@@ -31,6 +31,7 @@ from sidepulse import hook as hook_module
 from sidepulse.cli import build_parser, build_sidepulse_parser, cmd_hook_log
 from sidepulse.hook import format_hook_payload, hook_log_main, routed_hook_payload
 from sidepulse.install import fail_open_command, hook_command
+from sidepulse.origin import annotate_payload_with_origin, background_session_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -238,6 +239,74 @@ class HappyPathTests(HookIsolationMixin, unittest.TestCase):
                 self.assertTrue(provider)
                 self.assertIsInstance(path, Path)
                 self.assertIsInstance(line, dict)
+
+    def test_background_automation_environment_is_tagged(self):
+        environments = (
+            ({"AURA_TASK_DIR": "/tmp/aura-task"}, "env:AURA_TASK_DIR"),
+            (
+                {"XPC_SERVICE_NAME": "ch.cerqui.agent-loop"},
+                "env:XPC_SERVICE_NAME:ch.cerqui.agent-loop",
+            ),
+            (
+                {"XPC_SERVICE_NAME": "ch.cerqui.aura-self-improve"},
+                "env:XPC_SERVICE_NAME:ch.cerqui.aura-self-improve",
+            ),
+            (
+                {"SIDEPULSE_BACKGROUND_SESSION": "1"},
+                "env:SIDEPULSE_BACKGROUND_SESSION",
+            ),
+        )
+        for env, source in environments:
+            with self.subTest(source=source):
+                self.assertEqual(source, background_session_source(env))
+                payload = annotate_payload_with_origin(
+                    "claude", {"hook_event_name": "PreToolUse"}, env=env
+                )
+                self.assertIs(True, payload["sidepulse_background_session"])
+                self.assertEqual(source, payload["sidepulse_background_source"])
+
+    def test_interactive_aura_session_is_not_tagged(self):
+        transcript = self.home / "interactive.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "user", "entrypoint": "cli"}) + "\n",
+            encoding="utf-8",
+        )
+        env = {"XPC_SERVICE_NAME": "application.com.anthropic.claudefordesktop"}
+        self.assertIsNone(background_session_source(env))
+        payload = annotate_payload_with_origin(
+            "claude",
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": "/Users/x/Git/aura",
+                "transcript_path": str(transcript),
+            },
+            env=env,
+        )
+        self.assertNotIn("sidepulse_background_session", payload)
+
+    def test_headless_aura_transcript_is_tagged(self):
+        transcript = self.home / "headless.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "queue-operation"})
+            + "\n"
+            + json.dumps({"type": "user", "entrypoint": "sdk-cli"})
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = annotate_payload_with_origin(
+            "claude",
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/Users/x/Git/aura-server",
+                "transcript_path": str(transcript),
+            },
+            env={},
+        )
+        self.assertIs(True, payload["sidepulse_background_session"])
+        self.assertEqual(
+            "transcript:entrypoint:sdk-cli",
+            payload["sidepulse_background_source"],
+        )
 
 
 class EntryPointSubprocessTests(unittest.TestCase):

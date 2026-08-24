@@ -162,27 +162,44 @@ def test_finished_waits_for_subagents():
     assert alerts[0]["title"] == "Finished: Big Task"
 
 
-def test_ignored_cwd_sessions_are_filtered(monkeypatch):
+def test_background_and_default_ignored_sessions_are_filtered(monkeypatch, tmp_path):
     from sidepulse.collector import StatusMetadata, should_ignore_record
     from sidepulse.models import HookEvent
 
-    def record(cwd):
+    def record(cwd, *, background=False):
         return HookEvent(
             provider="claude",
             logged_at=datetime.now(timezone.utc),
             event_name="PreToolUse",
-            raw={},
+            raw={"sidepulse_background_session": background},
             session_id="s1",
             cwd=cwd,
         )
 
     meta = StatusMetadata(cwd=None)
-    assert should_ignore_record(record("/Users/x/Git/aura-server"), meta)
     assert should_ignore_record(record("/Users/x/.claude/memories"), meta)
+    assert not should_ignore_record(record("/Users/x/Git/aura-server"), meta)
+    assert not should_ignore_record(record("/Users/x/Git/aura"), meta)
     assert not should_ignore_record(record("/Users/x/Git/sidepulse"), meta)
+    assert should_ignore_record(record("/Users/x/Git", background=True), meta)
 
-    # Per-run subdirectories under an ignored dir are ignored too.
-    assert should_ignore_record(
+    transcript = tmp_path / "headless.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "entrypoint": "sdk-cli"}) + "\n")
+    headless = HookEvent(
+        provider="claude",
+        logged_at=datetime.now(timezone.utc),
+        event_name="UserPromptSubmit",
+        raw={
+            "cwd": "/Users/x/Git/aura-server",
+            "transcript_path": str(transcript),
+        },
+        session_id="s2",
+        cwd="/Users/x/Git/aura-server",
+    )
+    assert should_ignore_record(headless, meta)
+
+    # An Aura path alone is not enough to hide a session; launch evidence is.
+    assert not should_ignore_record(
         record("/Users/x/Git/aura-server/runs/20260823-120000-routine-inbox"), meta
     )
 
@@ -190,10 +207,39 @@ def test_ignored_cwd_sessions_are_filtered(monkeypatch):
     assert should_ignore_record(record("/tmp/scratch"), meta)
 
 
+def test_background_marker_removes_an_existing_live_status(tmp_path):
+    from sidepulse.collector import LiveAgentMonitor
+    from sidepulse.models import HookEvent
+
+    monitor = LiveAgentMonitor(latest_state_path=tmp_path / "latest.json")
+    visible = HookEvent(
+        provider="claude",
+        logged_at=datetime.now(timezone.utc),
+        event_name="UserPromptSubmit",
+        raw={"prompt": "Interactive task"},
+        session_id="s1",
+        cwd="/Users/x/Git/aura",
+    )
+    monitor.ingest_record(visible)
+    assert "claude:session:s1" in monitor.statuses_by_key
+
+    background = HookEvent(
+        provider="claude",
+        logged_at=datetime.now(timezone.utc),
+        event_name="PreToolUse",
+        raw={"sidepulse_background_session": True},
+        session_id="s1",
+        cwd="/Users/x/Git/aura",
+    )
+    monitor.ingest_record(background)
+    assert "claude:session:s1" not in monitor.statuses_by_key
+
+
 def test_ignored_display_name_prefix():
     from sidepulse.collector import is_ignored_display_name
 
-    assert is_ignored_display_name("aura-server: You are an autonomous agent")
+    assert not is_ignored_display_name("aura-server: You are an autonomous agent")
+    assert not is_ignored_display_name("aura: Process the family inbox")
     assert is_ignored_display_name("memories: Memory Writing Agent")
     assert not is_ignored_display_name("sidepulse: Merge main")
 

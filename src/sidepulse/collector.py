@@ -19,7 +19,7 @@ from .models import (
     parse_datetime,
     provider_label,
 )
-from .origin import origin_label_from_payload
+from .origin import aura_headless_entrypoint, origin_label_from_payload
 from .providers import detect_log_path, parse_log_line, SUMMARY_EVENT_NAME
 from .settings import AgentMonitorSettings, load_settings
 
@@ -215,6 +215,9 @@ class AgentMonitor:
                 metadata_by_session,
                 metadata_by_status,
             )
+            if should_ignore_record(record, metadata):
+                statuses_by_key.pop(record.status_key, None)
+                continue
             apply_summary_record(record, statuses_by_key)
             status = status_from_event(record, metadata)
             if status is not None and is_phantom_session_end(
@@ -423,6 +426,10 @@ class LiveAgentMonitor:
                 self.metadata_by_session,
                 self.metadata_by_status,
             )
+            if should_ignore_record(record, metadata):
+                if self.statuses_by_key.pop(record.status_key, None) is not None:
+                    self.write_latest_state()
+                return
             if apply_summary_record(record, self.statuses_by_key):
                 self.write_latest_state()
             status = status_from_event(record, metadata)
@@ -1511,11 +1518,10 @@ def should_ignore_status_transition(
     )
 
 
-# Sessions running in these directories are background automation (memory
-# writers, the aura-server agent loop) and never worth surfacing on LEDs,
-# in the status bar, or on the phone. Extend with SIDEPULSE_IGNORE_DIRS
+# Internal memory-writer sessions are never worth surfacing on LEDs, in the
+# status bar, or on the phone. Extend with SIDEPULSE_IGNORE_DIRS
 # (comma-separated directory names).
-DEFAULT_IGNORED_CWD_NAMES = ("memories", "aura-server", "aura")
+DEFAULT_IGNORED_CWD_NAMES = ("memories",)
 
 
 def ignored_cwd_names() -> frozenset[str]:
@@ -1537,9 +1543,11 @@ def is_ignored_display_name(display_name: str) -> bool:
 
 
 def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
-    # Match any path component: automation runs often use per-task
-    # subdirectories (aura-server/runs/2026...-routine-inbox), so the leaf
-    # name alone is not enough.
+    if record.raw.get("sidepulse_background_session") is True:
+        return True
+    if aura_headless_entrypoint(record.raw) == "sdk-cli":
+        return True
+
     if is_ignored_path(metadata.cwd) or is_ignored_path(record.cwd):
         return True
 

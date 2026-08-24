@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
 from .models import provider_label
+
+
+BACKGROUND_XPC_SERVICES = frozenset(
+    {
+        "ch.cerqui.agent-loop",
+        "ch.cerqui.aura-self-improve",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -233,11 +243,69 @@ def annotate_payload_with_origin(
     *,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    if "agent_origin" in payload or "agentOrigin" in payload:
-        return payload
+    active_env = os.environ if env is None else env
     result = dict(payload)
-    result.update(detect_agent_origin(provider, env=env).to_payload())
+    if "agent_origin" not in payload and "agentOrigin" not in payload:
+        result.update(detect_agent_origin(provider, env=active_env).to_payload())
+    background_source = background_session_source(active_env, payload)
+    if background_source:
+        result["sidepulse_background_session"] = True
+        result.setdefault("sidepulse_background_source", background_source)
     return result
+
+
+def background_session_source(
+    env: Mapping[str, str],
+    payload: Mapping[str, Any] | None = None,
+) -> str | None:
+    explicit = str(env.get("SIDEPULSE_BACKGROUND_SESSION") or "").strip().lower()
+    if explicit in {"1", "true", "yes"}:
+        return "env:SIDEPULSE_BACKGROUND_SESSION"
+
+    if str(env.get("AURA_TASK_DIR") or "").strip():
+        return "env:AURA_TASK_DIR"
+
+    service = str(env.get("XPC_SERVICE_NAME") or "").strip()
+    if service in BACKGROUND_XPC_SERVICES:
+        return f"env:XPC_SERVICE_NAME:{service}"
+
+    if payload is not None and aura_headless_entrypoint(payload) == "sdk-cli":
+        return "transcript:entrypoint:sdk-cli"
+    return None
+
+
+def aura_headless_entrypoint(payload: Mapping[str, Any]) -> str | None:
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not any(
+        part in {"aura", "aura-server"} for part in Path(cwd).parts
+    ):
+        return None
+
+    transcript_path = payload.get("transcript_path") or payload.get("transcriptPath")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    try:
+        stat = Path(transcript_path).stat()
+    except OSError:
+        return None
+    return transcript_entrypoint(transcript_path, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=1024)
+def transcript_entrypoint(path: str, mtime_ns: int, size: int) -> str | None:
+    del mtime_ns, size
+    try:
+        with Path(path).open(encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(32), handle):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("entrypoint"), str):
+                    return row["entrypoint"]
+    except OSError:
+        return None
+    return None
 
 
 def origin_label_from_payload(provider: str, raw: Mapping[str, Any]) -> str | None:
