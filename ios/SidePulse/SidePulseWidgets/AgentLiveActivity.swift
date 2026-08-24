@@ -85,11 +85,11 @@ struct AgentLiveActivity: Widget {
                     // The expanded island has a limited height; three compact
                     // rows fit without clipping.
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(context.state.agents.prefix(2)) { agent in
+                        ForEach(context.state.agents.prefix(3)) { agent in
                             AgentRowView(agent: agent)
                         }
-                        if context.state.agents.count > 2 {
-                            Text("+\(context.state.agents.count - 2) more")
+                        if context.state.agents.count > 3 {
+                            Text("+\(context.state.agents.count - 3) more")
                                 .font(.caption2)
                                 .foregroundStyle(.white.opacity(0.5))
                         }
@@ -207,39 +207,29 @@ private struct AgentRowView: View {
     private var isDone: Bool { agent.mode == "completed" }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            // Line 1: the name spans the whole width so long summaries fill
-            // the row instead of wrapping early against a reserved column.
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: AgentModeStyle.symbol(agent.mode))
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color.forMode(agent.mode))
-                    .frame(width: 16)
-                    .padding(.top, 1)
-                Text(agent.name)
-                    .font(.caption)
-                    .foregroundStyle(isDone ? Color.white.opacity(0.7) : .white)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        // One line per session: density beats detail here — more sessions
+        // fit the card, and summaries are short enough to survive one line.
+        HStack(spacing: 7) {
+            Image(systemName: AgentModeStyle.symbol(agent.mode))
+                .font(.system(size: 11))
+                .foregroundStyle(Color.forMode(agent.mode))
+                .frame(width: 14)
+            if let provider = agent.provider {
+                Text(provider.capitalized)
+                    .font(.system(size: 9, weight: .semibold))
+                    .lineLimit(1)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(.white.opacity(0.12), in: Capsule())
             }
-            // Line 2: provider + directory on the left, live status/time on
-            // the right — the status moved off line 1 so nothing narrows it.
-            HStack(spacing: 5) {
-                if let provider = agent.provider {
-                    Text(provider.capitalized)
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.75))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(.white.opacity(0.12), in: Capsule())
-                }
-                if let cwd = agent.cwd {
-                    Text(cwd)
-                        .foregroundStyle(.white.opacity(0.5))
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 6)
+            Text(agent.name)
+                .font(.caption)
+                .foregroundStyle(isDone ? Color.white.opacity(0.7) : .white)
+                .lineLimit(1)
+                .layoutPriority(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Group {
                 if let finishedAt = agent.finishedAt {
                     Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
                         .foregroundStyle(.white.opacity(0.5))
@@ -251,7 +241,7 @@ private struct AgentRowView: View {
             }
             .font(.caption2)
             .lineLimit(1)
-            .padding(.leading, 24)
+            .frame(maxWidth: 82, alignment: .trailing)
         }
     }
 }
@@ -314,11 +304,11 @@ private struct LockScreenView: View {
                     .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 5) {
-                    ForEach(context.state.agents.prefix(4)) { agent in
+                    ForEach(context.state.agents.prefix(5)) { agent in
                         AgentRowView(agent: agent)
                     }
-                    if context.state.agents.count > 4 {
-                        Text("+\(context.state.agents.count - 4) more")
+                    if context.state.agents.count > 5 {
+                        Text("+\(context.state.agents.count - 5) more")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }

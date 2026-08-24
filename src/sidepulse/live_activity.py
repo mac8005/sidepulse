@@ -226,7 +226,7 @@ _DEEP_LINKS: DeepLinkResolver | None = None
 def status_row(status: AgentStatus) -> dict[str, Any]:
     row = {
         "id": status.agent_id,
-        "name": _truncate(status.display_name, MAX_NAME_CHARS),
+        "name": _truncate(status.display_name.strip(), MAX_NAME_CHARS),
         "mode": status.mode.value,
         "detail": _truncate(status.tool_name, MAX_DETAIL_CHARS) if status.tool_name else None,
         "provider": status.provider,
@@ -625,7 +625,9 @@ class SessionSummarizer:
             print(f"live-activity: claude -p exited {result.returncode}: {result.stderr[:120]}")
             return None
         line = result.stdout.strip().splitlines()
-        text = line[0].strip().strip("\"'") if line else ""
+        # Models sometimes add a trailing period or stray spaces; row text
+        # must be clean — it renders as a one-line title.
+        text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
         if text:
             print(f"live-activity: summary -> {text[:70]}")
             return _truncate(text, SUMMARY_MAX_CHARS)
