@@ -217,6 +217,11 @@ class AgentMonitor:
             )
             apply_summary_record(record, statuses_by_key)
             status = status_from_event(record, metadata)
+            if status is not None and is_phantom_session_end(
+                record, statuses_by_key.get(status.agent_id), metadata
+            ):
+                statuses_by_key.pop(status.agent_id, None)
+                continue
             if status is not None:
                 track_pending_permissions(record, pending_permissions_by_key)
                 previous = statuses_by_key.get(status.agent_id)
@@ -424,8 +429,13 @@ class LiveAgentMonitor:
             if status is None:
                 return
 
-            track_pending_permissions(record, self.pending_permissions_by_key)
             previous = self.statuses_by_key.get(status.agent_id)
+            if is_phantom_session_end(record, previous, metadata):
+                if self.statuses_by_key.pop(status.agent_id, None) is not None:
+                    self.write_latest_state()
+                return
+
+            track_pending_permissions(record, self.pending_permissions_by_key)
             if should_ignore_status_transition(
                 previous,
                 status,
@@ -1375,6 +1385,26 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
 
 def status_counts_active(status: AgentStatus) -> bool:
     return status.mode not in {AgentMode.COMPLETED, AgentMode.IDLE_READY}
+
+
+def is_phantom_session_end(
+    record: HookEvent,
+    previous: AgentStatus | None,
+    metadata: StatusMetadata,
+) -> bool:
+    """A session that starts and immediately ends without ever doing anything.
+
+    Claude Desktop probes sessions on launch: SessionStart directly followed
+    by SessionEnd, no prompt, no tool use. They render as untitled
+    "<project> (id)" rows and clutter every menu. A session counts as a
+    phantom when its SessionEnd arrives with no title or summary and no
+    prior activity beyond another start/end.
+    """
+    if record.event_name != "SessionEnd" or record.agent_id:
+        return False
+    if metadata.title is not None or metadata.summary is not None:
+        return False
+    return previous is None or previous.event_name in {"SessionStart", "SessionEnd"}
 
 
 def apply_summary_record(

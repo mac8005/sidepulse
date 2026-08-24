@@ -174,6 +174,55 @@ class FakeProcess:
 
 
 class AgentMonitorTests(unittest.TestCase):
+    def test_phantom_desktop_sessions_are_hidden(self) -> None:
+        # Claude Desktop probes sessions on launch: SessionStart directly
+        # followed by SessionEnd, no prompt, no work. They must not appear;
+        # a real session that worked before ending stays visible.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            claude = base / "claude.jsonl"
+            events = [
+                {
+                    "logged_at": "2026-06-20T06:00:00Z",
+                    "hook_event_name": "SessionStart",
+                    "session_id": "phantom",
+                    "cwd": "/Users/someone",
+                },
+                {
+                    "logged_at": "2026-06-20T06:00:00Z",
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "phantom",
+                    "cwd": "/Users/someone",
+                },
+                {
+                    "logged_at": "2026-06-20T06:01:00Z",
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "real",
+                    "cwd": "/tmp/proj",
+                    "prompt": "Fix the parser",
+                },
+                {
+                    "logged_at": "2026-06-20T06:02:00Z",
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "real",
+                    "cwd": "/tmp/proj",
+                },
+            ]
+            claude.write_text("".join(json.dumps(event) + "\n" for event in events))
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("claude", claude),),
+                stale_after_seconds=999999999,
+                tool_running_timeout_seconds=0,
+                completed_visible_seconds=-1,
+            ).snapshot(include_stale=True)
+            ids = [
+                status.session_id
+                for status in snapshot.statuses + snapshot.stale_statuses
+            ]
+            self.assertNotIn("phantom", ids)
+            self.assertIn("real", ids)
+
     def test_summary_record_titles_the_session(self) -> None:
         # The live-activity daemon appends SidepulseSummary records to the
         # hook log; they retitle the session row (also retroactively) without
