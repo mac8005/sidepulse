@@ -208,7 +208,7 @@ private struct WatchAgentRowView: View {
             }
             .font(.system(size: 9))
             .lineLimit(1)
-            .frame(maxWidth: 52, alignment: .trailing)
+            .layoutPriority(2)
         }
     }
 }
@@ -253,7 +253,11 @@ private struct AgentRowView: View {
             }
             .font(.caption2)
             .lineLimit(1)
-            .frame(maxWidth: 64, alignment: .trailing)
+            // Natural width, offered space BEFORE the greedy name — the
+            // name's ellipsis then lands right beside the label instead of
+            // leaving a reserved-column gap. Server-side caps bound the
+            // detail text, so the label can't eat the row.
+            .layoutPriority(2)
         }
     }
 }
