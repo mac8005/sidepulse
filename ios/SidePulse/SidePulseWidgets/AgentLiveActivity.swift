@@ -169,6 +169,18 @@ private struct StatusChips: View {
     }
 }
 
+
+/// "14s", "55m", "2h", "3d" — the system `.relative` style ("55 min, 0 sec")
+/// wastes a third of the row. Static, but every push re-renders it and the
+/// daemon heartbeats at least every five minutes, so drift stays small.
+private func compactAgo(_ finishedAt: Double) -> String {
+    let seconds = max(0, Date().timeIntervalSince1970 - finishedAt)
+    if seconds < 60 { return "\(Int(seconds))s" }
+    if seconds < 3600 { return "\(Int(seconds / 60))m" }
+    if seconds < 86400 { return "\(Int(seconds / 3600))h" }
+    return "\(Int(seconds / 86400))d"
+}
+
 private struct WatchAgentRowView: View {
     let agent: AgentActivityAttributes.AgentRow
 
@@ -186,7 +198,7 @@ private struct WatchAgentRowView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Group {
                 if let finishedAt = agent.finishedAt {
-                    Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
+                    Text(compactAgo(finishedAt))
                         .foregroundStyle(.white.opacity(0.5))
                 } else {
                     Text(agent.detail ?? AgentModeStyle.label(agent.mode))
@@ -196,7 +208,7 @@ private struct WatchAgentRowView: View {
             }
             .font(.system(size: 9))
             .lineLimit(1)
-            .frame(maxWidth: 58, alignment: .trailing)
+            .frame(maxWidth: 52, alignment: .trailing)
         }
     }
 }
@@ -231,7 +243,7 @@ private struct AgentRowView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Group {
                 if let finishedAt = agent.finishedAt {
-                    Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
+                    Text(compactAgo(finishedAt))
                         .foregroundStyle(.white.opacity(0.5))
                 } else {
                     Text(agent.detail ?? AgentModeStyle.label(agent.mode))
@@ -241,7 +253,7 @@ private struct AgentRowView: View {
             }
             .font(.caption2)
             .lineLimit(1)
-            .frame(maxWidth: 82, alignment: .trailing)
+            .frame(maxWidth: 64, alignment: .trailing)
         }
     }
 }
