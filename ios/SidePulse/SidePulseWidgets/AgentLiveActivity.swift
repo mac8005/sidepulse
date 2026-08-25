@@ -162,21 +162,39 @@ private struct IslandMinimal: View {
     let activeCount: Int
 
     var body: some View {
-        let showsActive = activeCount > 0
-        let color = showsActive ? groups.symbol.color : Color.statusDone
-        let count = showsActive ? activeCount : groups.done
+        let done = groups.done
         ZStack {
-            Circle()
-                .fill(color.opacity(0.22))
-            if count > 0 {
-                Text("\(count)")
+            if activeCount > 0 && done > 0 {
+                // Both at once: "3/2" — active in the state color, finished
+                // in green — on a neutral tint so neither color dominates.
+                Circle()
+                    .fill(Color.white.opacity(0.14))
+                (Text("\(activeCount)").foregroundColor(groups.symbol.color)
+                    + Text("/").foregroundColor(Color.white.opacity(0.45))
+                    + Text("\(done)").foregroundColor(Color.statusDone))
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+            } else if activeCount > 0 {
+                Circle()
+                    .fill(groups.symbol.color.opacity(0.22))
+                Text("\(activeCount)")
                     .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(color)
+                    .foregroundStyle(groups.symbol.color)
+                    .minimumScaleFactor(0.6)
+            } else if done > 0 {
+                Circle()
+                    .fill(Color.statusDone.opacity(0.22))
+                Text("\(done)")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.statusDone)
                     .minimumScaleFactor(0.6)
             } else {
+                Circle()
+                    .fill(groups.symbol.color.opacity(0.22))
                 Image(systemName: groups.symbol.name)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(color)
+                    .foregroundStyle(groups.symbol.color)
             }
         }
     }
