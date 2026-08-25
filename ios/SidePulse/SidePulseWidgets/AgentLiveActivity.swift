@@ -82,14 +82,15 @@ struct AgentLiveActivity: Widget {
                         .padding(.trailing, 2)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    // The expanded island has a limited height; three compact
-                    // rows fit without clipping.
+                    // The expanded island caps at 160pt; four single-line rows
+                    // fit, so recently finished sessions show below the active
+                    // ones instead of hiding behind "+n more".
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(context.state.agents.prefix(3)) { agent in
+                        ForEach(context.state.agents.prefix(4)) { agent in
                             AgentRowView(agent: agent)
                         }
-                        if context.state.agents.count > 3 {
-                            Text("+\(context.state.agents.count - 3) more")
+                        if context.state.agents.count > 4 {
+                            Text("+\(context.state.agents.count - 4) more")
                                 .font(.caption2)
                                 .foregroundStyle(.white.opacity(0.5))
                         }
@@ -97,32 +98,87 @@ struct AgentLiveActivity: Widget {
                     .widgetURL(URL(string: "sidepulse://agents"))
                 }
             } compactLeading: {
-                // Single-activity compact: state icon on the leading side.
-                Image(systemName: groups.symbol.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(groups.symbol.color)
+                IslandCompactLeading(groups: groups, activeCount: context.state.activeCount)
                     .widgetURL(URL(string: "sidepulse://agents"))
             } compactTrailing: {
-                Text("\(context.state.activeCount)")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .foregroundStyle(groups.symbol.color)
+                IslandCompactTrailing(groups: groups)
                     .widgetURL(URL(string: "sidepulse://agents"))
             } minimal: {
-                // With a second Live Activity (e.g. Now Playing) present iOS
-                // renders every activity as `minimal`, so the count lives
-                // here — a colored number is more useful than an icon.
-                ZStack {
-                    Circle()
-                        .fill(groups.symbol.color.opacity(0.22))
-                    Text("\(context.state.activeCount)")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundStyle(groups.symbol.color)
-                        .minimumScaleFactor(0.6)
-                }
-                .widgetURL(URL(string: "sidepulse://agents"))
+                IslandMinimal(groups: groups, activeCount: context.state.activeCount)
+                    .widgetURL(URL(string: "sidepulse://agents"))
             }
         }
         .supplementalActivityFamilies([.small])
+    }
+}
+
+
+// MARK: - Dynamic Island pieces
+
+/// Compact leading: the most urgent state's glyph plus the active count —
+/// what is happening right now.
+private struct IslandCompactLeading: View {
+    let groups: ModeGroups
+    let activeCount: Int
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: groups.symbol.name)
+                .font(.system(size: 12, weight: .semibold))
+            if activeCount > 0 {
+                Text("\(activeCount)")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .contentTransition(.numericText())
+            }
+        }
+        .foregroundStyle(groups.symbol.color)
+    }
+}
+
+/// Compact trailing: recently finished sessions as a green check + count,
+/// so "one working, three done" reads at a glance without expanding.
+private struct IslandCompactTrailing: View {
+    let groups: ModeGroups
+
+    var body: some View {
+        if groups.done > 0 {
+            HStack(spacing: 3) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("\(groups.done)")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .contentTransition(.numericText())
+            }
+            .foregroundStyle(Color.statusDone)
+        }
+    }
+}
+
+/// Minimal (another Live Activity shares the island): one tinted number —
+/// the active count while anything runs, otherwise the finished count in
+/// green, so "all done" never reads as a lonely zero.
+private struct IslandMinimal: View {
+    let groups: ModeGroups
+    let activeCount: Int
+
+    var body: some View {
+        let showsActive = activeCount > 0
+        let color = showsActive ? groups.symbol.color : Color.statusDone
+        let count = showsActive ? activeCount : groups.done
+        ZStack {
+            Circle()
+                .fill(color.opacity(0.22))
+            if count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+                    .minimumScaleFactor(0.6)
+            } else {
+                Image(systemName: groups.symbol.name)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(color)
+            }
+        }
     }
 }
 
@@ -144,7 +200,7 @@ private struct StatusChips: View {
         ]
 
         HStack(spacing: 5) {
-            ForEach(Array(parts.prefix(3).enumerated()), id: \.offset) { _, part in
+            ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
                 chip(part.0, part.1)
             }
         }
