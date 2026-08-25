@@ -102,6 +102,11 @@ final class LiveMonitorManager: ObservableObject {
                 await other.end(nil, dismissalPolicy: .immediate)
             }
         }
+        // Push the current token right away (an activity observed at launch
+        // may not re-emit it), then follow rotations.
+        if let current = activity.pushToken {
+            Task { await self.register(kind: "update", token: current, model: model, activityID: activity.id) }
+        }
         Task {
             for await tokenData in activity.pushTokenUpdates {
                 await self.register(kind: "update", token: tokenData, model: model, activityID: activity.id)
@@ -138,18 +143,27 @@ final class LiveMonitorManager: ObservableObject {
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = 10
 
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if (200..<300).contains(code) {
-                statusMessage = kind == "push_to_start"
-                    ? "Registered — the Mac can now start the Live Activity"
-                    : "Live Activity connected"
-            } else {
+        // A token the daemon never receives leaves an activity it can never
+        // update, so a transient failure (cellular blip, Tailscale waking)
+        // retries with backoff before giving up.
+        var delay: UInt64 = 2
+        for attempt in 1...5 {
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(code) {
+                    statusMessage = kind == "push_to_start"
+                        ? "Registered — the Mac can now start the Live Activity"
+                        : "Live Activity connected"
+                    return
+                }
                 statusMessage = "Server error \(code) registering \(kind) token"
+            } catch {
+                statusMessage = "Cannot reach server: \(error.localizedDescription)"
             }
-        } catch {
-            statusMessage = "Cannot reach server: \(error.localizedDescription)"
+            guard attempt < 5 else { return }
+            try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+            delay *= 2
         }
     }
 

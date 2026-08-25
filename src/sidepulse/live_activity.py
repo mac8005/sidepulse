@@ -45,7 +45,12 @@ MAX_NAME_CHARS = 120
 MAX_DETAIL_CHARS = 32
 PUSH_MIN_INTERVAL_SECONDS = 3.0
 PUSH_HEARTBEAT_SECONDS = 300.0
-PUSH_TO_START_COOLDOWN_SECONDS = 60.0
+# Push-to-start retry while active sessions exist but the phone has not
+# registered an activity: a start push can be lost or throttled, and the
+# system ends activities after eight hours. Each start push carries an
+# alert, so retries back off (2, 4, 8, 16, then every 30 minutes).
+PUSH_TO_START_COOLDOWN_SECONDS = 120.0
+PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
 SSE_HEARTBEAT_SECONDS = 10.0
 # A live daemon refreshes within PUSH_HEARTBEAT; a longer stale window
 # lets iOS dim the activity if the mini stops pushing.
@@ -648,6 +653,7 @@ class LiveActivityDaemon:
         self._last_start_push_at = 0.0
         self._idle_since: float | None = None
         self._activity_live = False
+        self._start_push_attempts = 0
         self._agent_modes: dict[str, str] = {}
         self._last_alerts: dict[tuple[str, str], float] = {}
         self._last_rows: dict[str, dict[str, Any]] = {}
@@ -737,7 +743,10 @@ class LiveActivityDaemon:
 
         if active:
             self._idle_since = None
-            if not self._activity_live:
+            if not self.tokens.tokens("update"):
+                # Evidence over belief: only a registered update token proves
+                # an activity is live on the phone. Keep asking (rate-limited)
+                # until one arrives, whatever an earlier start push claimed.
                 self._maybe_push_to_start(content_state, now)
         else:
             if self._idle_since is None:
@@ -968,6 +977,11 @@ class LiveActivityDaemon:
             if status == 410 or (status == 400 and "BadDeviceToken" in body):
                 print(f"live-activity: dropping dead {kind} token ({status})")
                 self.tokens.drop(kind, token)
+                if kind == "update" and not self.tokens.tokens("update"):
+                    # The phone's activity is gone; allow a prompt restart.
+                    self._activity_live = False
+                    self._last_start_push_at = 0.0
+                    self._start_push_attempts = 0
             elif status != 200:
                 print(f"live-activity: APNs {kind} push -> {status} {body[:120]}")
 
@@ -1018,9 +1032,15 @@ class LiveActivityDaemon:
     def _maybe_push_to_start(self, content_state: dict[str, Any], now: float) -> None:
         if not self.tokens.tokens("push_to_start"):
             return
-        if now - self._last_start_push_at < PUSH_TO_START_COOLDOWN_SECONDS:
+        # First retry after the base cooldown, then doubling per attempt.
+        wait = min(
+            PUSH_TO_START_COOLDOWN_SECONDS * (2 ** max(0, self._start_push_attempts - 1)),
+            PUSH_TO_START_MAX_BACKOFF_SECONDS,
+        )
+        if self._last_start_push_at and now - self._last_start_push_at < wait:
             return
         self._last_start_push_at = now
+        self._start_push_attempts += 1
         payload = {
             "aps": {
                 "timestamp": int(now),
@@ -1037,7 +1057,8 @@ class LiveActivityDaemon:
         }
         print("live-activity: sending push-to-start")
         self._apns_fanout("push_to_start", payload)
-        self._activity_live = True
+        # _activity_live flips only when the phone registers the activity's
+        # update token — a sent start push is not a started activity.
 
     def _push_update(
         self,
@@ -1098,7 +1119,9 @@ class LiveActivityDaemon:
             print(f"live-activity: {reason}; will restart")
         self.tokens.clear("update")
         self._activity_live = False
+        self._start_push_attempts = 0
         self._last_start_push_at = 0.0
+        self._start_push_attempts = 0
 
     def _push_end(self, content_state: dict[str, Any], now: float) -> None:
         payload = {
@@ -1200,6 +1223,7 @@ class LiveActivityDaemon:
                 daemon.tokens.register(kind, token, meta)
                 if kind == "update":
                     daemon._activity_live = True
+                    daemon._start_push_attempts = 0
                 elif kind == "push_to_start" and is_new:
                     # Fresh install or token rotation: any previously known
                     # activity is stale. End it, forget its tokens, and allow

@@ -285,6 +285,41 @@ def test_publish_summary_writes_hook_records(tmp_path, monkeypatch):
     assert codex_record.raw.get("summary") == "kleido: import flow reworked"
 
 
+def test_push_to_start_retries_until_activity_registers(tmp_path, monkeypatch):
+    from sidepulse.live_activity import (
+        PUSH_TO_START_COOLDOWN_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("push_to_start", "p2s", {"device": "phone", "activity_id": ""})
+    sent = []
+    monkeypatch.setattr(daemon, "_apns_fanout", lambda kind, payload, priority=10: sent.append(kind))
+    state = {"aggregateMode": "working", "activeCount": 1, "agents": [], "updatedAt": 0.0}
+
+    daemon._maybe_push_to_start(state, 1000.0)
+    assert sent == ["push_to_start"]
+    # A sent start push is not a started activity.
+    assert daemon._activity_live is False
+
+    daemon._maybe_push_to_start(state, 1000.0 + 5)
+    assert sent == ["push_to_start"]  # inside the cooldown
+
+    daemon._maybe_push_to_start(state, 1000.0 + PUSH_TO_START_COOLDOWN_SECONDS + 1)
+    assert sent == ["push_to_start", "push_to_start"]  # keeps retrying
+
+    # Backoff doubles: the third attempt waits twice as long.
+    t2 = 1000.0 + PUSH_TO_START_COOLDOWN_SECONDS + 1
+    daemon._maybe_push_to_start(state, t2 + PUSH_TO_START_COOLDOWN_SECONDS + 1)
+    assert len(sent) == 2
+    daemon._maybe_push_to_start(state, t2 + 2 * PUSH_TO_START_COOLDOWN_SECONDS + 1)
+    assert len(sent) == 3
+
+
 def test_moonside_marker_follows_background_tasks(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 
