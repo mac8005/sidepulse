@@ -145,16 +145,15 @@ private struct IslandCompactTrailing: View {
     let groups: ModeGroups
 
     var body: some View {
-        if groups.done > 0 {
+        if groups.unreadDone > 0 {
             HStack(spacing: 3) {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 11, weight: .semibold))
-                Text("\(groups.done)")
+                Text("\(groups.unreadDone)")
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .contentTransition(.numericText())
             }
-            // Bright while something finished is still unread; quiet after.
-            .foregroundStyle(Color.statusDone.opacity(groups.unreadDone > 0 ? 1 : 0.5))
+            .foregroundStyle(Color.statusDone)
         }
     }
 }
@@ -167,7 +166,7 @@ private struct IslandMinimal: View {
     let activeCount: Int
 
     var body: some View {
-        let done = groups.done
+        let done = groups.unreadDone
         ZStack {
             if activeCount > 0 && done > 0 {
                 // Both at once: "3/2" — active in the state color, finished
@@ -176,9 +175,7 @@ private struct IslandMinimal: View {
                     .fill(Color.white.opacity(0.14))
                 (Text("\(activeCount)").foregroundColor(groups.symbol.color)
                     + Text("/").foregroundColor(Color.white.opacity(0.45))
-                    + Text("\(done)").foregroundColor(
-                        Color.statusDone.opacity(groups.unreadDone > 0 ? 1 : 0.5)
-                    ))
+                    + Text("\(done)").foregroundColor(Color.statusDone))
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
@@ -221,7 +218,8 @@ private struct StatusChips: View {
             (groups.blocked, .statusBlocked),
             (groups.waiting, .statusWaiting),
             (groups.working, .statusWorking),
-            (groups.done, .statusDone),
+            // Green means "awaiting your look": only unread finished count.
+            (groups.unreadDone, .statusDone),
         ]
 
         HStack(spacing: 5) {
@@ -350,6 +348,12 @@ private struct AgentRowView: View {
             // detail text, so the label can't eat the row.
             .layoutPriority(2)
         }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(
+            isUnread ? Color.statusDone.opacity(0.16) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+        )
     }
 }
 
