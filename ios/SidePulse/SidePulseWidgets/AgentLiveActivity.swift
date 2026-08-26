@@ -10,13 +10,17 @@ private struct ModeGroups {
     var waiting = 0
     var working = 0
     var done = 0
+    /// Finished sessions the user has not opened yet.
+    var unreadDone = 0
 
     init(agents: [AgentActivityAttributes.AgentRow]) {
         for agent in agents {
             switch agent.mode {
             case "blocked_error": blocked += 1
             case "waiting_for_input": waiting += 1
-            case "completed": done += 1
+            case "completed":
+                done += 1
+                if agent.unread == true { unreadDone += 1 }
             case "idle_ready": break
             default: working += 1
             }
@@ -149,7 +153,8 @@ private struct IslandCompactTrailing: View {
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .contentTransition(.numericText())
             }
-            .foregroundStyle(Color.statusDone)
+            // Bright while something finished is still unread; quiet after.
+            .foregroundStyle(Color.statusDone.opacity(groups.unreadDone > 0 ? 1 : 0.5))
         }
     }
 }
@@ -171,7 +176,9 @@ private struct IslandMinimal: View {
                     .fill(Color.white.opacity(0.14))
                 (Text("\(activeCount)").foregroundColor(groups.symbol.color)
                     + Text("/").foregroundColor(Color.white.opacity(0.45))
-                    + Text("\(done)").foregroundColor(Color.statusDone))
+                    + Text("\(done)").foregroundColor(
+                        Color.statusDone.opacity(groups.unreadDone > 0 ? 1 : 0.5)
+                    ))
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
@@ -266,7 +273,10 @@ private struct WatchAgentRowView: View {
                 .frame(width: 12)
             Text(agent.name)
                 .font(.system(size: 11))
-                .foregroundStyle(agent.mode == "completed" ? Color.white.opacity(0.7) : .white)
+                .foregroundStyle(
+                    agent.mode == "completed" && agent.unread != true
+                        ? Color.white.opacity(0.55) : .white
+                )
                 .lineLimit(1)
                 .layoutPriority(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -291,6 +301,7 @@ private struct AgentRowView: View {
     let agent: AgentActivityAttributes.AgentRow
 
     private var isDone: Bool { agent.mode == "completed" }
+    private var isUnread: Bool { isDone && agent.unread == true }
 
     var body: some View {
         // One line per session: density beats detail here — more sessions
@@ -310,11 +321,17 @@ private struct AgentRowView: View {
                     .background(.white.opacity(0.12), in: Capsule())
             }
             Text(agent.name)
-                .font(.caption)
-                .foregroundStyle(isDone ? Color.white.opacity(0.7) : .white)
+                .font(isUnread ? .caption.weight(.semibold) : .caption)
+                .foregroundStyle(isDone && !isUnread ? Color.white.opacity(0.55) : .white)
                 .lineLimit(1)
                 .layoutPriority(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            if isUnread {
+                // Unread marker: this finished session awaits a look.
+                Circle()
+                    .fill(Color.statusDone)
+                    .frame(width: 6, height: 6)
+            }
             Group {
                 if let finishedAt = agent.finishedAt {
                     Text(compactAgo(finishedAt))

@@ -6,6 +6,9 @@ import UIKit
 struct AgentsLiveView: View {
     @ObservedObject var model: AppModel
     @StateObject private var stream = AgentStreamClient()
+    /// Rows tapped this session — dim immediately, before the daemon's
+    /// confirming push arrives over the stream.
+    @State private var locallySeen: Set<String> = []
 
     var body: some View {
         List {
@@ -16,7 +19,12 @@ struct AgentsLiveView: View {
             Section("Agents") {
                 if let snapshot = stream.snapshot, !snapshot.agents.isEmpty {
                     ForEach(snapshot.agents) { agent in
-                        AgentLiveRow(agent: agent)
+                        AgentLiveRow(agent: agent, isUnread: isUnread(agent)) {
+                            markSeen(agent)
+                        }
+                        .listRowBackground(
+                            isUnread(agent) ? Color.green.opacity(0.10) : nil
+                        )
                     }
                 } else if stream.snapshot != nil {
                     Text("All quiet — no active agents.")
@@ -37,6 +45,26 @@ struct AgentsLiveView: View {
         .onDisappear {
             stream.stop()
         }
+    }
+
+    private func isUnread(_ agent: AgentSnapshot.Agent) -> Bool {
+        agent.finishedAt != nil && agent.unread == true && !locallySeen.contains(agent.id)
+    }
+
+    /// Tell the daemon this finished session was opened; it re-pushes the
+    /// dimmed state to the Live Activity and every other client.
+    private func markSeen(_ agent: AgentSnapshot.Agent) {
+        guard isUnread(agent) else { return }
+        locallySeen.insert(agent.id)
+        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("seen") else {
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": agent.id])
+        request.timeoutInterval = 10
+        Task { _ = try? await URLSession.shared.data(for: request) }
     }
 
     @ViewBuilder
@@ -69,9 +97,12 @@ struct AgentsLiveView: View {
 
 private struct AgentLiveRow: View {
     let agent: AgentSnapshot.Agent
+    let isUnread: Bool
+    let markSeen: () -> Void
 
     var body: some View {
         Button {
+            markSeen()
             openProviderApp()
         } label: {
             rowContent
@@ -111,13 +142,13 @@ private struct AgentLiveRow: View {
     private var rowContent: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: AgentModeStyle.symbol(agent.mode))
+                glyph
                     .font(.system(size: 13))
                     .foregroundStyle(color(agent.mode))
                     .frame(width: 16)
                     .padding(.top, 3)
                 Text(agent.name)
-                    .font(.body)
+                    .font(isUnread ? .body.weight(.semibold) : .body)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -155,6 +186,17 @@ private struct AgentLiveRow: View {
             .padding(.leading, 20)
         }
         .padding(.vertical, 2)
+    }
+
+    /// Unread finished sessions pulse until opened.
+    @ViewBuilder
+    private var glyph: some View {
+        let image = Image(systemName: AgentModeStyle.symbol(agent.mode))
+        if #available(iOS 17.0, *), isUnread {
+            image.symbolEffect(.pulse)
+        } else {
+            image
+        }
     }
 
     private var secondaryLine: String {

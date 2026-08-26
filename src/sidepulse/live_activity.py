@@ -910,6 +910,7 @@ class LiveActivityDaemon:
                     "mode": "completed",
                     "detail": None,
                     "finishedAt": now,
+                    "unread": True,
                 }
 
         for status in current.values():
@@ -919,6 +920,8 @@ class LiveActivityDaemon:
                     **status_row(status),
                     "detail": None,
                     "finishedAt": previous.get("finishedAt", now),
+                    # Stays unread until the user opens it in the app.
+                    "unread": previous.get("unread", True),
                 }
             elif status.mode.value not in TERMINAL_MODES:
                 # Reactivated: it is no longer "recently finished".
@@ -954,6 +957,16 @@ class LiveActivityDaemon:
                 }
         except (OSError, ValueError):
             pass
+
+    def mark_finished_seen(self, agent_id: str) -> bool:
+        """The user opened this finished session in the app; stop
+        highlighting it everywhere on the next push."""
+        row = self._recent_finished.get(agent_id)
+        if not row or not row.get("unread"):
+            return False
+        row["unread"] = False
+        self._save_recent_finished()
+        return True
 
     def _save_recent_finished(self) -> None:
         try:
@@ -1191,6 +1204,16 @@ class LiveActivityDaemon:
                     return
 
             def do_POST(self) -> None:
+                if self.path == "/seen":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, OSError):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    marked = daemon.mark_finished_seen(str(body.get("id", "")))
+                    self._json(200, {"ok": True, "marked": marked})
+                    return
                 if self.path != "/register":
                     self._json(404, {"error": "not found"})
                     return

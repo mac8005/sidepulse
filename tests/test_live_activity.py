@@ -244,6 +244,30 @@ def test_ignored_display_name_prefix():
     assert not is_ignored_display_name("sidepulse: Merge main")
 
 
+def test_finished_rows_track_unread_until_marked_seen(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore, build_content_state
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    done = make_status("claude:session:s1", AgentMode.COMPLETED, name="T", session_id="s1")
+    daemon._remember_finished([done], now=100.0)
+    row = daemon._recent_finished["claude:session:s1"]
+    assert row["unread"] is True
+
+    # Re-remembering the same completed session must not reset read state.
+    assert daemon.mark_finished_seen("claude:session:s1") is True
+    daemon._remember_finished([done], now=110.0)
+    assert daemon._recent_finished["claude:session:s1"]["unread"] is False
+    assert daemon.mark_finished_seen("claude:session:s1") is False  # already read
+    assert daemon.mark_finished_seen("missing") is False
+
+    # The wire rows carry the flag for every surface.
+    state = build_content_state([], "idle_ready", recent_finished=list(daemon._recent_finished.values()))
+    assert state["agents"][0]["unread"] is False
+
+
 def test_publish_summary_writes_hook_records(tmp_path, monkeypatch):
     from sidepulse.collector import SourceSpec
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore

@@ -12,6 +12,7 @@ struct AgentSnapshot: Codable, Equatable {
         var cwd: String?
         var finishedAt: Double?
         var deepLink: String?
+        var unread: Bool?
     }
 
     var aggregateMode: String
