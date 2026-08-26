@@ -36,6 +36,10 @@ CODEX_SESSION_INDEX_MAX_LINES = 5000
 COMPLETED_VISIBLE_SECONDS = 20 * 60.0
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
+# Codex reasons silently for minutes between tool calls (no events at all),
+# so its crash-safety window must be far wider than Claude's — otherwise a
+# thinking session reads as "Done". Real turn ends still arrive as Stop.
+CODEX_POST_TOOL_WORKING_VISIBLE_SECONDS = 15 * 60.0
 
 
 @dataclass(frozen=True)
@@ -1341,11 +1345,14 @@ def status_for_snapshot(
     *,
     post_tool_working_visible_seconds: float,
 ) -> AgentStatus:
+    window = post_tool_working_visible_seconds
+    if status.provider == "codex" and window >= 0:
+        window = max(window, CODEX_POST_TOOL_WORKING_VISIBLE_SECONDS)
     if (
         status.mode == AgentMode.WORKING
         and status.event_name == "PostToolUse"
-        and post_tool_working_visible_seconds >= 0
-        and status.age_seconds(now) > post_tool_working_visible_seconds
+        and window >= 0
+        and status.age_seconds(now) > window
     ):
         return _replace_mode(status, AgentMode.COMPLETED)
     return status

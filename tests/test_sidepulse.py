@@ -174,6 +174,39 @@ class FakeProcess:
 
 
 class AgentMonitorTests(unittest.TestCase):
+    def test_codex_post_tool_quiet_period_stays_working(self) -> None:
+        # Codex reasons for minutes between tool calls without emitting
+        # events; only Claude's short crash-safety window may flip a quiet
+        # PostToolUse row to completed.
+        from sidepulse.collector import status_for_snapshot
+
+        now = datetime(2026, 6, 20, 12, 0, tzinfo=timezone.utc)
+
+        def row(provider: str, minutes_ago: float) -> AgentStatus:
+            return AgentStatus(
+                provider=provider,
+                agent_id=f"{provider}:session:s1",
+                display_name="t",
+                mode=AgentMode.WORKING,
+                updated_at=now - timedelta(minutes=minutes_ago),
+                event_name="PostToolUse",
+                session_id="s1",
+            )
+
+        kwargs = {"post_tool_working_visible_seconds": 120.0}
+        self.assertEqual(
+            status_for_snapshot(row("claude", 5), now, **kwargs).mode,
+            AgentMode.COMPLETED,
+        )
+        self.assertEqual(
+            status_for_snapshot(row("codex", 5), now, **kwargs).mode,
+            AgentMode.WORKING,
+        )
+        self.assertEqual(
+            status_for_snapshot(row("codex", 20), now, **kwargs).mode,
+            AgentMode.COMPLETED,
+        )
+
     def test_phantom_desktop_sessions_are_hidden(self) -> None:
         # Claude Desktop probes sessions on launch: SessionStart directly
         # followed by SessionEnd, no prompt, no work. They must not appear;
@@ -5826,7 +5859,9 @@ class AgentMonitorTests(unittest.TestCase):
             display_name="tool-session",
             mode=AgentMode.WORKING,
             updated_at=now
-            - timedelta(seconds=collector_module.POST_TOOL_WORKING_VISIBLE_SECONDS + 1),
+            - timedelta(
+                seconds=collector_module.CODEX_POST_TOOL_WORKING_VISIBLE_SECONDS + 1
+            ),
             event_name="PostToolUse",
             session_id="tool-session",
             cwd="/tmp/project",
