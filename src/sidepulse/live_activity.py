@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .collector import AgentMonitor
+from .ipc import HookEventServer
 from .hook import write_hook_line
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
@@ -43,7 +44,7 @@ RECENT_FINISHED_SECONDS = 30 * 60.0
 TERMINAL_MODES = {"completed", "idle_ready"}
 MAX_NAME_CHARS = 120
 MAX_DETAIL_CHARS = 32
-PUSH_MIN_INTERVAL_SECONDS = 3.0
+PUSH_MIN_INTERVAL_SECONDS = 1.0
 PUSH_HEARTBEAT_SECONDS = 300.0
 # Push-to-start retry while active sessions exist but the phone has not
 # registered an activity: a start push can be lost or throttled, and the
@@ -648,6 +649,7 @@ class LiveActivityDaemon:
         self._condition = threading.Condition()
         self._latest: dict[str, Any] | None = None
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._last_push_at = 0.0
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
@@ -677,6 +679,21 @@ class LiveActivityDaemon:
         server = self._build_server()
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
+        # Hooks broadcast every event to the local unix socket as they log
+        # it; listening there turns the poll loop event-driven, so a state
+        # change reaches the phone in about a second instead of up to a
+        # full poll interval later. Polling remains as the fallback (and
+        # the socket may be owned by a status bar on this machine).
+        event_server = None
+        try:
+            event_server = HookEventServer(
+                lambda _provider, _line: self._wake.set()
+            )
+            event_server.start()
+            print("live-activity: hook event socket armed (instant ticks)")
+        except OSError as exc:
+            event_server = None
+            print(f"live-activity: no event socket ({exc}); polling only")
         print(
             f"live-activity: serving on 0.0.0.0:{self.config.port}, "
             f"topic {self.config.liveactivity_topic}, tokens {self.tokens.summary()}"
@@ -689,12 +706,19 @@ class LiveActivityDaemon:
                 except Exception as exc:  # keep the loop alive
                     print(f"live-activity: tick failed: {exc}")
                 elapsed = time.time() - started
-                self._stop.wait(max(0.2, self.config.poll_seconds - elapsed))
+                # A hook event wakes the loop immediately; otherwise poll.
+                # Wait first, then clear: an event that arrived during the
+                # tick returns instantly instead of being lost to the poll.
+                self._wake.wait(max(0.2, self.config.poll_seconds - elapsed))
+                self._wake.clear()
         finally:
+            if event_server is not None:
+                event_server.stop()
             server.shutdown()
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         with self._condition:
             self._condition.notify_all()
 
