@@ -45,6 +45,10 @@ TERMINAL_MODES = {"completed", "idle_ready"}
 MAX_NAME_CHARS = 120
 MAX_DETAIL_CHARS = 32
 PUSH_MIN_INTERVAL_SECONDS = 1.0
+# Cosmetic content (summary/detail text) coalesces into low-priority pushes
+# on this cadence, so the iOS update budget stays available for the
+# structural changes people actually watch for.
+COSMETIC_PUSH_INTERVAL_SECONDS = 20.0
 PUSH_HEARTBEAT_SECONDS = 300.0
 # Push-to-start retry while active sessions exist but the phone has not
 # registered an activity: a start push can be lost or throttled, and the
@@ -227,6 +231,22 @@ class DeepLinkResolver:
 
 
 _DEEP_LINKS: DeepLinkResolver | None = None
+
+
+def _structure_signature(content_state: dict[str, Any]) -> tuple:
+    """What people watch for: modes, row identity/order, unread, counts.
+
+    Name and detail text churn constantly while agents work; pushing those
+    at noticeable priority burns the system's update budget and delays the
+    changes that matter."""
+    return (
+        content_state.get("aggregateMode"),
+        content_state.get("activeCount"),
+        tuple(
+            (row.get("id"), row.get("mode"), row.get("unread"))
+            for row in content_state.get("agents", [])
+        ),
+    )
 
 
 def status_row(status: AgentStatus) -> dict[str, Any]:
@@ -650,6 +670,7 @@ class LiveActivityDaemon:
         self._latest: dict[str, Any] | None = None
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._last_pushed_signature: tuple | None = None
         self._last_push_at = 0.0
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
@@ -758,9 +779,19 @@ class LiveActivityDaemon:
             # activity without posting a separate notification banner.
             self._push_update(content_state, now, alert=ready_alerts[0])
         elif self.tokens.tokens("update"):
-            if changed and now - self._last_push_at >= PUSH_MIN_INTERVAL_SECONDS:
-                # A visible change (mode, count, agent) — deliver immediately.
+            signature = _structure_signature(content_state)
+            structural = signature != self._last_pushed_signature
+            if (
+                changed
+                and structural
+                and now - self._last_push_at >= PUSH_MIN_INTERVAL_SECONDS
+            ):
+                # A structural change (mode, row set, unread, counts) —
+                # deliver immediately at noticeable priority.
                 self._push_update(content_state, now, important=True)
+            elif changed and now - self._last_push_at >= COSMETIC_PUSH_INTERVAL_SECONDS:
+                # Text-only churn (summaries, tool names) coalesces quietly.
+                self._push_update(content_state, now, important=False)
             elif active and now - self._last_push_at >= PUSH_HEARTBEAT_SECONDS:
                 # Silent keep-alive against the stale-date; low priority.
                 self._push_update(content_state, now, important=False)
@@ -1132,6 +1163,7 @@ class LiveActivityDaemon:
             }
         self._apns_fanout("update", {"aps": aps}, priority=priority)
         self._activity_live = True
+        self._last_pushed_signature = _structure_signature(content_state)
 
     def _end_stale_activity(self, reason: str) -> None:
         with self._condition:
@@ -1236,6 +1268,8 @@ class LiveActivityDaemon:
                         self._json(400, {"error": "invalid body"})
                         return
                     marked = daemon.mark_finished_seen(str(body.get("id", "")))
+                    if marked:
+                        daemon._wake.set()
                     self._json(200, {"ok": True, "marked": marked})
                     return
                 if self.path != "/register":

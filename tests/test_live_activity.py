@@ -244,6 +244,30 @@ def test_ignored_display_name_prefix():
     assert not is_ignored_display_name("sidepulse: Merge main")
 
 
+def test_structure_signature_ignores_text_churn():
+    from sidepulse.live_activity import _structure_signature
+
+    base = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [
+            {"id": "a", "mode": "working", "name": "doing X", "detail": "Bash"},
+            {"id": "b", "mode": "completed", "name": "done Y", "unread": True},
+        ],
+        "updatedAt": 1.0,
+    }
+    renamed = {**base, "agents": [
+        {"id": "a", "mode": "working", "name": "doing Z", "detail": "Read"},
+        {"id": "b", "mode": "completed", "name": "done Y", "unread": True},
+    ]}
+    seen = {**base, "agents": [
+        base["agents"][0],
+        {"id": "b", "mode": "completed", "name": "done Y", "unread": False},
+    ]}
+    assert _structure_signature(base) == _structure_signature(renamed)
+    assert _structure_signature(base) != _structure_signature(seen)
+
+
 def test_finished_rows_track_unread_until_marked_seen(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore, build_content_state
 
