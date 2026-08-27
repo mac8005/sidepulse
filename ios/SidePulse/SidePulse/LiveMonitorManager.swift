@@ -59,25 +59,42 @@ final class LiveMonitorManager: ObservableObject {
                 self.observe(activity: activity, model: model)
             }
         }
-        // Activities that already exist when the app launches — and if there
-        // are none, tell the daemon so it can restart one immediately instead
-        // of updating an activity the last app update destroyed.
         if #available(iOS 17.2, *) {
-            var existing = Activity<AgentActivityAttributes>.activities
-            if existing.count > 1 {
-                existing.sort { $0.content.state.updatedAt > $1.content.state.updatedAt }
-                for stale in existing.dropFirst() {
-                    let activity = stale
-                    Task { await activity.end(nil, dismissalPolicy: .immediate) }
+            reconcileActivities(model: model)
+            // A start push whose activity token never reached the daemon
+            // leaves an orphan the Mac can no longer end, so the app clears
+            // leftovers every time it comes forward — not just at launch.
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.reconcileActivities(model: model)
                 }
-                existing = [existing[0]]
             }
-            for activity in existing {
-                observe(activity: activity, model: model)
+        }
+    }
+
+    /// Keep exactly one activity: the freshest. Older ones are orphans whose
+    /// tokens the daemon no longer has, so only the app can end them. With
+    /// none left, tell the daemon so it can start a fresh one.
+    @available(iOS 17.2, *)
+    private func reconcileActivities(model: AppModel) {
+        var existing = Activity<AgentActivityAttributes>.activities
+        if existing.count > 1 {
+            existing.sort { $0.content.state.updatedAt > $1.content.state.updatedAt }
+            for stale in existing.dropFirst() {
+                let activity = stale
+                Task { await activity.end(nil, dismissalPolicy: .immediate) }
             }
-            if existing.isEmpty {
-                Task { await self.sendReset(model: model) }
-            }
+            existing = [existing[0]]
+        }
+        for activity in existing {
+            observe(activity: activity, model: model)
+        }
+        if existing.isEmpty {
+            Task { await self.sendReset(model: model) }
         }
     }
 
