@@ -6,9 +6,10 @@ import UIKit
 struct AgentsLiveView: View {
     @ObservedObject var model: AppModel
     @StateObject private var stream = AgentStreamClient()
-    /// Rows tapped this session — dim immediately, before the daemon's
-    /// confirming push arrives over the stream.
-    @State private var locallySeen: Set<String> = []
+    /// Completions tapped this app session, keyed by the row's finish time
+    /// so the dimming applies only to the completion the user actually
+    /// opened — a session that finishes another turn re-arms as unread.
+    @State private var locallySeen: [String: Double] = [:]
 
     var body: some View {
         List {
@@ -48,14 +49,15 @@ struct AgentsLiveView: View {
     }
 
     private func isUnread(_ agent: AgentSnapshot.Agent) -> Bool {
-        agent.finishedAt != nil && agent.unread == true && !locallySeen.contains(agent.id)
+        guard let finishedAt = agent.finishedAt, agent.unread == true else { return false }
+        return locallySeen[agent.id] != finishedAt
     }
 
     /// Tell the daemon this finished session was opened; it re-pushes the
     /// dimmed state to the Live Activity and every other client.
     private func markSeen(_ agent: AgentSnapshot.Agent) {
-        guard isUnread(agent) else { return }
-        locallySeen.insert(agent.id)
+        guard isUnread(agent), let finishedAt = agent.finishedAt else { return }
+        locallySeen[agent.id] = finishedAt
         guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("seen") else {
             return
         }
@@ -64,7 +66,15 @@ struct AgentsLiveView: View {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": agent.id])
         request.timeoutInterval = 10
-        Task { _ = try? await URLSession.shared.data(for: request) }
+        Task {
+            // The daemon owns this state. If it never heard the tap, drop the
+            // local override rather than showing "read" over a row every
+            // other surface still reports as unread.
+            let ok = (try? await URLSession.shared.data(for: request))
+                .map { ($0.1 as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false }
+                ?? false
+            if !ok { locallySeen[agent.id] = nil }
+        }
     }
 
     @ViewBuilder
