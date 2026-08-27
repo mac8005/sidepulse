@@ -244,6 +244,41 @@ def test_ignored_display_name_prefix():
     assert not is_ignored_display_name("sidepulse: Merge main")
 
 
+def test_rate_limited_structural_change_still_pushes(tmp_path, monkeypatch):
+    # A structural change skipped for rate limiting must stay pending and go
+    # out on a later tick. Comparing against the last computed state instead
+    # of the last pushed one silently dropped it (a cleared unread badge
+    # then lingered until the next unrelated change or the heartbeat).
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("update", "upd", {"device": "phone", "activity_id": "a"})
+    pushes = []
+    monkeypatch.setattr(daemon, "_apns_fanout", lambda kind, payload, priority=10: pushes.append(priority))
+
+    def state(unread: bool, name: str = "done Y") -> dict:
+        return {
+            "aggregateMode": "idle_ready",
+            "activeCount": 0,
+            "agents": [{"id": "b", "mode": "completed", "name": name, "unread": unread}],
+            "updatedAt": 0.0,
+        }
+
+    daemon._push_update(state(True), now=1000.0)
+    assert pushes == [10]
+
+    # The unread clear lands inside the minimum interval: nothing goes out...
+    daemon._last_push_at = 1000.0
+    assert daemon._differs_from_pushed(state(False)) is True
+
+    # ...and the very next tick must still see it as pending and push it.
+    daemon._push_update(state(False), now=1000.5)
+    assert pushes == [10, 10]
+    assert daemon._differs_from_pushed(state(False)) is False
+
+
 def test_structure_signature_ignores_text_churn():
     from sidepulse.live_activity import _structure_signature
 

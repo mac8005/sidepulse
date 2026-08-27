@@ -23,7 +23,7 @@ struct AgentsLiveView: View {
                             markSeen(agent)
                         }
                         .listRowBackground(
-                            isUnread(agent) ? Color.green.opacity(0.10) : nil
+                            isUnread(agent) ? Color.green.opacity(0.16) : nil
                         )
                     }
                 } else if stream.snapshot != nil {
@@ -87,6 +87,15 @@ struct AgentsLiveView: View {
             }
             Spacer()
             if let snapshot = stream.snapshot {
+                let unread = snapshot.agents.filter(isUnread).count
+                if unread > 0 {
+                    Label("\(unread) new", systemImage: "bell.badge.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.green, in: Capsule())
+                }
                 Text("\(snapshot.activeCount) active")
                     .font(.subheadline.bold())
             }
@@ -140,6 +149,18 @@ private struct AgentLiveRow: View {
     }
 
     private var rowContent: some View {
+        HStack(spacing: 0) {
+            // Unread sessions carry a green edge bar so they are obvious
+            // even at a glance down a long list.
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(isUnread ? Color.green : Color.clear)
+                .frame(width: 4)
+                .padding(.trailing, isUnread ? 8 : 0)
+            details
+        }
+    }
+
+    private var details: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .top, spacing: 10) {
                 glyph
@@ -147,10 +168,20 @@ private struct AgentLiveRow: View {
                     .foregroundStyle(color(agent.mode))
                     .frame(width: 16)
                     .padding(.top, 3)
-                Text(agent.name)
-                    .font(isUnread ? .body.weight(.semibold) : .body)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 3) {
+                    if isUnread {
+                        Text("NEW")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green, in: Capsule())
+                    }
+                    Text(agent.name)
+                        .font(isUnread ? .body.weight(.bold) : .body)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             HStack(spacing: 6) {
                 if let provider = agent.provider {

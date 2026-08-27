@@ -671,6 +671,7 @@ class LiveActivityDaemon:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._last_pushed_signature: tuple | None = None
+        self._last_pushed_state: dict[str, Any] | None = None
         self._last_push_at = 0.0
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
@@ -779,17 +780,17 @@ class LiveActivityDaemon:
             # activity without posting a separate notification banner.
             self._push_update(content_state, now, alert=ready_alerts[0])
         elif self.tokens.tokens("update"):
-            signature = _structure_signature(content_state)
-            structural = signature != self._last_pushed_signature
-            if (
-                changed
-                and structural
-                and now - self._last_push_at >= PUSH_MIN_INTERVAL_SECONDS
-            ):
+            # Compare against what was actually PUSHED, never against the
+            # last computed state: a change skipped for rate limiting must
+            # stay pending and go out on a later tick, not be forgotten
+            # because the in-memory state already moved on.
+            structural = _structure_signature(content_state) != self._last_pushed_signature
+            cosmetic = not structural and self._differs_from_pushed(content_state)
+            if structural and now - self._last_push_at >= PUSH_MIN_INTERVAL_SECONDS:
                 # A structural change (mode, row set, unread, counts) —
                 # deliver immediately at noticeable priority.
                 self._push_update(content_state, now, important=True)
-            elif changed and now - self._last_push_at >= COSMETIC_PUSH_INTERVAL_SECONDS:
+            elif cosmetic and now - self._last_push_at >= COSMETIC_PUSH_INTERVAL_SECONDS:
                 # Text-only churn (summaries, tool names) coalesces quietly.
                 self._push_update(content_state, now, important=False)
             elif active and now - self._last_push_at >= PUSH_HEARTBEAT_SECONDS:
@@ -1030,6 +1031,13 @@ class LiveActivityDaemon:
         except OSError:
             pass
 
+    def _differs_from_pushed(self, content_state: dict[str, Any]) -> bool:
+        if self._last_pushed_state is None:
+            return True
+        old = {k: v for k, v in self._last_pushed_state.items() if k != "updatedAt"}
+        new = {k: v for k, v in content_state.items() if k != "updatedAt"}
+        return old != new
+
     def _meaningfully_changed(self, content_state: dict[str, Any]) -> bool:
         if self._latest is None:
             return True
@@ -1164,6 +1172,7 @@ class LiveActivityDaemon:
         self._apns_fanout("update", {"aps": aps}, priority=priority)
         self._activity_live = True
         self._last_pushed_signature = _structure_signature(content_state)
+        self._last_pushed_state = content_state
 
     def _end_stale_activity(self, reason: str) -> None:
         with self._condition:
