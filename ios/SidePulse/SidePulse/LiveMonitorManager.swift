@@ -95,7 +95,53 @@ final class LiveMonitorManager: ObservableObject {
         }
         if existing.isEmpty {
             Task { await self.sendReset(model: model) }
+            // iOS refuses push-to-start while an app stays force-quit (and
+            // after an app update), so waiting for the Mac can leave the
+            // Live Activity gone for good. The app can always start one
+            // itself; the daemon takes over as soon as its token arrives.
+            startActivityLocally(model: model)
         }
+    }
+
+    @available(iOS 17.2, *)
+    private func startActivityLocally(model: AppModel) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            statusMessage = "Live Activities are turned off in Settings"
+            return
+        }
+        Task {
+            let label = await hostLabel(model: model)
+            let state = AgentActivityAttributes.ContentState(
+                aggregateMode: "idle_ready",
+                activeCount: 0,
+                agents: [],
+                updatedAt: Date().timeIntervalSince1970
+            )
+            do {
+                let activity = try Activity.request(
+                    attributes: AgentActivityAttributes(hostLabel: label),
+                    content: ActivityContent(state: state, staleDate: nil),
+                    pushType: .token
+                )
+                observe(activity: activity, model: model)
+                statusMessage = "Live Activity started"
+            } catch {
+                statusMessage = "Could not start Live Activity: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// The daemon's own label for the host; activity attributes are fixed at
+    /// creation, so an app-started activity must get this right up front.
+    private func hostLabel(model: AppModel) async -> String {
+        let fallback = URL(string: model.liveMonitorServerURL)?.host ?? "Mac"
+        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("health"),
+              let (data, _) = try? await URLSession.shared.data(from: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let label = object["hostLabel"] as? String,
+              !label.isEmpty
+        else { return fallback }
+        return label
     }
 
     private func sendReset(model: AppModel) async {

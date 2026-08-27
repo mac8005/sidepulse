@@ -1310,7 +1310,16 @@ class LiveActivityDaemon:
 
             def do_GET(self) -> None:
                 if self.path == "/health":
-                    self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
+                    self._json(
+                        200,
+                        {
+                            "ok": True,
+                            "tokens": daemon.tokens.summary(),
+                            # The app needs this to label an activity it
+                            # starts itself; attributes are fixed at creation.
+                            "hostLabel": daemon.config.host_label,
+                        },
+                    )
                 elif self.path == "/snapshot":
                     with daemon._condition:
                         latest = daemon._latest
@@ -1387,11 +1396,17 @@ class LiveActivityDaemon:
                 if kind == "update":
                     daemon._activity_live = True
                     daemon._start_push_attempts = 0
-                elif kind == "push_to_start" and is_new:
-                    # Fresh install or token rotation: any previously known
-                    # activity is stale. End it, forget its tokens, and allow
-                    # an immediate restart on the next tick.
-                    daemon._end_stale_activity("new push-to-start token")
+                elif kind == "push_to_start":
+                    if is_new:
+                        # Fresh install or token rotation: any previously
+                        # known activity is stale. End it, forget its tokens,
+                        # and allow an immediate restart on the next tick.
+                        daemon._end_stale_activity("new push-to-start token")
+                    else:
+                        # The app is running and reachable again, so earlier
+                        # unanswered start pushes (iOS drops them while an app
+                        # stays force-quit) should not keep the cap closed.
+                        daemon._start_push_attempts = 0
                 print(f"live-activity: registered {kind} token from {meta['device'] or 'unknown'}")
                 self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
 

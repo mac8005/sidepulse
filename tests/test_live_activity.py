@@ -279,6 +279,36 @@ def test_rate_limited_structural_change_still_pushes(tmp_path, monkeypatch):
     assert daemon._differs_from_pushed(state(False)) is False
 
 
+def test_reregistering_push_to_start_reopens_the_start_cap(tmp_path, monkeypatch):
+    # iOS drops start pushes while an app stays force-quit, so those attempts
+    # burn the cap. Launching the app re-registers its (unchanged) token, and
+    # that evidence must reopen the cap or the activity never comes back.
+    from sidepulse.live_activity import (
+        MAX_UNANSWERED_START_PUSHES,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("push_to_start", "p2s", {"device": "phone", "activity_id": ""})
+    daemon._start_push_attempts = MAX_UNANSWERED_START_PUSHES
+
+    sent = []
+    monkeypatch.setattr(daemon, "_apns_fanout", lambda kind, payload, priority=10: sent.append(kind))
+    state = {"aggregateMode": "working", "activeCount": 1, "agents": [], "updatedAt": 0.0}
+
+    daemon._maybe_push_to_start(state, 10_000.0)
+    assert sent == [], "capped: no more activities may be stacked"
+
+    # What the register handler does for an already-known token.
+    daemon._start_push_attempts = 0
+    daemon._maybe_push_to_start(state, 10_000.0)
+    assert sent == ["push_to_start"]
+
+
 def test_shrink_payload_fits_oversized_pushes():
     from sidepulse.live_activity import APNS_PAYLOAD_LIMIT_BYTES, shrink_payload
     import json as _json
