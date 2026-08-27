@@ -239,6 +239,49 @@ class DeepLinkResolver:
 _DEEP_LINKS: DeepLinkResolver | None = None
 
 
+APNS_PAYLOAD_LIMIT_BYTES = 4096
+
+
+def shrink_payload(payload: dict[str, Any], limit: int = APNS_PAYLOAD_LIMIT_BYTES) -> dict[str, Any]:
+    """Keep a push under the APNs size limit.
+
+    An oversized payload is rejected outright (413) and the update is lost
+    entirely, so deliver a trimmed one instead. Sheds the least useful
+    content first: deep links, directories and tool details, then long
+    names, and only then whole rows from the end (finished sessions sort
+    last, so active work survives longest).
+    """
+
+    def encoded(value: dict[str, Any]) -> int:
+        return len(json.dumps(value, separators=(",", ":")).encode())
+
+    if encoded(payload) <= limit:
+        return payload
+
+    trimmed = json.loads(json.dumps(payload))
+    rows = trimmed.get("aps", {}).get("content-state", {}).get("agents")
+    if not isinstance(rows, list):
+        return trimmed
+
+    for key in ("deepLink", "cwd", "detail"):
+        if encoded(trimmed) <= limit:
+            return trimmed
+        for row in rows:
+            row.pop(key, None)
+
+    for cap in (80, 60, 40):
+        if encoded(trimmed) <= limit:
+            return trimmed
+        for row in rows:
+            name = row.get("name")
+            if isinstance(name, str) and len(name) > cap:
+                row["name"] = name[: cap - 1] + "\u2026"
+
+    while rows and encoded(trimmed) > limit:
+        rows.pop()
+    return trimmed
+
+
 def _structure_signature(content_state: dict[str, Any]) -> tuple:
     """What people watch for: modes, row identity/order, unread, counts.
 
@@ -432,8 +475,6 @@ class APNsLiveActivityClient:
     ) -> tuple[int, str]:
         import httpx
 
-        if self._client is None:
-            self._client = httpx.Client(http2=True, timeout=10.0)
         url = f"https://{self.config.apns_host}/3/device/{token}"
         headers = {
             "authorization": f"bearer {self._token()}",
@@ -442,11 +483,26 @@ class APNsLiveActivityClient:
             "apns-priority": str(priority),
             "apns-expiration": "0",
         }
-        try:
-            response = self._client.post(url, json=payload, headers=headers)
-            return response.status_code, response.text
-        except httpx.HTTPError as exc:
-            return 0, str(exc)
+        last_error = ""
+        for attempt in range(3):
+            if self._client is None:
+                self._client = httpx.Client(http2=True, timeout=10.0)
+            try:
+                response = self._client.post(url, json=payload, headers=headers)
+                return response.status_code, response.text
+            except httpx.HTTPError as exc:
+                # A half-dead HTTP/2 connection surfaces here (seen as
+                # "[Errno 35] Resource temporarily unavailable"), and the
+                # push was simply lost. Reconnect and try again.
+                last_error = str(exc)
+                try:
+                    self._client.close()
+                except Exception:
+                    pass
+                self._client = None
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        return 0, last_error
 
 
 SUMMARY_MAX_CHARS = 90
@@ -1054,6 +1110,7 @@ class LiveActivityDaemon:
     # -- APNs ----------------------------------------------------------
 
     def _apns_fanout(self, kind: str, payload: dict[str, Any], priority: int = 10) -> None:
+        payload = shrink_payload(payload)
         for token in self.tokens.tokens(kind):
             status, body = self.apns.send(token, payload, priority=priority)
             if status == 410 or (status == 400 and "BadDeviceToken" in body):

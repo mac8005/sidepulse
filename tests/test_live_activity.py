@@ -279,6 +279,89 @@ def test_rate_limited_structural_change_still_pushes(tmp_path, monkeypatch):
     assert daemon._differs_from_pushed(state(False)) is False
 
 
+def test_shrink_payload_fits_oversized_pushes():
+    from sidepulse.live_activity import APNS_PAYLOAD_LIMIT_BYTES, shrink_payload
+    import json as _json
+
+    small = {"aps": {"content-state": {"agents": [{"id": "a", "name": "short"}]}}}
+    assert shrink_payload(small) is small  # untouched
+
+    big = {
+        "aps": {
+            "event": "update",
+            "content-state": {
+                "aggregateMode": "working",
+                "activeCount": 9,
+                "agents": [
+                    {
+                        "id": f"claude:session:{i}",
+                        "name": "A very long session summary that keeps going " * 4,
+                        "mode": "working",
+                        "detail": "Bash",
+                        "cwd": "some/deep/directory",
+                        "deepLink": "https://claude.ai/chat/" + "x" * 60,
+                    }
+                    for i in range(20)
+                ],
+                "updatedAt": 1.0,
+            },
+        }
+    }
+    assert len(_json.dumps(big, separators=(",", ":")).encode()) > APNS_PAYLOAD_LIMIT_BYTES
+
+    fitted = shrink_payload(big)
+    assert len(_json.dumps(fitted, separators=(",", ":")).encode()) <= APNS_PAYLOAD_LIMIT_BYTES
+    state = fitted["aps"]["content-state"]
+    assert state["aggregateMode"] == "working"  # structure survives
+    assert state["agents"], "some rows must survive"
+    assert big["aps"]["content-state"]["agents"][0].get("deepLink")  # original untouched
+
+
+def test_apns_send_retries_transient_transport_errors(monkeypatch):
+    import httpx
+    from sidepulse.live_activity import APNsLiveActivityClient, LiveActivityConfig
+    from pathlib import Path as _Path
+
+    config = LiveActivityConfig(apns_key_path=_Path("/tmp/k.p8"), apns_key_id="K", apns_team_id="T")
+    client = APNsLiveActivityClient(config)
+    monkeypatch.setattr(client, "_token", lambda: "jwt")
+    monkeypatch.setattr("sidepulse.live_activity.time.sleep", lambda _s: None)
+
+    attempts = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def post(self, url, json, headers):
+            attempts.append(url)
+            if len(attempts) < 3:
+                raise httpx.ConnectError("[Errno 35] Resource temporarily unavailable")
+            return FakeResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: FakeClient())
+    status, body = client.send("tok", {"aps": {}})
+    assert (status, body) == (200, "ok")
+    assert len(attempts) == 3
+
+    # Exhausted retries report the transport error rather than a fake success.
+    attempts.clear()
+
+    class AlwaysFails(FakeClient):
+        def post(self, url, json, headers):
+            attempts.append(url)
+            raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: AlwaysFails())
+    status, body = client.send("tok", {"aps": {}})
+    assert status == 0 and "boom" in body
+    assert len(attempts) == 3
+
+
 def test_structure_signature_ignores_text_churn():
     from sidepulse.live_activity import _structure_signature
 
