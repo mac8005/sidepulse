@@ -145,15 +145,29 @@ private struct IslandCompactTrailing: View {
     let groups: ModeGroups
 
     var body: some View {
-        if groups.unreadDone > 0 {
-            HStack(spacing: 3) {
+        // Never hand WidgetKit an empty compact region: with nothing to
+        // report the island fails to present at all, leaving only the Lock
+        // Screen card. The count still means unread and nothing else.
+        Group {
+            if groups.unreadDone > 0 {
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("\(groups.unreadDone)")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .contentTransition(.numericText())
+                }
+                .foregroundStyle(Color.statusDone)
+            } else if groups.done > 0 {
+                // Finished, all seen: a quiet check, no number.
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 11, weight: .semibold))
-                Text("\(groups.unreadDone)")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .contentTransition(.numericText())
+                    .foregroundStyle(Color.statusDone.opacity(0.45))
+            } else {
+                Circle()
+                    .fill(Color.white.opacity(0.18))
+                    .frame(width: 6, height: 6)
             }
-            .foregroundStyle(Color.statusDone)
         }
     }
 }

@@ -604,9 +604,9 @@ class SessionSummarizer:
     def _generate(self, message: str, context: str, style: str = "outcome") -> str | None:
         if style == "task":
             instruction = (
-                "An AI coding session is working on a request; its most "
+                "A coding session is working on a request; its most "
                 "recent actions may be listed. In at most six words, present "
-                "progressive, say what it is doing RIGHT NOW — 'sidepulse: "
+                "progressive, say what is being done RIGHT NOW — 'sidepulse: "
                 "deploying build to TestFlight', 'kleido: running tests "
                 "after merge'. Prefer the latest action over the request "
                 "when they differ. The text may contain heavy typos; read "
@@ -614,9 +614,8 @@ class SessionSummarizer:
             )
         else:
             instruction = (
-                "Summarize the state or outcome this AI assistant message "
-                "describes in at most six words — 'scalper fee cap fixed', "
-                "'sidepulse build on TestFlight'. "
+                "Summarize the state or outcome described in at most six words — "
+                "'scalper fee cap fixed', 'sidepulse build on TestFlight'. "
             )
         prompt = (
             instruction
