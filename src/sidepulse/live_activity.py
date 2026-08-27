@@ -56,6 +56,12 @@ PUSH_HEARTBEAT_SECONDS = 300.0
 # alert, so retries back off (2, 4, 8, 16, then every 30 minutes).
 PUSH_TO_START_COOLDOWN_SECONDS = 120.0
 PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
+# Every start push creates a NEW activity, and one whose token never reaches
+# the daemon can no longer be ended remotely — it just sits on the Lock
+# Screen. So keep a hard floor between any two start pushes, and stop after
+# a few unanswered ones until the phone proves something changed.
+START_PUSH_MIN_GAP_SECONDS = 45.0
+MAX_UNANSWERED_START_PUSHES = 3
 SSE_HEARTBEAT_SECONDS = 10.0
 # A live daemon refreshes within PUSH_HEARTBEAT; a longer stale window
 # lets iOS dim the activity if the mini stops pushing.
@@ -940,10 +946,11 @@ class LiveActivityDaemon:
         if status.cwd:
             payload["cwd"] = status.cwd
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line: dict[str, Any] = {"logged_at": timestamp}
         if status.provider == "codex":
-            line: dict[str, Any] = {"logged_at": timestamp, "event": payload}
+            line["event"] = payload
         else:
-            line = {"logged_at": timestamp, **payload}
+            line.update(payload)
         try:
             write_hook_line(path, line)
         except OSError:
@@ -1054,9 +1061,10 @@ class LiveActivityDaemon:
                 print(f"live-activity: dropping dead {kind} token ({status})")
                 self.tokens.drop(kind, token)
                 if kind == "update" and not self.tokens.tokens("update"):
-                    # The phone's activity is gone; allow a prompt restart.
+                    # The phone's activity is gone; allow a restart on the
+                    # next tick (the floor still applies, so a flapping token
+                    # cannot spawn a stack of activities).
                     self._activity_live = False
-                    self._last_start_push_at = 0.0
                     self._start_push_attempts = 0
             elif status != 200:
                 print(f"live-activity: APNs {kind} push -> {status} {body[:120]}")
@@ -1108,12 +1116,23 @@ class LiveActivityDaemon:
     def _maybe_push_to_start(self, content_state: dict[str, Any], now: float) -> None:
         if not self.tokens.tokens("push_to_start"):
             return
-        # First retry after the base cooldown, then doubling per attempt.
-        wait = min(
-            PUSH_TO_START_COOLDOWN_SECONDS * (2 ** max(0, self._start_push_attempts - 1)),
-            PUSH_TO_START_MAX_BACKOFF_SECONDS,
+        if self._start_push_attempts >= MAX_UNANSWERED_START_PUSHES:
+            # Starting more activities would only stack unreachable ones.
+            # Wait for evidence: a registered update token, a dead token, or
+            # the app reporting it has no activity.
+            return
+        # First retry after the base cooldown, then doubling per attempt —
+        # but never faster than the floor, even right after a reset.
+        wait = max(
+            START_PUSH_MIN_GAP_SECONDS,
+            min(
+                PUSH_TO_START_COOLDOWN_SECONDS * (2 ** max(0, self._start_push_attempts - 1)),
+                PUSH_TO_START_MAX_BACKOFF_SECONDS,
+            )
+            if self._start_push_attempts
+            else 0.0,
         )
-        if self._last_start_push_at and now - self._last_start_push_at < wait:
+        if now - self._last_start_push_at < wait:
             return
         self._last_start_push_at = now
         self._start_push_attempts += 1
@@ -1197,8 +1216,6 @@ class LiveActivityDaemon:
             print(f"live-activity: {reason}; will restart")
         self.tokens.clear("update")
         self._activity_live = False
-        self._start_push_attempts = 0
-        self._last_start_push_at = 0.0
         self._start_push_attempts = 0
 
     def _push_end(self, content_state: dict[str, Any], now: float) -> None:
