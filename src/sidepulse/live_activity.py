@@ -50,10 +50,10 @@ PUSH_MIN_INTERVAL_SECONDS = 1.0
 # structural changes people actually watch for.
 COSMETIC_PUSH_INTERVAL_SECONDS = 20.0
 PUSH_HEARTBEAT_SECONDS = 300.0
-# Push-to-start retry while active sessions exist but the phone has not
-# registered an activity: a start push can be lost or throttled, and the
-# system ends activities after eight hours. Each start push carries an
-# alert, so retries back off (2, 4, 8, 16, then every 30 minutes).
+# Push-to-start retry while there is something to show but the phone has
+# not registered an activity: a start push can be lost or throttled, and the
+# system ends activities after eight hours. A start push for active work
+# alerts, so retries back off (2, 4, 8, 16, then every 30 minutes).
 PUSH_TO_START_COOLDOWN_SECONDS = 120.0
 PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
 # Every start push creates a NEW activity, and one whose token never reaches
@@ -105,6 +105,16 @@ class LiveActivityConfig:
     @property
     def liveactivity_topic(self) -> str:
         return f"{self.bundle_id}.push-type.liveactivity"
+
+
+def _log(message: str) -> None:
+    """One timestamped daemon line.
+
+    launchd captures stdout to a file that is only ever read after the fact,
+    when the question is "what happened at 11:15?" — an untimestamped line
+    cannot answer it.
+    """
+    print(f"{datetime.now().strftime('%H:%M:%S')} live-activity: {message}", flush=True)
 
 
 def default_token_store_path() -> Path:
@@ -718,17 +728,17 @@ class SessionSummarizer:
                 env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"live-activity: summary generation failed: {exc}")
+            _log(f"summary generation failed: {exc}")
             return None
         if result.returncode != 0:
-            print(f"live-activity: claude -p exited {result.returncode}: {result.stderr[:120]}")
+            _log(f"claude -p exited {result.returncode}: {result.stderr[:120]}")
             return None
         line = result.stdout.strip().splitlines()
         # Models sometimes add a trailing period or stray spaces; row text
         # must be clean — it renders as a one-line title.
         text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
         if text:
-            print(f"live-activity: summary -> {text[:70]}")
+            _log(f"summary -> {text[:70]}")
             return _truncate(text, SUMMARY_MAX_CHARS)
         return None
 
@@ -785,12 +795,12 @@ class LiveActivityDaemon:
                 lambda _provider, _line: self._wake.set()
             )
             event_server.start()
-            print("live-activity: hook event socket armed (instant ticks)")
+            _log("hook event socket armed (instant ticks)")
         except OSError as exc:
             event_server = None
-            print(f"live-activity: no event socket ({exc}); polling only")
-        print(
-            f"live-activity: serving on 0.0.0.0:{self.config.port}, "
+            _log(f"no event socket ({exc}); polling only")
+        _log(
+            f"serving on 0.0.0.0:{self.config.port}, "
             f"topic {self.config.liveactivity_topic}, tokens {self.tokens.summary()}"
         )
         try:
@@ -799,7 +809,7 @@ class LiveActivityDaemon:
                 try:
                     self._tick()
                 except Exception as exc:  # keep the loop alive
-                    print(f"live-activity: tick failed: {exc}")
+                    _log(f"tick failed: {exc}")
                 elapsed = time.time() - started
                 # A hook event wakes the loop immediately; otherwise poll.
                 # Wait first, then clear: an event that arrived during the
@@ -879,11 +889,6 @@ class LiveActivityDaemon:
 
         if active:
             self._idle_since = None
-            if not self.tokens.tokens("update"):
-                # Evidence over belief: only a registered update token proves
-                # an activity is live on the phone. Keep asking (rate-limited)
-                # until one arrives, whatever an earlier start push claimed.
-                self._maybe_push_to_start(content_state, now)
         else:
             if self._idle_since is None:
                 self._idle_since = now
@@ -894,6 +899,14 @@ class LiveActivityDaemon:
             ):
                 # Nothing active and nothing recently finished — safe to end.
                 self._push_end(content_state, now)
+
+        # Evidence over belief: only a registered update token proves an
+        # activity is live on the phone. Keep asking (rate-limited) until one
+        # arrives, whatever an earlier start push claimed. Finished rows earn
+        # an island too: gating this on active work meant an activity that
+        # died while the host idled stayed dead until new work began.
+        if (active or self._recent_finished) and not self.tokens.tokens("update"):
+            self._maybe_push_to_start(content_state, now)
 
     def _sync_background_tasks(self, statuses, now: float) -> None:
         """Mirror held-open sessions onto the Moonside lamp markers.
@@ -914,7 +927,7 @@ class LiveActivityDaemon:
 
         for session_id in holding_now - self._bg_holding:
             self._moonside_marker(session_id, "working", expect=("idle", None))
-            print(f"live-activity: {session_id[:8]} has background tasks; holding busy")
+            _log(f"{session_id[:8]} has background tasks; holding busy")
         for session_id in self._bg_holding - holding_now:
             # Finished or resumed; real hook writes win, this only cleans up
             # a marker still showing our flip.
@@ -1133,7 +1146,7 @@ class LiveActivityDaemon:
         for token in self.tokens.tokens(kind):
             status, body = self.apns.send(token, payload, priority=priority)
             if status == 410 or (status == 400 and "BadDeviceToken" in body):
-                print(f"live-activity: dropping dead {kind} token ({status})")
+                _log(f"dropping dead {kind} token ({status})")
                 self.tokens.drop(kind, token)
                 if kind == "update" and not self.tokens.tokens("update"):
                     # The phone's activity is gone; allow a restart on the
@@ -1142,7 +1155,7 @@ class LiveActivityDaemon:
                     self._activity_live = False
                     self._start_push_attempts = 0
             elif status != 200:
-                print(f"live-activity: APNs {kind} push -> {status} {body[:120]}")
+                _log(f"APNs {kind} push -> {status} {body[:120]}")
 
     def _defer_finished_alerts(
         self, alerts: list[dict[str, str]], statuses, now: float
@@ -1236,21 +1249,23 @@ class LiveActivityDaemon:
             return
         self._last_start_push_at = now
         self._start_push_attempts += 1
-        payload = {
-            "aps": {
-                "timestamp": int(now),
-                "event": "start",
-                "content-state": content_state,
-                "relevance-score": 100,
-                "attributes-type": ATTRIBUTES_TYPE,
-                "attributes": {"hostLabel": self.config.host_label},
-                "alert": {
-                    "title": f"Agents active on {self.config.host_label}",
-                    "body": f"{content_state['activeCount']} agent(s) running",
-                },
-            }
+        aps: dict[str, Any] = {
+            "timestamp": int(now),
+            "event": "start",
+            "content-state": content_state,
+            "relevance-score": 100,
+            "attributes-type": ATTRIBUTES_TYPE,
+            "attributes": {"hostLabel": self.config.host_label},
         }
-        print("live-activity: sending push-to-start")
+        if content_state["activeCount"]:
+            aps["alert"] = {
+                "title": f"Agents active on {self.config.host_label}",
+                "body": f"{content_state['activeCount']} agent(s) running",
+            }
+        # Putting the island back for work that already finished is a repair,
+        # not news: it starts silently.
+        payload = {"aps": aps}
+        _log("sending push-to-start")
         self._apns_fanout("push_to_start", payload)
         # _activity_live flips only when the phone registers the activity's
         # update token — a sent start push is not a started activity.
@@ -1282,7 +1297,7 @@ class LiveActivityDaemon:
         # alerts); 5 only for the silent heartbeat.
         priority = 10 if (alert or important) else 5
         if alert:
-            print(f"live-activity: alerting update -> {alert['title']}")
+            _log(f"alerting update -> {alert['title']}")
             aps["alert"] = {
                 "title": alert["title"],
                 "body": alert["body"],
@@ -1297,7 +1312,7 @@ class LiveActivityDaemon:
         with self._condition:
             latest = self._latest
         if self.tokens.tokens("update"):
-            print(f"live-activity: {reason}; ending stale activity")
+            _log(f"{reason}; ending stale activity")
             payload = {
                 "aps": {
                     "timestamp": int(time.time()),
@@ -1313,7 +1328,7 @@ class LiveActivityDaemon:
             }
             self._apns_fanout("update", payload)
         else:
-            print(f"live-activity: {reason}; will restart")
+            _log(f"{reason}; will restart")
         self.tokens.clear("update")
         self._activity_live = False
         self._start_push_attempts = 0
@@ -1327,7 +1342,7 @@ class LiveActivityDaemon:
                 "dismissal-date": int(now),
             }
         }
-        print("live-activity: ending activity (idle)")
+        _log("ending activity (idle)")
         self._apns_fanout("update", payload)
         self.tokens.clear("update")
         self._activity_live = False
@@ -1459,7 +1474,7 @@ class LiveActivityDaemon:
                         # unanswered start pushes (iOS drops them while an app
                         # stays force-quit) should not keep the cap closed.
                         daemon._start_push_attempts = 0
-                print(f"live-activity: registered {kind} token from {meta['device'] or 'unknown'}")
+                _log(f"registered {kind} token from {meta['device'] or 'unknown'}")
                 self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
 
         class Server(ThreadingHTTPServer):
