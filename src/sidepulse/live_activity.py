@@ -73,6 +73,12 @@ PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
 # Screen. So keep a hard floor between any two start pushes, and stop after
 # a few unanswered ones until the phone proves something changed.
 START_PUSH_MIN_GAP_SECONDS = 45.0
+# The app reports "no activity" when our OWN dedup ends the previous one:
+# an immediate end flips that activity to .dismissed, which the app cannot
+# tell from a swipe-away. Acting on that echo ends the activity we just
+# started, and the next start push repeats it. Ignore resets this close to
+# a start push — a real "the phone has nothing" reset survives the wait.
+RESET_ECHO_SECONDS = 60.0
 MAX_UNANSWERED_START_PUSHES = 3
 # iOS ends a Live Activity eight hours in: the Dynamic Island slot goes at
 # once while a dead card lingers on the Lock Screen for hours. Rotate a
@@ -1216,6 +1222,15 @@ class LiveActivityDaemon:
         self._deferred_alerts = still_waiting
         return ready
 
+    def _is_reset_echo(self, now: float) -> bool:
+        """Is this reset our own dedup coming back at us?
+
+        Starting an activity ends the previous one, and the app cannot tell
+        that dismissal from a swipe-away, so it reports "no activity" about a
+        second after every start push. Believing it kills the new activity.
+        """
+        return bool(self._last_start_push_at) and now - self._last_start_push_at < RESET_ECHO_SECONDS
+
     def _activity_started_at(self, activity_id: str) -> float | None:
         """When this activity first registered, across token rotations."""
         if not activity_id:
@@ -1466,6 +1481,10 @@ class LiveActivityDaemon:
                 if kind == "reset":
                     # The app launched and found no live activity on the
                     # phone — whatever update tokens we hold are dead.
+                    if daemon._is_reset_echo(time.time()):
+                        _log("ignoring reset echo just after a start push")
+                        self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
+                        return
                     daemon._end_stale_activity("app reports no activity")
                     self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                     return

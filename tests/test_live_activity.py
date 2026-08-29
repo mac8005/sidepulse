@@ -841,3 +841,28 @@ def test_an_idle_activity_is_probed_so_a_silent_death_is_noticed(tmp_path, monke
     daemon._last_push_at -= 2
     daemon._tick()
     assert sent == [10, 5], "a silent probe, so a dead activity 410s"
+
+
+def test_a_reset_echoing_our_own_start_push_is_ignored(tmp_path, monkeypatch):
+    # Starting an activity ends the previous one, and .immediate dismissal
+    # flips that one to .dismissed — which the app cannot tell from a
+    # swipe-away, so it reports "no activity" a second after every start
+    # push. Believing it ended the activity we had just created, and the
+    # next start push repeated the whole cycle: the island never survived.
+    from sidepulse.live_activity import (
+        RESET_ECHO_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    # No start push has ever gone out: a reset is genuine news.
+    assert daemon._is_reset_echo(10_000.0) is False
+
+    daemon._last_start_push_at = 10_000.0
+    assert daemon._is_reset_echo(10_001.0) is True, "one second later: our own echo"
+    assert daemon._is_reset_echo(10_000.0 + RESET_ECHO_SECONDS + 1) is False, "later: genuine"
