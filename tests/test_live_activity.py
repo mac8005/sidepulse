@@ -609,6 +609,31 @@ def test_stop_with_running_background_tasks_is_long_task():
     assert mode_for_event(stop([{"id": "b1", "status": "completed"}])) == AgentMode.COMPLETED
 
 
+def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from sidepulse.live_activity import SessionSummarizer
+
+    command = []
+
+    def fake_run(args, **_kwargs):
+        command.extend(args)
+        return SimpleNamespace(returncode=0, stdout="sidepulse: tests passing\n", stderr="")
+
+    summarizer = object.__new__(SessionSummarizer)
+    summarizer.model = "claude-haiku-test"
+    summarizer.claude = "/usr/local/bin/claude"
+    summarizer.workdir = tmp_path
+    summarizer.moonside_dir = tmp_path / "moonside"
+    monkeypatch.setattr("sidepulse.live_activity.subprocess.run", fake_run)
+
+    assert summarizer._generate("Tests pass.", "working directory: sidepulse") == (
+        "sidepulse: tests passing"
+    )
+    tools_index = command.index("--tools")
+    assert command[tools_index + 1] == ""
+
+
 def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
     import time as _time
 

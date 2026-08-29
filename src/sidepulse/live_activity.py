@@ -581,9 +581,10 @@ class SessionSummarizer:
     """Turns a session's last assistant message into a tiny outcome line
     ("TestFlight build deployed") via `claude -p` on a fast model.
 
-    Runs the CLI with an isolated cwd whose path contains an ignored
-    directory name and a private MOONSIDE_RUNTIME_DIR, so the summary
-    sessions never appear in any monitor or on the lamp.
+    Runs the CLI without tools and with an isolated cwd whose path contains
+    an ignored directory name and a private MOONSIDE_RUNTIME_DIR, so the
+    summary sessions cannot mutate files and never appear in any monitor or
+    on the lamp.
     """
 
     def __init__(self, model: str) -> None:
@@ -698,6 +699,9 @@ class SessionSummarizer:
                     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                     "--settings", '{"disableAllHooks":true}',
                     "--no-session-persistence",
+                    # The complete source text is already in the prompt; the
+                    # summary worker needs no filesystem or shell access.
+                    "--tools", "",
                 ],
                 capture_output=True,
                 text=True,
