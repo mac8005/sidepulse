@@ -690,3 +690,48 @@ def test_recent_finished_keeps_newest_three_beyond_window(tmp_path, monkeypatch)
     # The three newest survive despite being past the window; older ones drop.
     survivors = set(daemon._recent_finished)
     assert survivors == {"s2", "s3", "s4"}
+
+
+def test_activity_rotates_before_the_eight_hour_cap(tmp_path, monkeypatch):
+    # iOS ends a Live Activity eight hours in: the Dynamic Island slot goes
+    # immediately while a dead card sits on the Lock Screen for hours, and
+    # the daemon only learns of it when a later push 410s. Rotate first.
+    from sidepulse.live_activity import (
+        ACTIVITY_MAX_AGE_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    start = 1000.0
+    daemon.tokens.register(
+        "update",
+        "upd",
+        {"device": "phone", "activity_id": "a", "activity_started_at": start},
+    )
+    daemon._activity_live = True
+
+    assert daemon._activity_age(start + 3600) == 3600
+
+    # The app re-registers the same activity (iOS may hand it a new token);
+    # the clock must keep running, not restart from the registration.
+    assert daemon._activity_started_at("a") == start
+    assert daemon._activity_started_at("b") is None
+
+    sent = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: sent.append(payload["aps"]["event"]),
+    )
+
+    # Past the rotation age the activity ends and its token is forgotten,
+    # which reopens the start path for a fresh one.
+    daemon._end_stale_activity("test")
+    assert sent == ["end"]
+    assert daemon.tokens.tokens("update") == []
+    assert daemon._activity_live is False
+    assert daemon._activity_age(start + ACTIVITY_MAX_AGE_SECONDS) is None

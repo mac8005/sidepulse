@@ -62,6 +62,10 @@ PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
 # a few unanswered ones until the phone proves something changed.
 START_PUSH_MIN_GAP_SECONDS = 45.0
 MAX_UNANSWERED_START_PUSHES = 3
+# iOS ends a Live Activity eight hours in: the Dynamic Island slot goes at
+# once while a dead card lingers on the Lock Screen for hours. Rotate a
+# little early, so the swap happens while the update token still answers.
+ACTIVITY_MAX_AGE_SECONDS = 7.5 * 3600
 SSE_HEARTBEAT_SECONDS = 10.0
 # A live daemon refreshes within PUSH_HEARTBEAT; a longer stale window
 # lets iOS dim the activity if the mini stops pushing.
@@ -151,6 +155,10 @@ class TokenStore:
     def tokens(self, kind: str) -> list[str]:
         with self._lock:
             return list(self._data[kind])
+
+    def entries(self, kind: str) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {token: dict(meta) for token, meta in self._data[kind].items()}
 
     def contains(self, kind: str, token: str) -> bool:
         with self._lock:
@@ -836,6 +844,13 @@ class LiveActivityDaemon:
         now = time.time()
         active = content_state["activeCount"] > 0
 
+        # Beat iOS to the eight-hour cap: end this activity ourselves, so the
+        # start path below can put a fresh one in the island instead of
+        # leaving a dead card on the Lock Screen and an empty island.
+        age = self._activity_age(now)
+        if age is not None and age >= ACTIVITY_MAX_AGE_SECONDS:
+            self._end_stale_activity(f"activity is {age / 3600:.1f}h old")
+
         alerts, self._agent_modes = compute_alerts(
             self._agent_modes, statuses, now, self._last_alerts
         )
@@ -1173,6 +1188,31 @@ class LiveActivityDaemon:
         self._deferred_alerts = still_waiting
         return ready
 
+    def _activity_started_at(self, activity_id: str) -> float | None:
+        """When this activity first registered, across token rotations."""
+        if not activity_id:
+            return None
+        stamps = [
+            meta.get("activity_started_at")
+            for meta in self.tokens.entries("update").values()
+            if meta.get("activity_id") == activity_id
+        ]
+        stamps = [stamp for stamp in stamps if isinstance(stamp, (int, float))]
+        return min(stamps) if stamps else None
+
+    def _activity_age(self, now: float) -> float | None:
+        """Seconds since the live activity started, None while unknown.
+
+        The stamp rides in the update token's metadata, so the clock survives
+        daemon restarts as well as the token rotations iOS does mid-activity.
+        """
+        stamps = [
+            meta.get("activity_started_at")
+            for meta in self.tokens.entries("update").values()
+        ]
+        stamps = [stamp for stamp in stamps if isinstance(stamp, (int, float))]
+        return now - min(stamps) if stamps else None
+
     def _maybe_push_to_start(self, content_state: dict[str, Any], now: float) -> None:
         if not self.tokens.tokens("push_to_start"):
             return
@@ -1395,6 +1435,14 @@ class LiveActivityDaemon:
                     "device": str(body.get("device", "")),
                     "activity_id": str(body.get("activity_id", "")),
                 }
+                if kind == "update":
+                    # The app re-registers constantly, so the clock has to
+                    # start with the ACTIVITY, not with the latest
+                    # registration, or the rotation never comes due.
+                    started = daemon._activity_started_at(meta["activity_id"])
+                    meta["activity_started_at"] = (
+                        started if started is not None else time.time()
+                    )
                 is_new = not daemon.tokens.contains(kind, token)
                 daemon.tokens.register(kind, token, meta)
                 if kind == "update":
