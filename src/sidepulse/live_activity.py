@@ -49,7 +49,14 @@ PUSH_MIN_INTERVAL_SECONDS = 1.0
 # on this cadence, so the iOS update budget stays available for the
 # structural changes people actually watch for.
 COSMETIC_PUSH_INTERVAL_SECONDS = 20.0
-PUSH_HEARTBEAT_SECONDS = 300.0
+# A live daemon refreshes within PUSH_HEARTBEAT; past this window iOS dims
+# the activity, so the phone never shows confident stale data.
+STALE_AFTER_SECONDS = 360.0
+# Half the stale window, so a single lost or slow push cannot let an
+# activity go stale while work is live. At 300s against a 360s window the
+# margin was 60 seconds, and a stale activity keeps its Lock Screen card
+# while losing the Dynamic Island — exactly the reported symptom.
+PUSH_HEARTBEAT_SECONDS = STALE_AFTER_SECONDS / 2
 # Once everything is finished the content stops changing, so nothing gets
 # pushed — and an activity that died on the phone meanwhile stays "live" in
 # the daemon's belief, because only a push can come back 410. Probe slowly
@@ -72,9 +79,6 @@ MAX_UNANSWERED_START_PUSHES = 3
 # little early, so the swap happens while the update token still answers.
 ACTIVITY_MAX_AGE_SECONDS = 7.5 * 3600
 SSE_HEARTBEAT_SECONDS = 10.0
-# A live daemon refreshes within PUSH_HEARTBEAT; a longer stale window
-# lets iOS dim the activity if the mini stops pushing.
-STALE_AFTER_SECONDS = 360.0
 ATTRIBUTES_TYPE = "AgentActivityAttributes"
 
 # Modes worth interrupting the user for, and their notification titles.
@@ -763,6 +767,7 @@ class LiveActivityDaemon:
         self._last_push_at = 0.0
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
+        self._pushes_this_activity = 0
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -1153,6 +1158,8 @@ class LiveActivityDaemon:
         payload = shrink_payload(payload)
         for token in self.tokens.tokens(kind):
             status, body = self.apns.send(token, payload, priority=priority)
+            if kind == "update" and status == 200:
+                self._pushes_this_activity += 1
             if status == 410 or (status == 400 and "BadDeviceToken" in body):
                 _log(f"dropping dead {kind} token ({status})")
                 self.tokens.drop(kind, token)
@@ -1382,6 +1389,21 @@ class LiveActivityDaemon:
                         {
                             "ok": True,
                             "tokens": daemon.tokens.summary(),
+                            # What a vanished island needs answered: how old
+                            # the activity is, how long since iOS last heard
+                            # from us (against STALE_AFTER_SECONDS), and how
+                            # hard it has been pushed (against the budget).
+                            "activityAgeMinutes": (
+                                round(age / 60, 1)
+                                if (age := daemon._activity_age(time.time())) is not None
+                                else None
+                            ),
+                            "secondsSinceLastPush": (
+                                round(time.time() - daemon._last_push_at, 1)
+                                if daemon._last_push_at
+                                else None
+                            ),
+                            "pushesThisActivity": daemon._pushes_this_activity,
                             # The app needs this to label an activity it
                             # starts itself; attributes are fixed at creation.
                             "hostLabel": daemon.config.host_label,
@@ -1473,6 +1495,7 @@ class LiveActivityDaemon:
                     daemon._start_push_attempts = 0
                 elif kind == "push_to_start":
                     if is_new:
+                        self._pushes_this_activity = 0
                         # Fresh install or token rotation: any previously
                         # known activity is stale. End it, forget its tokens,
                         # and allow an immediate restart on the next tick.
