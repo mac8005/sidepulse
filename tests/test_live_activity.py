@@ -784,3 +784,60 @@ def test_a_dead_activity_restarts_while_only_finished_rows_remain(tmp_path, monk
     daemon._recent_finished = {}
     daemon._tick()
     assert sent == []
+
+
+def test_an_idle_activity_is_probed_so_a_silent_death_is_noticed(tmp_path, monkeypatch):
+    # The heartbeat used to require active work. With everything finished the
+    # content stops changing, so nothing was pushed at all — and only a push
+    # can come back 410, so an activity that died while the user idled stayed
+    # "live" in the daemon's belief until new work began.
+    import time
+    import types
+
+    from sidepulse.live_activity import (
+        IDLE_HEARTBEAT_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("update", "upd", {"device": "phone", "activity_id": "a"})
+    daemon.monitor = types.SimpleNamespace(
+        snapshot=lambda include_stale=False: types.SimpleNamespace(
+            statuses=[], aggregate=types.SimpleNamespace(mode=AgentMode.IDLE_READY)
+        )
+    )
+    daemon._recent_finished = {
+        "claude:session:a": {
+            "id": "claude:session:a",
+            "name": "done",
+            "mode": "completed",
+            "provider": "claude",
+            "finishedAt": time.time(),
+            "unread": False,
+        }
+    }
+    sent = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: sent.append(priority),
+    )
+
+    daemon._tick()
+    assert sent == [10], "the first tick is a structural change"
+
+    # Nothing changes from here on: only the heartbeat can push.
+    daemon._tick()
+    assert sent == [10]
+
+    daemon._last_push_at -= IDLE_HEARTBEAT_SECONDS - 1
+    daemon._tick()
+    assert sent == [10], "not due yet"
+
+    daemon._last_push_at -= 2
+    daemon._tick()
+    assert sent == [10, 5], "a silent probe, so a dead activity 410s"

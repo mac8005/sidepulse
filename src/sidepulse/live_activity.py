@@ -50,6 +50,11 @@ PUSH_MIN_INTERVAL_SECONDS = 1.0
 # structural changes people actually watch for.
 COSMETIC_PUSH_INTERVAL_SECONDS = 20.0
 PUSH_HEARTBEAT_SECONDS = 300.0
+# Once everything is finished the content stops changing, so nothing gets
+# pushed — and an activity that died on the phone meanwhile stays "live" in
+# the daemon's belief, because only a push can come back 410. Probe slowly
+# while idle: that is what turns a silent death into a restart.
+IDLE_HEARTBEAT_SECONDS = 900.0
 # Push-to-start retry while there is something to show but the phone has
 # not registered an activity: a start push can be lost or throttled, and the
 # system ends activities after eight hours. A start push for active work
@@ -883,8 +888,11 @@ class LiveActivityDaemon:
             elif cosmetic and now - self._last_push_at >= COSMETIC_PUSH_INTERVAL_SECONDS:
                 # Text-only churn (summaries, tool names) coalesces quietly.
                 self._push_update(content_state, now, important=False)
-            elif active and now - self._last_push_at >= PUSH_HEARTBEAT_SECONDS:
-                # Silent keep-alive against the stale-date; low priority.
+            elif now - self._last_push_at >= (
+                PUSH_HEARTBEAT_SECONDS if active else IDLE_HEARTBEAT_SECONDS
+            ):
+                # Silent keep-alive against the stale-date, and the only
+                # liveness probe there is; low priority.
                 self._push_update(content_state, now, important=False)
 
         if active:
