@@ -539,6 +539,42 @@ class APNsLiveActivityClient:
 
 
 SUMMARY_MAX_CHARS = 90
+SUMMARY_PROMPT_VERSION = 2
+GENERIC_WORKDIR_NAMES = {
+    "android",
+    "app",
+    "apps",
+    "git",
+    "ios",
+    "project",
+    "projects",
+    "src",
+    "tmp",
+    "workspace",
+    "workspaces",
+}
+
+
+def _project_name_from_cwd(cwd: str | None) -> str | None:
+    """Return a repository name only when the path identifies one."""
+    if not cwd:
+        return None
+    parts = Path(cwd).parts
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold() == "git":
+            candidate = parts[index + 1]
+            if candidate.casefold() not in GENERIC_WORKDIR_NAMES:
+                return candidate
+    candidate = Path(cwd).name
+    if candidate and candidate.casefold() not in GENERIC_WORKDIR_NAMES:
+        return candidate
+    return None
+
+
+def _summary_cache_key(session_id: str, style: str) -> str:
+    # Prompt semantics changed in v2: cached model-chosen project names must
+    # never leak back into titles produced under the trusted-repository rule.
+    return f"{session_id}|{style}|v{SUMMARY_PROMPT_VERSION}"
 
 
 class PromptTracker:
@@ -552,6 +588,7 @@ class PromptTracker:
     def __init__(self) -> None:
         self._prompts: dict[str, str] = {}
         self._actions: dict[str, list[str]] = {}
+        self._projects: dict[str, str] = {}
         self._offsets: dict[str, int] = {}
 
     def prompt_for(self, session_id: str) -> str | None:
@@ -559,6 +596,14 @@ class PromptTracker:
 
     def actions_for(self, session_id: str) -> list[str]:
         return self._actions.get(session_id, [])
+
+    def project_for(self, session_id: str, cwd: str | None = None) -> str | None:
+        return self._projects.get(session_id) or _project_name_from_cwd(cwd)
+
+    def trusted_context_for(self, session_id: str, cwd: str | None = None) -> str:
+        if project := self.project_for(session_id, cwd):
+            return f"repository observed for this session: {project}"
+        return ""
 
     def poll(self) -> None:
         for name in ("claude.jsonl", "codex.jsonl"):
@@ -590,11 +635,15 @@ class PromptTracker:
                 session_id = event.get("session_id")
                 if not isinstance(session_id, str):
                     continue
+                project = _project_name_from_cwd(event.get("cwd"))
+                if project:
+                    self._projects[session_id] = project
                 hook = event.get("hook_event_name")
                 if hook == "UserPromptSubmit":
                     prompt = event.get("prompt")
                     if isinstance(prompt, str) and prompt.strip():
-                        self._prompts[session_id] = prompt.strip()
+                        prompt = prompt.strip()
+                        self._prompts[session_id] = prompt
                         self._actions[session_id] = []  # new turn, new actions
                 elif hook == "PreToolUse":
                     tool_input = event.get("tool_input")
@@ -646,12 +695,14 @@ class SessionSummarizer:
         context: str = "",
         style: str = "outcome",
     ) -> str | None:
+        key = _summary_cache_key(session_id, style)
         if not message:
             with self._lock:
-                cached = self._results.get(f"{session_id}|{style}")
+                cached = self._results.get(key)
             return cached[1] if cached else None
-        key = f"{session_id}|{style}"
-        source_hash = hashlib.sha256(message.encode()).hexdigest()[:16]
+        source_hash = hashlib.sha256(
+            f"{SUMMARY_PROMPT_VERSION}\0{context}\0{message}".encode()
+        ).hexdigest()[:16]
         with self._lock:
             cached = self._results.get(key)
             if cached and cached[0] == source_hash:
@@ -696,24 +747,21 @@ class SessionSummarizer:
             instruction = (
                 "A coding session is working on a request; its most "
                 "recent actions may be listed. In at most six words, present "
-                "progressive, say what is being done RIGHT NOW — 'sidepulse: "
-                "deploying build to TestFlight', 'kleido: running tests "
-                "after merge'. Prefer the latest action over the request "
+                "progressive, say what is being done RIGHT NOW. Prefer the "
+                "latest action over the request "
                 "when they differ. The text may contain heavy typos; read "
                 "through them. Never invent work not mentioned. "
             )
         else:
             instruction = (
-                "Summarize the state or outcome described in at most six words — "
-                "'scalper fee cap fixed', 'sidepulse build on TestFlight'. "
+                "Summarize the state or outcome described in at most six words. "
             )
         prompt = (
             instruction
-            + "Make clear which project or topic it concerns, woven naturally "
-            "into the phrase, abbreviating long names. Infer the project from "
-            "the CONTENT; generic directory names like 'Git' are never "
-            "project names. No quotes, respond with only the phrase.\n\n"
-            f"Context: {context[:300]}\n\n"
+            + "Return only the action or outcome. Do not include or guess a "
+            "project, product, or topic name; Sidepulse adds a trusted repository "
+            "label separately. No quotes, respond with only the phrase.\n\n"
+            f"Trusted session context: {context[:800]}\n\n"
             f"Content:\n{message[:3000]}"
         )
         env = dict(os.environ)
@@ -752,6 +800,11 @@ class SessionSummarizer:
         # Models sometimes add a trailing period or stray spaces; row text
         # must be clean — it renders as a one-line title.
         text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
+        # Defensive boundary for a model that still emits "Project: action"
+        # despite the action-only instruction. Project identity is supplied
+        # deterministically by the daemon, never by model output.
+        if ":" in text:
+            text = text.split(":", 1)[1].strip()
         if text:
             _log(f"summary -> {text[:70]}")
             return _truncate(text, SUMMARY_MAX_CHARS)
@@ -988,12 +1041,13 @@ class LiveActivityDaemon:
             "waiting_for_input",
             "long_task_progress",
         }
+        trusted_context = self._prompt_tracker.trusted_context_for(
+            status.session_id, status.cwd
+        )
         if settled:
-            context = (
-                f"working directory: {status.cwd or 'unknown'}; "
-                f"session title: {status.display_name}"
+            summary = self.summarizer.summary_for(
+                status.session_id, status.message, trusted_context
             )
-            summary = self.summarizer.summary_for(status.session_id, status.message, context)
         elif status.mode.value in {"working", "tool_running", "long_task_progress"}:
             # While working, summarize the CURRENT prompt (tracked from the
             # hook logs — the display name only ever carries the first one).
@@ -1014,14 +1068,8 @@ class LiveActivityDaemon:
                     if actions:
                         source += "\n\nMost recent actions (latest last):\n- " + "\n- ".join(actions)
                     self._task_sources[status.session_id] = (source, _time.time())
-                last_outcome = self.summarizer.summary_for(
-                    status.session_id, None, style="outcome"
-                )
-                task_context = f"working directory: {status.cwd or 'unknown'}"
-                if last_outcome:
-                    task_context += f"; the session's previous work: {last_outcome}"
                 summary = self.summarizer.summary_for(
-                    status.session_id, source, task_context, style="task"
+                    status.session_id, source, trusted_context, style="task"
                 )
             else:
                 summary = self.summarizer.summary_for(status.session_id, None, style="outcome")
@@ -1029,8 +1077,17 @@ class LiveActivityDaemon:
             return status
         if not summary:
             return status
+        summary = self._summary_title(status.session_id, summary, status.cwd)
         self._publish_summary(status, summary)
         return dataclass_replace(status, display_name=summary)
+
+    def _summary_title(
+        self, session_id: str, action: str, cwd: str | None = None
+    ) -> str:
+        project = self._prompt_tracker.project_for(session_id, cwd)
+        if not project:
+            return action
+        return _truncate(f"{project}: {action}", SUMMARY_MAX_CHARS)
 
     def _publish_summary(self, status: AgentStatus, summary: str) -> None:
         """Write the summary into the provider's hook log so every consumer
@@ -1195,7 +1252,15 @@ class LiveActivityDaemon:
                 ready.append(alert)
             else:
                 self._deferred_alerts.append(
-                    {**alert, "session_id": session_id, "deadline": now + FINISHED_ALERT_DEFER_SECONDS}
+                    {
+                        **alert,
+                        "session_id": session_id,
+                        "cwd": next(
+                            (status.cwd for status in statuses if status.session_id == session_id),
+                            None,
+                        ),
+                        "deadline": now + FINISHED_ALERT_DEFER_SECONDS,
+                    }
                 )
 
         still_waiting = []
@@ -1206,6 +1271,9 @@ class LiveActivityDaemon:
                 else None
             )
             if summary:
+                summary = self._summary_title(
+                    pending["session_id"], summary, pending.get("cwd")
+                )
                 ready.append(
                     {
                         "title": f"{ALERT_MODES['completed']}: {_truncate(summary, MAX_NAME_CHARS)}",

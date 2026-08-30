@@ -618,7 +618,11 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
 
     def fake_run(args, **_kwargs):
         command.extend(args)
-        return SimpleNamespace(returncode=0, stdout="sidepulse: tests passing\n", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Kleido: deploying TestFlight build IPA\n",
+            stderr="",
+        )
 
     summarizer = object.__new__(SessionSummarizer)
     summarizer.model = "claude-haiku-test"
@@ -627,11 +631,104 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
     summarizer.moonside_dir = tmp_path / "moonside"
     monkeypatch.setattr("sidepulse.live_activity.subprocess.run", fake_run)
 
-    assert summarizer._generate("Tests pass.", "working directory: sidepulse") == (
-        "sidepulse: tests passing"
+    assert summarizer._generate(
+        "Upload to TestFlight: success.",
+        "repository observed for this session: live-translator",
+    ) == (
+        "deploying TestFlight build IPA"
     )
     tools_index = command.index("--tools")
     assert command[tools_index + 1] == ""
+    prompt = command[command.index("-p") + 1].lower()
+    assert "kleido" not in prompt
+    assert "sidepulse:" not in prompt
+
+
+def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    records = [
+        {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/Users/x/Git/live-translator",
+            "prompt": "Go to voice translator app repo.",
+        },
+        {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/Users/x/Git",
+            "prompt": (
+                '<task-notification><summary>Monitor event: "TestFlight build with '
+                'summary chip"</summary><event>Upload: success</event></task-notification>'
+            ),
+        },
+    ]
+    (tmp_path / "claude.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+
+    tracker = PromptTracker()
+    tracker.poll()
+
+    assert tracker.project_for("s1", "/Users/x/Git") == "live-translator"
+    assert tracker.trusted_context_for("s1") == (
+        "repository observed for this session: live-translator"
+    )
+    assert "TestFlight build with summary chip" in tracker.prompt_for("s1")
+
+
+def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "claude.jsonl").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/Users/x/Git/live-translator",
+                "prompt": "Improve the live translator and deploy it.",
+            }
+        )
+        + "\n"
+    )
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker.poll()
+
+    calls = []
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            calls.append((message, context, style))
+            return "TestFlight build uploaded"
+
+    daemon.summarizer = FakeSummarizer()
+    done = make_status(
+        "claude:session:s1",
+        AgentMode.COMPLETED,
+        name="Kleido: deploying TestFlight build IPA",
+        session_id="s1",
+    )
+    done = type(done)(
+        **{
+            **done.__dict__,
+            "event_name": "Stop",
+            "message": "Uploaded. Waiting on processing.",
+            "cwd": "/Users/x/Git",
+        }
+    )
+
+    result = daemon._apply_summary(done)
+
+    assert result.display_name == "live-translator: TestFlight build uploaded"
+    assert all("Kleido" not in context for _, context, _ in calls)
 
 
 def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
