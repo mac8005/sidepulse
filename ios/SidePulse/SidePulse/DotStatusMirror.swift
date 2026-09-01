@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Intents
 
 /// LED display states, shared with the Mac status bar app (`led_status.py`).
 enum LedDisplayState: Equatable {
@@ -124,7 +125,7 @@ enum DndSchedule {
 /// Keeps a SidePulse Dot plugged into this phone in step with the Mac's
 /// agents, the way the Mac status bar app drives its own Dot: idle → off,
 /// working → rolling cyan (or the KITT scanner), done → green, needs input →
-/// amber pulse, DND → off.
+/// amber pulse, DND → off. Optionally an active iOS Focus counts as DND too.
 ///
 /// iOS only lets the app write to the drive while it is in the foreground, so
 /// the mirror runs from scene-active to scene-background and turns the Dot
@@ -144,6 +145,11 @@ final class DotStatusMirror: ObservableObject {
     private var lastProgram: String?
     private var lastError: String?
     private var lastAttempt: Date = .distantPast
+    /// True while a Focus that shares its status with this app is on. iOS
+    /// has no in-app change notification, so it is re-read on every sync
+    /// (and by the 15 s timer).
+    private var focusActive = false
+    private var focusAuthorizationRequested = false
     /// Matches `AgentLedController.error_retry_seconds` on the Mac.
     private let errorRetrySeconds: TimeInterval = 10
     /// Matches `STATUS_BAR_REFRESH_SECONDS`, which is how often the Mac
@@ -163,6 +169,7 @@ final class DotStatusMirror: ObservableObject {
             stream.$state.map { _ in () }.eraseToAnyPublisher(),
             model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$focusDndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$hasFolderAccess.map { _ in () }.eraseToAnyPublisher(),
         ]
         Publishers.MergeMany(triggers)
@@ -193,12 +200,52 @@ final class DotStatusMirror: ObservableObject {
         }
         lastProgram = nil
         lastError = nil
+        focusActive = false
         model = nil
         statusText = "Off"
     }
 
+    /// Focus status needs the user's one-time consent (system prompt) and, per
+    /// Focus, "Share Focus Status" enabled in iOS Settings; anything else
+    /// reads as "no Focus".
+    private func refreshFocusStatus() {
+        guard let model, model.focusDndEnabled else {
+            focusActive = false
+            return
+        }
+        let center = INFocusStatusCenter.default
+        switch center.authorizationStatus {
+        case .authorized:
+            focusActive = center.focusStatus.isFocused ?? false
+        case .notDetermined:
+            focusActive = false
+            guard !focusAuthorizationRequested else { return }
+            focusAuthorizationRequested = true
+            center.requestAuthorization { [weak self] _ in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.sync() }
+                }
+            }
+        default:
+            focusActive = false
+        }
+    }
+
+    private var focusAccessHint: String? {
+        guard let model, model.focusDndEnabled else { return nil }
+        switch INFocusStatusCenter.default.authorizationStatus {
+        case .denied, .restricted:
+            return " · Focus access denied (iOS Settings › SidePulse)"
+        default:
+            return nil
+        }
+    }
+
     private func sync() {
         guard let model else { return }
+        // Before the folder check so switching the option on asks for Focus
+        // access right away.
+        refreshFocusStatus()
         guard model.hasFolderAccess else {
             lastProgram = nil
             statusText = "No SidePulse Dot folder selected"
@@ -206,16 +253,22 @@ final class DotStatusMirror: ObservableObject {
         }
 
         let state: LedDisplayState
-        let label: String
+        var label: String
         if model.dndEnabled {
             state = .idle
             label = "DND on — Dot off"
+        } else if focusActive {
+            state = .idle
+            label = "iOS Focus on — Dot off"
         } else if case .failed = stream.state {
             state = .idle
             label = "Mac unreachable — Dot off"
         } else {
             state = stream.snapshot.map { LedDisplayState.forMode($0.aggregateMode) } ?? .idle
             label = state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label
+        }
+        if let focusAccessHint {
+            label += focusAccessHint
         }
         let program = DotPrograms.program(for: state, kittMode: model.kittModeEnabled)
 

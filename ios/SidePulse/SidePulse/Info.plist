@@ -31,6 +31,8 @@
     </array>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>NSFocusStatusUsageDescription</key>
+    <string>SidePulse keeps the Dot off while a Focus such as Sleep or Do Not Disturb is on.</string>
     <key>NSSupportsLiveActivities</key>
     <true/>
     <key>NSSupportsLiveActivitiesFrequentUpdates</key>

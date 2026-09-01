@@ -620,8 +620,8 @@ private struct LiveMonitorSection: View {
     }
 }
 
-/// KITT and DND toggles — the Mac app's menu-level Dot controls. Shared by
-/// the Mac Agents screen and Settings.
+/// KITT and DND toggles — the Mac app's menu-level Dot controls — plus the
+/// iOS-only Focus option. Shared by the Mac Agents screen and Settings.
 struct DotBehaviorControls: View {
     @ObservedObject var model: AppModel
     @ObservedObject private var mirror = DotStatusMirror.shared
@@ -630,6 +630,14 @@ struct DotBehaviorControls: View {
         Toggle("KITT scanner while working", isOn: $model.kittModeEnabled)
 
         Toggle("DND On", isOn: $model.dndEnabled)
+
+        Toggle("Off during iOS Focus", isOn: $model.focusDndEnabled)
+
+        if model.focusDndEnabled {
+            Text("Counts every Focus that shares its status with SidePulse (iOS Settings › Focus › Sleep / Do Not Disturb › Focus Status).")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
 
         Text(mirror.statusText)
             .font(.footnote)

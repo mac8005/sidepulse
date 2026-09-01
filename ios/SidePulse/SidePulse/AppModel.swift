@@ -66,6 +66,11 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(dndLastScheduleTransition, forKey: Defaults.dndLastScheduleTransition) }
     }
 
+    /// Keep the Dot off while an iOS Focus (Sleep, Do Not Disturb, …) is on.
+    @Published var focusDndEnabled: Bool {
+        didSet { UserDefaults.standard.set(focusDndEnabled, forKey: Defaults.focusDndEnabled) }
+    }
+
     @Published var lastMessage: String = "Ready"
     @Published var eventLog: [String] = []
     @Published var receivedPushes: [ReceivedPush] {
@@ -86,6 +91,7 @@ final class AppModel: ObservableObject {
         static let dndStartTime = "dndStartTime"
         static let dndEndTime = "dndEndTime"
         static let dndLastScheduleTransition = "dndLastScheduleTransition"
+        static let focusDndEnabled = "focusDndEnabled"
     }
 
     private init() {
@@ -106,6 +112,7 @@ final class AppModel: ObservableObject {
         self.dndStartTime = UserDefaults.standard.string(forKey: Defaults.dndStartTime) ?? DndSchedule.defaultStartTime
         self.dndEndTime = UserDefaults.standard.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
         self.dndLastScheduleTransition = UserDefaults.standard.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
+        self.focusDndEnabled = UserDefaults.standard.bool(forKey: Defaults.focusDndEnabled)
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
         refreshFolderStatus()
