@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 from .models import AgentStatus
 
@@ -13,6 +13,7 @@ SESSION_OPEN_CHOICES = (SESSION_OPEN_APP, SESSION_OPEN_TERMINAL, SESSION_OPEN_VS
 SESSION_OPEN_APP_SURFACES = ("app", "ui", "transcript")
 SESSION_OPEN_TERMINAL_SURFACES = ("cli", "terminal", "command line")
 SESSION_OPEN_VSCODE_SURFACES = ("vscode", "vs code", "visual studio code")
+_CLAUDE_CODE_LINKS = None
 
 
 def session_deep_link(status: AgentStatus) -> str | None:
@@ -25,16 +26,46 @@ def session_deep_link(status: AgentStatus) -> str | None:
         # A remote session's transcript lives on the host, so claude://resume
         # fails on the client with "transcript may have been removed"; just
         # open the desktop app (the user navigates via Remote Control there).
-        # Local sessions resume directly.
+        # Local Remote Control sessions use their bridge id; ordinary local
+        # sessions resume from their on-disk transcript.
         if remote_session_parts(status.session_id):
             return "claude://"
         if session_id:
+            code_link = claude_code_desktop_link(session_id)
+            if code_link:
+                return code_link
             params = {"session": session_id}
             if status.cwd:
                 params["cwd"] = status.cwd
             return "claude://resume?" + urlencode(params, quote_via=quote)
         return "claude://"
     return None
+
+
+def claude_code_desktop_link(session_id: str) -> str | None:
+    web_link = claude_code_web_link(session_id)
+    if not web_link:
+        return None
+    parsed = urlparse(web_link)
+    path = parsed.path.strip("/").split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "claude.ai"
+        or len(path) != 2
+        or path[0] != "code"
+        or not path[1].startswith(("session_", "cse_"))
+    ):
+        return None
+    return f"claude://claude.ai/code/{quote(path[1], safe='')}"
+
+
+def claude_code_web_link(session_id: str) -> str | None:
+    global _CLAUDE_CODE_LINKS
+    if _CLAUDE_CODE_LINKS is None:
+        from .live_activity import DeepLinkResolver
+
+        _CLAUDE_CODE_LINKS = DeepLinkResolver()
+    return _CLAUDE_CODE_LINKS.link_for("claude", session_id)
 
 
 def session_vscode_link(status: AgentStatus) -> str | None:

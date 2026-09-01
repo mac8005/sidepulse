@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import os
@@ -40,6 +41,9 @@ POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
 # so its crash-safety window must be far wider than Claude's — otherwise a
 # thinking session reads as "Done". Real turn ends still arrive as Stop.
 CODEX_POST_TOOL_WORKING_VISIBLE_SECONDS = 15 * 60.0
+HOOK_LOG_MAX_BYTES_PER_SOURCE = 32 * 1024 * 1024
+HOOK_LOG_READ_CHUNK_BYTES = 64 * 1024
+HOOK_LOG_CONTINUITY_BYTES = 128
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,29 @@ class CachedTranscriptRecords:
     mtime: float
     size: int
     records: tuple[HookEvent, ...]
+
+
+@dataclass(frozen=True)
+class CachedLogLine:
+    byte_count: int
+    record: HookEvent | None
+
+
+@dataclass
+class CachedLogRecords:
+    device: int
+    inode: int
+    mtime_ns: int
+    offset: int
+    anchor: bytes
+    pending: bytes
+    discarding_line: bool
+    lines: deque[CachedLogLine]
+    total_bytes: int = 0
+
+    @property
+    def records(self) -> tuple[HookEvent, ...]:
+        return tuple(line.record for line in self.lines if line.record is not None)
 
 
 @dataclass(frozen=True)
@@ -124,7 +151,7 @@ class AgentMonitor:
         self.idle_visible_seconds = idle_visible_seconds
         self.post_tool_working_visible_seconds = post_tool_working_visible_seconds
         self.max_lines_per_source = max_lines_per_source
-        self._log_records_cache: dict[tuple[str, str, int], CachedTranscriptRecords] = {}
+        self._log_records_cache: dict[tuple[str, str, int], CachedLogRecords] = {}
         self._transcript_records_cache: dict[tuple[str, str], CachedTranscriptRecords] = {}
         self._transcript_file_list_cache: dict[tuple[str, int], CachedTranscriptFileList] = {}
         self._latest_status_signature: tuple[Any, ...] | None = None
@@ -273,7 +300,9 @@ class AgentMonitor:
                 )
                 continue
 
-            parts.append((source.provider, str(source.path), file_signature(source.path)))
+            parts.append(
+                (source.provider, str(source.path), hook_log_signature(source.path))
+            )
         return tuple(parts)
 
     def _transcript_source_signature(
@@ -307,22 +336,33 @@ class AgentMonitor:
 
         key = (source.provider, str(source.path), self.max_lines_per_source)
         cached = self._log_records_cache.get(key)
-        if cached is not None and cached.mtime == stat.st_mtime and cached.size == stat.st_size:
+        if (
+            cached is not None
+            and cached.device == stat.st_dev
+            and cached.inode == stat.st_ino
+            and cached.mtime_ns == stat.st_mtime_ns
+            and cached.offset == stat.st_size
+        ):
             return cached.records
 
-        records: list[HookEvent] = []
-        for line in read_recent_lines(source.path, self.max_lines_per_source):
-            record = parse_log_line(source.provider, line)
-            if record is not None:
-                records.append(record)
+        if cached is not None and append_hook_log_cache(
+            cached,
+            source,
+            stat,
+            max_lines=self.max_lines_per_source,
+            max_bytes=HOOK_LOG_MAX_BYTES_PER_SOURCE,
+        ):
+            return cached.records
 
-        cached_records = tuple(records)
-        self._log_records_cache[key] = CachedTranscriptRecords(
-            mtime=stat.st_mtime,
-            size=stat.st_size,
-            records=cached_records,
+        cached = load_hook_log_cache(
+            source,
+            max_lines=self.max_lines_per_source,
+            max_bytes=HOOK_LOG_MAX_BYTES_PER_SOURCE,
         )
-        return cached_records
+        if cached is None:
+            return ()
+        self._log_records_cache[key] = cached
+        return cached.records
 
     def _iter_codex_transcript_records(self, root: Path) -> Iterable[HookEvent]:
         for path in self._recent_transcript_files(root, limit=CODEX_TRANSCRIPT_MAX_FILES):
@@ -570,6 +610,14 @@ def file_signature(path: Path) -> tuple[float, int] | None:
     except OSError:
         return None
     return (stat.st_mtime, stat.st_size)
+
+
+def hook_log_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
 
 def iter_codex_transcript_file(path: Path) -> Iterable[HookEvent]:
@@ -1580,6 +1628,211 @@ def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
         "you are an expert at upholding safety and compliance standards",
     )
     return any(prompt in text for prompt in internal_prompts)
+
+
+def load_hook_log_cache(
+    source: SourceSpec,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> CachedLogRecords | None:
+    max_bytes = max(1, max_bytes)
+    try:
+        with source.path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
+            start = max(0, stat.st_size - max_bytes)
+            aligned = start == 0
+            if start > 0:
+                handle.seek(start - 1)
+                aligned = handle.read(1) == b"\n"
+
+            cache = CachedLogRecords(
+                device=stat.st_dev,
+                inode=stat.st_ino,
+                mtime_ns=stat.st_mtime_ns,
+                offset=start,
+                anchor=b"",
+                pending=b"",
+                discarding_line=not aligned,
+                lines=deque(),
+            )
+            handle.seek(start)
+            remaining = stat.st_size - start
+            while remaining > 0:
+                chunk = handle.read(min(HOOK_LOG_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                feed_hook_log_bytes(
+                    cache,
+                    source.provider,
+                    chunk,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                )
+                cache.offset += len(chunk)
+                remaining -= len(chunk)
+            cache.anchor = hook_log_anchor(handle, cache.offset)
+            return cache
+    except OSError:
+        return None
+
+
+def append_hook_log_cache(
+    cache: CachedLogRecords,
+    source: SourceSpec,
+    stat: Any,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> bool:
+    if (
+        cache.device != stat.st_dev
+        or cache.inode != stat.st_ino
+        or stat.st_size <= cache.offset
+    ):
+        return False
+
+    max_bytes = max(1, max_bytes)
+    try:
+        with source.path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (
+                cache.device != opened.st_dev
+                or cache.inode != opened.st_ino
+                or opened.st_size <= cache.offset
+            ):
+                return False
+            if hook_log_anchor(handle, cache.offset) != cache.anchor:
+                return False
+
+            handle.seek(cache.offset)
+            remaining = opened.st_size - cache.offset
+            while remaining > 0:
+                chunk = handle.read(min(HOOK_LOG_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                feed_hook_log_bytes(
+                    cache,
+                    source.provider,
+                    chunk,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                )
+                cache.offset += len(chunk)
+                remaining -= len(chunk)
+            cache.mtime_ns = opened.st_mtime_ns
+            cache.anchor = hook_log_anchor(handle, cache.offset)
+            return True
+    except OSError:
+        return False
+
+
+def hook_log_anchor(handle: Any, offset: int) -> bytes:
+    length = min(HOOK_LOG_CONTINUITY_BYTES, offset)
+    if length <= 0:
+        return b""
+    handle.seek(offset - length)
+    return handle.read(length)
+
+
+def feed_hook_log_bytes(
+    cache: CachedLogRecords,
+    provider: str,
+    data: bytes,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> None:
+    cursor = 0
+    while cursor < len(data):
+        if cache.discarding_line:
+            newline = data.find(b"\n", cursor)
+            if newline < 0:
+                return
+            append_cached_log_line(
+                cache,
+                None,
+                max_bytes,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
+            cache.discarding_line = False
+            cursor = newline + 1
+            continue
+
+        newline = data.find(b"\n", cursor)
+        if newline < 0:
+            fragment = data[cursor:]
+            if len(cache.pending) + len(fragment) > max_bytes:
+                cache.pending = b""
+                cache.discarding_line = True
+                cache.lines.clear()
+                cache.total_bytes = 0
+            else:
+                cache.pending += fragment
+                trim_cached_log_lines(
+                    cache,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                )
+            return
+
+        fragment = data[cursor:newline]
+        line_bytes = len(cache.pending) + len(fragment) + 1
+        if line_bytes > max_bytes:
+            cache.pending = b""
+            append_cached_log_line(
+                cache,
+                None,
+                max_bytes,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
+        else:
+            raw = cache.pending + fragment if cache.pending else fragment
+            cache.pending = b""
+            record = parse_log_line(provider, raw.decode("utf-8", errors="replace"))
+            append_cached_log_line(
+                cache,
+                record,
+                line_bytes,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+            )
+        cursor = newline + 1
+
+
+def append_cached_log_line(
+    cache: CachedLogRecords,
+    record: HookEvent | None,
+    byte_count: int,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> None:
+    bounded_count = min(max(1, byte_count), max_bytes)
+    cache.lines.append(CachedLogLine(bounded_count, record))
+    cache.total_bytes += bounded_count
+    trim_cached_log_lines(
+        cache,
+        max_lines=max_lines,
+        max_bytes=max_bytes,
+    )
+
+
+def trim_cached_log_lines(
+    cache: CachedLogRecords,
+    *,
+    max_lines: int,
+    max_bytes: int,
+) -> None:
+    line_limit = max(0, max_lines)
+    while cache.lines and (
+        len(cache.lines) > line_limit
+        or cache.total_bytes + len(cache.pending) > max_bytes
+    ):
+        removed = cache.lines.popleft()
+        cache.total_bytes -= removed.byte_count
 
 
 def read_recent_lines(path: Path, max_lines: int) -> list[str]:

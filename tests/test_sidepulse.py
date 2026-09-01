@@ -6037,7 +6037,7 @@ class AgentMonitorTests(unittest.TestCase):
                 self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.WORKING)
                 self.assertEqual(calls, [path, path])
 
-    def test_hook_log_records_are_cached_until_file_changes(self) -> None:
+    def test_hook_log_append_parses_only_new_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
             now = datetime.now(timezone.utc).isoformat()
@@ -6058,21 +6058,14 @@ class AgentMonitorTests(unittest.TestCase):
                 sources=(SourceSpec("codex", log),),
                 stale_after_seconds=3600,
             )
-            calls: list[Path] = []
-            original_read_recent_lines = collector_module.read_recent_lines
-
-            def counting_read_recent_lines(read_path: Path, max_lines: int) -> list[str]:
-                if read_path == log:
-                    calls.append(read_path)
-                return original_read_recent_lines(read_path, max_lines)
-
             with patch(
-                "sidepulse.collector.read_recent_lines",
-                side_effect=counting_read_recent_lines,
-            ):
+                "sidepulse.collector.parse_log_line",
+                wraps=collector_module.parse_log_line,
+            ) as parse:
                 self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
+                first_count = parse.call_count
                 self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
-                self.assertEqual(calls, [log])
+                self.assertEqual(parse.call_count, first_count)
 
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write(
@@ -6090,7 +6083,155 @@ class AgentMonitorTests(unittest.TestCase):
                     )
 
                 self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.WORKING)
-                self.assertEqual(calls, [log, log])
+                self.assertEqual(parse.call_count, first_count + 1)
+
+    def test_hook_log_defers_partial_last_line_until_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": now,
+                        "event": {
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "codex-session",
+                            "tool_name": "Bash",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex", log),),
+                stale_after_seconds=3600,
+            )
+            completed_line = json.dumps(
+                {
+                    "logged_at": now,
+                    "event": {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "codex-session",
+                        "tool_name": "Bash",
+                    },
+                }
+            ).encode()
+            split_at = len(completed_line) // 2
+
+            with patch(
+                "sidepulse.collector.parse_log_line",
+                wraps=collector_module.parse_log_line,
+            ) as parse:
+                self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
+                first_count = parse.call_count
+
+                with log.open("ab") as handle:
+                    handle.write(completed_line[:split_at])
+                self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
+                self.assertEqual(parse.call_count, first_count)
+
+                with log.open("ab") as handle:
+                    handle.write(completed_line[split_at:] + b"\n")
+                self.assertEqual(monitor.snapshot().aggregate.mode, AgentMode.WORKING)
+                self.assertEqual(parse.call_count, first_count + 1)
+
+    def test_hook_log_malformed_line_counts_toward_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            old = json.dumps(
+                {
+                    "logged_at": now,
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "old-session",
+                }
+            )
+            new = json.dumps(
+                {
+                    "logged_at": now,
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "new-session",
+                }
+            )
+            log.write_text(f"{old}\nnot-json\n{new}\n")
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+                max_lines_per_source=2,
+            ).snapshot()
+
+            self.assertEqual(
+                [status.session_id for status in snapshot.statuses],
+                ["new-session"],
+            )
+
+    def test_hook_log_byte_budget_evicts_oldest_complete_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            encoded_lines = [
+                (
+                    json.dumps(
+                        {
+                            "logged_at": now,
+                            "hook_event_name": "PreToolUse",
+                            "session_id": session_id,
+                            "prompt": "x" * 80,
+                        }
+                    )
+                    + "\n"
+                ).encode()
+                for session_id in ("old-session", "new-session")
+            ]
+            byte_budget = max(map(len, encoded_lines)) + 1
+            self.assertGreater(sum(map(len, encoded_lines)), byte_budget)
+            log.write_bytes(b"".join(encoded_lines))
+
+            with patch.object(
+                collector_module,
+                "HOOK_LOG_MAX_BYTES_PER_SOURCE",
+                byte_budget,
+            ):
+                snapshot = AgentMonitor(
+                    sources=(SourceSpec("claude", log),),
+                    stale_after_seconds=3600,
+                ).snapshot()
+
+            self.assertEqual(
+                [status.session_id for status in snapshot.statuses],
+                ["new-session"],
+            )
+
+    def test_hook_log_same_size_rewrite_resets_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "claude.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+
+            def line(session_id: str, event_name: str) -> str:
+                return json.dumps(
+                    {
+                        "logged_at": now,
+                        "hook_event_name": event_name,
+                        "session_id": session_id,
+                    }
+                ) + "\n"
+
+            first = line("aaaa-session", "PreToolUse")
+            second = line("bbbb-session", "PreToolUse")
+            self.assertEqual(len(first.encode()), len(second.encode()))
+            log.write_text(first)
+            monitor = AgentMonitor(
+                sources=(SourceSpec("claude", log),),
+                stale_after_seconds=3600,
+            )
+            self.assertEqual(monitor.snapshot().statuses[0].session_id, "aaaa-session")
+
+            old_mtime_ns = log.stat().st_mtime_ns
+            log.write_text(second)
+            os.utime(log, ns=(old_mtime_ns + 1_000_000, old_mtime_ns + 1_000_000))
+
+            self.assertEqual(monitor.snapshot().statuses[0].session_id, "bbbb-session")
 
     def test_snapshot_reuses_latest_statuses_when_inputs_are_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6977,10 +7118,11 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             cwd="/Users/pero/pgit/sdstatus_bitbang",
         )
 
-        self.assertEqual(
-            session_deep_link(status),
-            "claude://resume?session=1ca4348e-2aec-4147-9e81-d7d56364d257&cwd=%2FUsers%2Fpero%2Fpgit%2Fsdstatus_bitbang",
-        )
+        with patch("sidepulse.session_actions.claude_code_web_link", return_value=None):
+            self.assertEqual(
+                session_deep_link(status),
+                "claude://resume?session=1ca4348e-2aec-4147-9e81-d7d56364d257&cwd=%2FUsers%2Fpero%2Fpgit%2Fsdstatus_bitbang",
+            )
         self.assertEqual(
             session_resume_command(status),
             "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257",
@@ -7010,6 +7152,45 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             session_vscode_link(remote_status),
             "vscode://anthropic.claude-code/open?session=1ca4348e-2aec-4147-9e81-d7d56364d257",
         )
+
+    def test_claude_remote_control_session_opens_exact_desktop_code_session(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:abc",
+            display_name="Claude abc",
+            mode=AgentMode.WORKING,
+            updated_at=datetime.now(timezone.utc),
+            event_name="PreToolUse",
+            session_id="8dcf06b7-1111-4222-8333-123456789abc",
+            cwd="/Users/pero/pgit/example",
+            origin="Claude App",
+        )
+        web_link = "https://claude.ai/code/session_01Rt6JgVEoVN923ZJJzZVjmo"
+        desktop_link = "claude://claude.ai/code/session_01Rt6JgVEoVN923ZJJzZVjmo"
+
+        with patch(
+            "sidepulse.session_actions.claude_code_web_link",
+            return_value=web_link,
+        ):
+            self.assertEqual(session_deep_link(status), desktop_link)
+            fake = SimpleNamespace(
+                settings=AgentMonitorSettings(),
+                set_settings_message=lambda message: None,
+            )
+            with patch("sidepulse.status_bar.open_url") as open_url:
+                status_bar.StatusBarController.open_session(
+                    fake,
+                    status,
+                    SESSION_OPEN_APP,
+                    remember=False,
+                )
+
+        open_url.assert_called_once_with(desktop_link)
 
 
 if __name__ == "__main__":
