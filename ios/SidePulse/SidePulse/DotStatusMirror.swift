@@ -1,0 +1,243 @@
+import Combine
+import Foundation
+
+/// LED display states, shared with the Mac status bar app (`led_status.py`).
+enum LedDisplayState: Equatable {
+    case idle
+    case working
+    case done
+    case ask
+
+    static func forMode(_ mode: String) -> LedDisplayState {
+        switch mode {
+        case "waiting_for_input", "blocked_error":
+            return .ask
+        case "working", "tool_running", "long_task_progress":
+            return .working
+        case "completed":
+            return .done
+        default:
+            return .idle
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .idle: return "Idle"
+        case .working: return "Working"
+        case .done: return "Done"
+        case .ask: return "Needs input"
+        }
+    }
+}
+
+/// LEDS.LED programs for the 2-LED SidePulse Dot — the same text the Mac app
+/// writes (`program_for_display_state` with `led_count=2`), so the Dot looks
+/// identical whichever machine it is plugged into.
+enum DotPrograms {
+    static let off = "off"
+    static let askAmber = "#FF3A00"
+    static let workingCyan = "#00E5FF"
+    static let doneGreen = "#00FF66"
+
+    static func program(for state: LedDisplayState, kittMode: Bool) -> String {
+        switch state {
+        case .idle:
+            return off
+        case .ask:
+            return "off\n\(askAmber) 1.6s pulse\nrepeat"
+        case .done:
+            return doneGreen
+        case .working:
+            return kittMode ? kittScanner(workingCyan) : rolling(workingCyan)
+        }
+    }
+
+    /// `rolling_program(color, led_count=2)`.
+    static func rolling(_ color: String) -> String {
+        "off 160ms cosine\n0:\(color) 760ms pulse 0ms; 1:\(color) 760ms pulse 260ms\nrepeat"
+    }
+
+    /// `kitt_scanner_program(color, led_count=2)`: scan out, then back.
+    static func kittScanner(_ color: String) -> String {
+        "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\nrepeat"
+    }
+}
+
+struct DndScheduleTransition: Equatable {
+    let key: String
+    let enabled: Bool
+}
+
+/// Daily DND window, ported from `status_bar.py`. Times are local "HH:MM".
+enum DndSchedule {
+    static let defaultStartTime = "22:00"
+    static let defaultEndTime = "07:00"
+
+    /// The most recent start/end boundary at or before `now`, looking back
+    /// one day so a window that opened yesterday evening is still honoured
+    /// this morning. Its key lets the caller apply each boundary exactly once.
+    static func latestTransition(startTime: String, endTime: String, now: Date = Date()) -> DndScheduleTransition? {
+        guard let start = parse(startTime), let end = parse(endTime) else { return nil }
+        var boundaries = [(label: "start", time: start, enabled: true)]
+        if start != end {
+            boundaries.append((label: "end", time: end, enabled: false))
+        }
+
+        let calendar = Calendar.current
+        var due: [(date: Date, label: String, enabled: Bool)] = []
+        for dayOffset in [-1, 0] {
+            guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now) else { continue }
+            var components = calendar.dateComponents([.year, .month, .day], from: day)
+            for boundary in boundaries {
+                components.hour = boundary.time.hour
+                components.minute = boundary.time.minute
+                components.second = 0
+                guard let date = calendar.date(from: components), date <= now else { continue }
+                due.append((date, boundary.label, boundary.enabled))
+            }
+        }
+        guard let latest = due.max(by: { $0.date < $1.date }) else { return nil }
+
+        let day = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: latest.date)
+        let key = String(
+            format: "%04d-%02d-%02d:%@:%02d:%02d",
+            day.year ?? 0, day.month ?? 0, day.day ?? 0, latest.label, day.hour ?? 0, day.minute ?? 0
+        )
+        return DndScheduleTransition(key: key, enabled: latest.enabled)
+    }
+
+    static func parse(_ value: String) -> (hour: Int, minute: Int)? {
+        let parts = value.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2,
+              let hour = Int(parts[0]), let minute = Int(parts[1]),
+              (0...23).contains(hour), (0...59).contains(minute)
+        else { return nil }
+        return (hour, minute)
+    }
+
+    static func format(hour: Int, minute: Int) -> String {
+        String(format: "%02d:%02d", hour, minute)
+    }
+}
+
+/// Keeps a SidePulse Dot plugged into this phone in step with the Mac's
+/// agents, the way the Mac status bar app drives its own Dot: idle → off,
+/// working → rolling cyan (or the KITT scanner), done → green, needs input →
+/// amber pulse, DND → off.
+///
+/// iOS only lets the app write to the drive while it is in the foreground, so
+/// the mirror runs from scene-active to scene-background and turns the Dot
+/// off on the way out rather than leaving a stale state glowing.
+@MainActor
+final class DotStatusMirror: ObservableObject {
+    static let shared = DotStatusMirror()
+
+    /// One stream for both the Dot and the Mac Agents screen.
+    let stream = AgentStreamClient()
+
+    @Published private(set) var statusText = "Off"
+
+    private var model: AppModel?
+    private var cancellables: Set<AnyCancellable> = []
+    private var scheduleTimer: Timer?
+    private var lastProgram: String?
+    private var lastError: String?
+    private var lastAttempt: Date = .distantPast
+    /// Matches `AgentLedController.error_retry_seconds` on the Mac.
+    private let errorRetrySeconds: TimeInterval = 10
+    /// Matches `STATUS_BAR_REFRESH_SECONDS`, which is how often the Mac
+    /// checks whether a DND schedule boundary has passed.
+    private let scheduleCheckSeconds: TimeInterval = 15
+
+    func start(model: AppModel) {
+        guard self.model == nil else { return }
+        self.model = model
+        model.applyDueDndSchedule()
+        stream.start(baseURL: model.liveMonitorServerURL)
+
+        // @Published emits on willSet; hop to the next main-queue turn so the
+        // sync reads the new values.
+        let triggers: [AnyPublisher<Void, Never>] = [
+            stream.$snapshot.map { _ in () }.eraseToAnyPublisher(),
+            stream.$state.map { _ in () }.eraseToAnyPublisher(),
+            model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$hasFolderAccess.map { _ in () }.eraseToAnyPublisher(),
+        ]
+        Publishers.MergeMany(triggers)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.sync() }
+            }
+            .store(in: &cancellables)
+
+        scheduleTimer = Timer.scheduledTimer(withTimeInterval: scheduleCheckSeconds, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let model = self.model else { return }
+                model.applyDueDndSchedule()
+                self.sync()
+            }
+        }
+        sync()
+    }
+
+    func suspend() {
+        guard model != nil else { return }
+        cancellables.removeAll()
+        scheduleTimer?.invalidate()
+        scheduleTimer = nil
+        stream.stop()
+        if let lastProgram, lastProgram != DotPrograms.off {
+            try? DriveWriter.shared.write(DotPrograms.off)
+        }
+        lastProgram = nil
+        lastError = nil
+        model = nil
+        statusText = "Off"
+    }
+
+    private func sync() {
+        guard let model else { return }
+        guard model.hasFolderAccess else {
+            lastProgram = nil
+            statusText = "No SidePulse Dot folder selected"
+            return
+        }
+
+        let state: LedDisplayState
+        let label: String
+        if model.dndEnabled {
+            state = .idle
+            label = "DND on — Dot off"
+        } else if case .failed = stream.state {
+            state = .idle
+            label = "Mac unreachable — Dot off"
+        } else {
+            state = stream.snapshot.map { LedDisplayState.forMode($0.aggregateMode) } ?? .idle
+            label = state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label
+        }
+        let program = DotPrograms.program(for: state, kittMode: model.kittModeEnabled)
+
+        if program == lastProgram {
+            if lastError == nil {
+                statusText = label
+                return
+            }
+            if Date().timeIntervalSince(lastAttempt) < errorRetrySeconds {
+                return
+            }
+        }
+
+        lastAttempt = Date()
+        lastProgram = program
+        do {
+            try DriveWriter.shared.write(program)
+            lastError = nil
+            statusText = label
+        } catch {
+            lastError = error.localizedDescription
+            statusText = "Dot write failed: \(error.localizedDescription)"
+        }
+    }
+}

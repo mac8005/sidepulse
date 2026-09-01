@@ -24,6 +24,7 @@
         9F0000010000000000000015 /* AgentActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000114 /* AgentActivityAttributes.swift */; };
         9F0000010000000000000017 /* AgentStreamClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000120 /* AgentStreamClient.swift */; };
         9F0000010000000000000018 /* AgentsLiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000121 /* AgentsLiveView.swift */; };
+        9F0000010000000000000034 /* DotStatusMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000134 /* DotStatusMirror.swift */; };
         9F0000010000000000000016 /* SidePulseWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000119 /* SidePulseWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
         9F0000010000000000000024 /* WatchRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000126 /* WatchRelay.swift */; };
         9F0000010000000000000025 /* WatchSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000127 /* WatchSessionStore.swift */; };
@@ -121,6 +122,7 @@
         9F0000010000000000000118 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
         9F0000010000000000000120 /* AgentStreamClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStreamClient.swift; sourceTree = "<group>"; };
         9F0000010000000000000121 /* AgentsLiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsLiveView.swift; sourceTree = "<group>"; };
+        9F0000010000000000000134 /* DotStatusMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DotStatusMirror.swift; sourceTree = "<group>"; };
         9F0000010000000000000119 /* SidePulseWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SidePulseWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
         9F0000010000000000000122 /* SidePulseWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePulseWatchApp.swift; sourceTree = "<group>"; };
         9F0000010000000000000126 /* WatchRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRelay.swift; sourceTree = "<group>"; };
@@ -195,6 +197,7 @@
                 9F0000010000000000000115 /* LiveMonitorManager.swift */,
                 9F0000010000000000000120 /* AgentStreamClient.swift */,
                 9F0000010000000000000121 /* AgentsLiveView.swift */,
+                9F0000010000000000000134 /* DotStatusMirror.swift */,
                 9F0000010000000000000126 /* WatchRelay.swift */,
                 9F0000010000000000000108 /* Assets.xcassets */,
                 9F0000010000000000000109 /* Info.plist */,
@@ -411,6 +414,7 @@
                 9F0000010000000000000012 /* LiveMonitorManager.swift in Sources */,
                 9F0000010000000000000017 /* AgentStreamClient.swift in Sources */,
                 9F0000010000000000000018 /* AgentsLiveView.swift in Sources */,
+                9F0000010000000000000034 /* DotStatusMirror.swift in Sources */,
                 9F0000010000000000000024 /* WatchRelay.swift in Sources */,
             );
             runOnlyForDeploymentPostprocessing = 0;

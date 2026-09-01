@@ -7,7 +7,8 @@ struct ContentView: View {
     @StateObject private var model: AppModel
     @State private var isShowingFolderPicker = false
     @State private var activeSheet: ActiveSheet?
-    @State private var isShowingAgents = false
+    /// The app opens straight into Mac Agents; the home screen sits behind it.
+    @State private var path: [Route] = [.agents]
 
     init() {
         _model = StateObject(wrappedValue: AppModel.shared)
@@ -18,21 +19,19 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    MacAgentsPanel(model: model)
+
                     HeaderPanel(model: model) {
                         activeSheet = .token
                         requestPushToken()
                     }
 
-                    RecentPushesPanel(pushes: Array(model.receivedPushes.prefix(5)))
-
                     SidePulseDotSetupPanel(model: model) {
                         activeSheet = .folderSetup
                     }
-
-                    MacAgentsPanel(model: model)
 
                     QuickPatternsPanel { pattern in
                         write(pattern)
@@ -42,8 +41,11 @@ struct ContentView: View {
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle("SidePulse")
-            .navigationDestination(isPresented: $isShowingAgents) {
-                AgentsLiveView(model: model)
+            .navigationDestination(for: Route.self) { route in
+                switch route {
+                case .agents:
+                    AgentsLiveView(model: model)
+                }
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -62,7 +64,7 @@ struct ContentView: View {
         }
         .onOpenURL { url in
             if url.host == "agents" {
-                isShowingAgents = true
+                path = [.agents]
             }
         }
         .sheet(item: $activeSheet) { sheet in
@@ -149,6 +151,10 @@ struct ContentView: View {
     }
 }
 
+private enum Route: Hashable {
+    case agents
+}
+
 private enum ActiveSheet: Identifiable {
     case token
     case folderSetup
@@ -204,102 +210,6 @@ private struct StatusPill: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(isConnected ? Color.green : Color.orange)
             .lineLimit(1)
-    }
-}
-
-private struct RecentPushesPanel: View {
-    let pushes: [ReceivedPush]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Latest Pushes")
-                    .font(.headline)
-                Spacer()
-                Text("\(pushes.count)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-
-            if pushes.isEmpty {
-                EmptyInboxView()
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(pushes) { push in
-                        ReceivedPushRow(push: push)
-                    }
-                }
-            }
-        }
-    }
-}
-
-private struct EmptyInboxView: View {
-    var body: some View {
-        Panel {
-            HStack(spacing: 12) {
-                Image(systemName: "tray")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 32, height: 32)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("No pushes received")
-                        .font(.subheadline.weight(.semibold))
-                    Text("SidePulse will store general pushes here even without a SidePulse Dot device.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-}
-
-private struct ReceivedPushRow: View {
-    let push: ReceivedPush
-
-    var body: some View {
-        Panel {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: push.writeStatus.symbolName)
-                    .font(.headline)
-                    .foregroundStyle(push.writeStatus.tint)
-                    .frame(width: 28, height: 28)
-
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(push.title)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
-                        Spacer(minLength: 8)
-                        Text(push.receivedAt, style: .relative)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Text(push.body)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-
-                    HStack(spacing: 8) {
-                        Text(push.writeStatus.displayName)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(push.writeStatus.tint)
-
-                        if let patternName = push.patternName {
-                            Text(patternName)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        } else if push.ledByteCount > 0 {
-                            Text("\(push.ledByteCount) bytes")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -516,6 +426,21 @@ private struct SettingsView: View {
                 } label: {
                     Label("Set Up LED Folder", systemImage: "folder.badge.plus")
                 }
+
+                DotBehaviorControls(model: model)
+            }
+
+            Section {
+                Toggle("Use a daily schedule", isOn: $model.dndScheduleEnabled)
+
+                if model.dndScheduleEnabled {
+                    DndTimePicker("Start", time: $model.dndStartTime)
+                    DndTimePicker("End", time: $model.dndEndTime)
+                }
+            } header: {
+                Text("DND Schedule")
+            } footer: {
+                Text("The schedule switches DND on/off; you can override it at any time.")
             }
 
             Section("Live Monitor (Mac Agents)") {
@@ -630,38 +555,6 @@ private struct Panel<Content: View>: View {
     }
 }
 
-private extension ReceivedPush.WriteStatus {
-    var symbolName: String {
-        switch self {
-        case .received:
-            return "tray.fill"
-        case .wrote:
-            return "checkmark.circle.fill"
-        case .noFolder:
-            return "folder.badge.questionmark"
-        case .failed:
-            return "xmark.octagon.fill"
-        case .unsupportedPattern:
-            return "questionmark.circle.fill"
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .received:
-            return .blue
-        case .wrote:
-            return .green
-        case .noFolder:
-            return .orange
-        case .failed:
-            return .red
-        case .unsupportedPattern:
-            return .purple
-        }
-    }
-}
-
 private extension Color {
     init(hex: String) {
         let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
@@ -727,13 +620,61 @@ private struct LiveMonitorSection: View {
     }
 }
 
+/// KITT and DND toggles — the Mac app's menu-level Dot controls. Shared by
+/// the Mac Agents screen and Settings.
+struct DotBehaviorControls: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject private var mirror = DotStatusMirror.shared
+
+    var body: some View {
+        Toggle("KITT scanner while working", isOn: $model.kittModeEnabled)
+
+        Toggle("DND On", isOn: $model.dndEnabled)
+
+        Text(mirror.statusText)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+        if model.dndScheduleEnabled {
+            Text("Schedule: \(model.dndStartTime)–\(model.dndEndTime)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Edits an "HH:MM" setting with the system time picker.
+private struct DndTimePicker: View {
+    let title: String
+    @Binding var time: String
+
+    init(_ title: String, time: Binding<String>) {
+        self.title = title
+        _time = time
+    }
+
+    var body: some View {
+        DatePicker(title, selection: date, displayedComponents: .hourAndMinute)
+    }
+
+    private var date: Binding<Date> {
+        Binding {
+            let parsed = DndSchedule.parse(time) ?? (hour: 0, minute: 0)
+            return Calendar.current.date(
+                bySettingHour: parsed.hour, minute: parsed.minute, second: 0, of: Date()
+            ) ?? Date()
+        } set: { newValue in
+            let components = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+            time = DndSchedule.format(hour: components.hour ?? 0, minute: components.minute ?? 0)
+        }
+    }
+}
+
 private struct MacAgentsPanel: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        NavigationLink {
-            AgentsLiveView(model: model)
-        } label: {
+        NavigationLink(value: Route.agents) {
             HStack {
                 Image(systemName: "desktopcomputer")
                     .font(.title3)

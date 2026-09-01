@@ -2,10 +2,11 @@ import SwiftUI
 import UIKit
 
 /// Realtime agent monitor: streams snapshots from the Mac over the local
-/// network / Tailscale while the app is in the foreground.
+/// network / Tailscale while the app is in the foreground. The stream is
+/// owned by `DotStatusMirror`, which drives a plugged-in Dot from it.
 struct AgentsLiveView: View {
     @ObservedObject var model: AppModel
-    @StateObject private var stream = AgentStreamClient()
+    @ObservedObject private var stream = DotStatusMirror.shared.stream
     /// Completions tapped this app session, keyed by the row's finish time
     /// so the dimming applies only to the completion the user actually
     /// opened — a session that finishes another turn re-arms as unread.
@@ -35,16 +36,16 @@ struct AgentsLiveView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            Section("SidePulse Dot") {
+                DotBehaviorControls(model: model)
+            }
         }
         .navigationTitle("Mac Agents")
         .task {
-            stream.start(baseURL: model.liveMonitorServerURL)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            stream.start(baseURL: model.liveMonitorServerURL)
-        }
-        .onDisappear {
-            stream.stop()
+            // Normally already running from the scene going active; harmless
+            // to repeat.
+            DotStatusMirror.shared.start(model: model)
         }
     }
 

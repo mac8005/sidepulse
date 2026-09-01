@@ -32,6 +32,40 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(liveMonitorServerURL, forKey: Defaults.liveMonitorServerURL) }
     }
 
+    // SidePulse Dot behaviour, same keys as the Mac app's settings.
+    @Published var kittModeEnabled: Bool {
+        didSet { UserDefaults.standard.set(kittModeEnabled, forKey: Defaults.kittModeEnabled) }
+    }
+
+    @Published var dndEnabled: Bool {
+        didSet { UserDefaults.standard.set(dndEnabled, forKey: Defaults.dndEnabled) }
+    }
+
+    @Published var dndScheduleEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(dndScheduleEnabled, forKey: Defaults.dndScheduleEnabled)
+            rearmDndSchedule()
+        }
+    }
+
+    @Published var dndStartTime: String {
+        didSet {
+            UserDefaults.standard.set(dndStartTime, forKey: Defaults.dndStartTime)
+            rearmDndSchedule()
+        }
+    }
+
+    @Published var dndEndTime: String {
+        didSet {
+            UserDefaults.standard.set(dndEndTime, forKey: Defaults.dndEndTime)
+            rearmDndSchedule()
+        }
+    }
+
+    @Published var dndLastScheduleTransition: String {
+        didSet { UserDefaults.standard.set(dndLastScheduleTransition, forKey: Defaults.dndLastScheduleTransition) }
+    }
+
     @Published var lastMessage: String = "Ready"
     @Published var eventLog: [String] = []
     @Published var receivedPushes: [ReceivedPush] {
@@ -46,6 +80,12 @@ final class AppModel: ObservableObject {
         static let receivedPushes = "receivedPushes"
         static let liveMonitorEnabled = "liveMonitorEnabled"
         static let liveMonitorServerURL = "liveMonitorServerURL"
+        static let kittModeEnabled = "kittModeEnabled"
+        static let dndEnabled = "dndEnabled"
+        static let dndScheduleEnabled = "dndScheduleEnabled"
+        static let dndStartTime = "dndStartTime"
+        static let dndEndTime = "dndEndTime"
+        static let dndLastScheduleTransition = "dndLastScheduleTransition"
     }
 
     private init() {
@@ -60,9 +100,44 @@ final class AppModel: ObservableObject {
         self.liveMonitorEnabled = UserDefaults.standard.bool(forKey: Defaults.liveMonitorEnabled)
         self.liveMonitorServerURL = UserDefaults.standard.string(forKey: Defaults.liveMonitorServerURL)
             ?? "http://macmini8005:8787"
+        self.kittModeEnabled = UserDefaults.standard.bool(forKey: Defaults.kittModeEnabled)
+        self.dndEnabled = UserDefaults.standard.bool(forKey: Defaults.dndEnabled)
+        self.dndScheduleEnabled = UserDefaults.standard.bool(forKey: Defaults.dndScheduleEnabled)
+        self.dndStartTime = UserDefaults.standard.string(forKey: Defaults.dndStartTime) ?? DndSchedule.defaultStartTime
+        self.dndEndTime = UserDefaults.standard.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
+        self.dndLastScheduleTransition = UserDefaults.standard.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
         refreshFolderStatus()
+    }
+
+    /// Port of `apply_due_dnd_schedule`: once a schedule boundary has passed,
+    /// flip DND to that boundary's state — exactly once, so a manual override
+    /// afterwards sticks until the next boundary.
+    @discardableResult
+    func applyDueDndSchedule(now: Date = Date()) -> Bool {
+        guard dndScheduleEnabled,
+              let transition = DndSchedule.latestTransition(startTime: dndStartTime, endTime: dndEndTime, now: now),
+              transition.key != dndLastScheduleTransition
+        else { return false }
+        dndLastScheduleTransition = transition.key
+        if dndEnabled != transition.enabled {
+            dndEnabled = transition.enabled
+        }
+        return true
+    }
+
+    /// Editing the schedule applies its current phase right away, like the
+    /// Mac app's Save Schedule button.
+    private func rearmDndSchedule() {
+        dndLastScheduleTransition = ""
+        applyDueDndSchedule()
+    }
+
+    var dndStatusText: String {
+        let status = dndEnabled ? "DND is on. LEDs are off." : "DND is off."
+        guard dndScheduleEnabled else { return status }
+        return "\(status) Schedule: \(dndStartTime)–\(dndEndTime)."
     }
 
     func setPushToken(from deviceToken: Data) {
