@@ -4,6 +4,7 @@ import io
 import json
 import plistlib
 from pathlib import Path
+from unittest.mock import patch
 
 from sidepulse import cli
 from sidepulse.collector import StatusMetadata, status_from_event
@@ -136,6 +137,33 @@ def test_emit_envelope_ignores_invalid_json() -> None:
     lines = output.getvalue().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["provider"] == "codex"
+
+
+def test_emit_envelope_carries_claude_remote_control_link_to_status() -> None:
+    output = io.StringIO()
+    web_link = "https://claude.ai/code/session_01RemoteControl"
+    line = json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-1",
+            "tool_name": "Bash",
+        }
+    )
+
+    with patch(
+        "sidepulse.remote_hosts.remote_session_web_link",
+        return_value=web_link,
+    ):
+        _emit_envelope("claude", line, output)
+
+    envelope = json.loads(output.getvalue())
+    qualified = qualify_remote_line("claude", envelope["line"], "macmini")
+    record = parse_log_line("claude", json.dumps(qualified))
+    assert record is not None
+    status = status_from_event(record, StatusMetadata())
+    assert status is not None
+    assert status.session_id == "remote:macmini:session-1"
+    assert status.deep_link == web_link
 
 
 def test_configured_remote_logs_uses_each_hosts_providers(tmp_path: Path) -> None:

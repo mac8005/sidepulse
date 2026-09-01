@@ -22,6 +22,7 @@ from .providers import HOOK_PROVIDERS, default_state_dir, detect_log_path
 REMOTE_CONFIG_VERSION = 1
 DEFAULT_REMOTE_PROVIDERS = ("codex", "claude")
 REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_REMOTE_DEEP_LINKS = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +305,12 @@ def _emit_envelope(provider: str, line: str, output: TextIO) -> None:
         return
     if not isinstance(parsed, dict):
         return
+    payload = parsed.get("event") if provider == "codex" else parsed
+    if isinstance(payload, dict):
+        payload.pop("sidepulse_deep_link", None)
+        deep_link = remote_session_web_link(provider, parsed)
+        if deep_link:
+            payload["sidepulse_deep_link"] = deep_link
     output.write(
         json.dumps(
             {"provider": provider, "line": parsed},
@@ -313,6 +320,21 @@ def _emit_envelope(provider: str, line: str, output: TextIO) -> None:
         + "\n"
     )
     output.flush()
+
+
+def remote_session_web_link(provider: str, line: dict[str, Any]) -> str | None:
+    if provider != "claude":
+        return None
+    session_id = line.get("session_id") or line.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+
+    global _REMOTE_DEEP_LINKS
+    if _REMOTE_DEEP_LINKS is None:
+        from .live_activity import DeepLinkResolver
+
+        _REMOTE_DEEP_LINKS = DeepLinkResolver()
+    return _REMOTE_DEEP_LINKS.link_for(provider, session_id)
 
 
 def stream_remote_events(

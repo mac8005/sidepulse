@@ -29,7 +29,7 @@ def session_deep_link(status: AgentStatus) -> str | None:
         # Local Remote Control sessions use their bridge id; ordinary local
         # sessions resume from their on-disk transcript.
         if remote_session_parts(status.session_id):
-            return "claude://"
+            return claude_code_desktop_link_from_web(status.deep_link) or "claude://"
         if session_id:
             code_link = claude_code_desktop_link(session_id)
             if code_link:
@@ -43,7 +43,10 @@ def session_deep_link(status: AgentStatus) -> str | None:
 
 
 def claude_code_desktop_link(session_id: str) -> str | None:
-    web_link = claude_code_web_link(session_id)
+    return claude_code_desktop_link_from_web(claude_code_web_link(session_id))
+
+
+def claude_code_desktop_link_from_web(web_link: str | None) -> str | None:
     if not web_link:
         return None
     parsed = urlparse(web_link)
@@ -54,6 +57,9 @@ def claude_code_desktop_link(session_id: str) -> str | None:
         or len(path) != 2
         or path[0] != "code"
         or not path[1].startswith(("session_", "cse_"))
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
     ):
         return None
     return f"claude://claude.ai/code/{quote(path[1], safe='')}"

@@ -7192,6 +7192,41 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
 
         open_url.assert_called_once_with(desktop_link)
 
+    def test_remote_claude_session_uses_propagated_desktop_link(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        web_link = "https://claude.ai/code/session_01Rt6JgVEoVN923ZJJzZVjmo"
+        desktop_link = "claude://claude.ai/code/session_01Rt6JgVEoVN923ZJJzZVjmo"
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:remote:macmini:abc",
+            display_name="Claude on macmini",
+            mode=AgentMode.WORKING,
+            updated_at=datetime.now(timezone.utc),
+            event_name="PreToolUse",
+            session_id="remote:macmini:8dcf06b7-1111-4222-8333-123456789abc",
+            origin="Claude on macmini",
+            deep_link=web_link,
+        )
+
+        self.assertEqual(session_deep_link(status), desktop_link)
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            set_settings_message=lambda message: None,
+        )
+        with patch("sidepulse.status_bar.open_url") as open_url:
+            status_bar.StatusBarController.open_session(
+                fake,
+                status,
+                SESSION_OPEN_APP,
+                remember=False,
+            )
+
+        open_url.assert_called_once_with(desktop_link)
+
 
 if __name__ == "__main__":
     unittest.main()

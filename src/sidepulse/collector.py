@@ -1120,6 +1120,7 @@ def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None)
         tool_name=record.tool_name,
         message=record.message,
         origin=record.origin or metadata.origin or origin_label_from_payload(record.provider, record.raw),
+        deep_link=_string_or_none(record.raw.get("sidepulse_deep_link")),
     )
 
 
@@ -1439,6 +1440,7 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             tool_name=_string_or_none(data.get("tool_name")),
             message=_string_or_none(data.get("message")),
             origin=_string_or_none(data.get("origin")),
+            deep_link=_string_or_none(data.get("deep_link")),
             stale=bool(data.get("stale", False)),
         )
     except Exception:
@@ -1874,6 +1876,7 @@ def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
         tool_name=status.tool_name,
         message=status.message,
         origin=status.origin,
+        deep_link=status.deep_link,
         stale=stale,
     )
 
@@ -1893,6 +1896,7 @@ def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
         tool_name=status.tool_name,
         message=status.message,
         origin=status.origin,
+        deep_link=status.deep_link,
         stale=status.stale,
     )
 

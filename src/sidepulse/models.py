@@ -77,6 +77,7 @@ class AgentStatus:
     tool_name: str | None = None
     message: str | None = None
     origin: str | None = None
+    deep_link: str | None = None
     stale: bool = False
 
     @property
@@ -107,6 +108,7 @@ class AgentStatus:
             "tool_name": self.tool_name,
             "message": self.message,
             "origin": self.origin,
+            "deep_link": self.deep_link,
             "stale": self.stale,
         }
 
