@@ -323,9 +323,10 @@ def _emit_envelope(provider: str, line: str, output: TextIO) -> None:
 
 
 def remote_session_web_link(provider: str, line: dict[str, Any]) -> str | None:
-    if provider != "claude":
+    payload = line.get("event") if provider == "codex" else line
+    if not isinstance(payload, dict):
         return None
-    session_id = line.get("session_id") or line.get("sessionId")
+    session_id = payload.get("session_id") or payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id:
         return None
 

@@ -166,6 +166,39 @@ def test_emit_envelope_carries_claude_remote_control_link_to_status() -> None:
     assert status.deep_link == web_link
 
 
+def test_emit_envelope_carries_codex_remote_thread_link_to_status() -> None:
+    output = io.StringIO()
+    thread_id = "01a05c0f-63d5-7401-8b3e-0aef600ecf82"
+    web_link = (
+        "https://chatgpt.com/app/codex/remote/thread/"
+        f"{thread_id}?hostId=slingshot%3Aenv_e_0123abc%3A8765"
+    )
+    line = json.dumps(
+        {
+            "event": {
+                "hook_event_name": "PreToolUse",
+                "session_id": thread_id,
+                "tool_name": "functions.exec",
+            }
+        }
+    )
+
+    with patch(
+        "sidepulse.remote_hosts.remote_session_web_link",
+        return_value=web_link,
+    ):
+        _emit_envelope("codex", line, output)
+
+    envelope = json.loads(output.getvalue())
+    qualified = qualify_remote_line("codex", envelope["line"], "macmini")
+    record = parse_log_line("codex", json.dumps(qualified))
+    assert record is not None
+    status = status_from_event(record, StatusMetadata())
+    assert status is not None
+    assert status.session_id == f"remote:macmini:{thread_id}"
+    assert status.deep_link == web_link
+
+
 def test_configured_remote_logs_uses_each_hosts_providers(tmp_path: Path) -> None:
     config = tmp_path / "remote-hosts.json"
     home = tmp_path / "home"

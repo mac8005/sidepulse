@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 from sidepulse.live_activity import (
     MAX_AGENT_ROWS,
     TokenStore,
     build_content_state,
+    status_row,
 )
 from sidepulse.models import AgentMode, AgentStatus
 
@@ -991,6 +993,87 @@ def test_deep_link_resolver_builds_url_from_bridge_session_id(tmp_path):
     assert resolver.link_for("claude", "rc") == "https://claude.ai/code/session_01FromUrlField"
     assert resolver.link_for("codex", "abc") is None
     assert resolver.link_for("claude", "remote:air:abc") is None
+
+
+def test_deep_link_resolver_builds_codex_remote_url(tmp_path):
+    from sidepulse.live_activity import DeepLinkResolver
+
+    codex_state = tmp_path / ".codex"
+    codex_state.mkdir()
+    (codex_state / ".codex-global-state.json").write_text(json.dumps({
+        "electron-local-remote-control-environment-id": "env_e_0123abc",
+    }))
+    resolver = DeepLinkResolver()
+    resolver._codex_state_dir = codex_state
+    resolver._codex_global_state = codex_state / ".codex-global-state.json"
+    thread_id = "01a05c0f-63d5-7401-8b3e-0aef600ecf82"
+
+    assert resolver.link_for("codex", thread_id) == (
+        "https://chatgpt.com/app/codex/remote/thread/"
+        f"{thread_id}?hostId=slingshot%3Aenv_e_0123abc%3A8765"
+    )
+    assert resolver.link_for("codex", "not-a-thread") is None
+    assert resolver.link_for("codex", f"remote:mini:{thread_id}") is None
+
+
+def test_deep_link_resolver_falls_back_to_enabled_codex_enrollment(tmp_path):
+    from sidepulse.live_activity import DeepLinkResolver
+
+    codex_state = tmp_path / ".codex"
+    codex_state.mkdir()
+    database = codex_state / "state_5.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE remote_control_enrollments ("
+        "environment_id TEXT NOT NULL, updated_at INTEGER NOT NULL, "
+        "remote_control_enabled INTEGER)"
+    )
+    connection.executemany(
+        "INSERT INTO remote_control_enrollments VALUES (?, ?, ?)",
+        [
+            ("env_e_disabled", 20, None),
+            ("env_e_current", 10, 1),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    resolver = DeepLinkResolver()
+    resolver._codex_state_dir = codex_state
+    resolver._codex_global_state = codex_state / "missing.json"
+    thread_id = "01a05c0f-63d5-7401-8b3e-0aef600ecf82"
+
+    assert resolver.link_for("codex", thread_id) == (
+        "https://chatgpt.com/app/codex/remote/thread/"
+        f"{thread_id}?hostId=slingshot%3Aenv_e_current%3A8765"
+    )
+
+
+def test_status_row_prefers_a_propagated_remote_deep_link(monkeypatch):
+    import sidepulse.live_activity as la
+
+    class Stub:
+        def link_for(self, provider, session_id):
+            raise AssertionError("the remote host's link must win")
+
+    thread_id = "01a05c0f-63d5-7401-8b3e-0aef600ecf82"
+    deep_link = (
+        "https://chatgpt.com/app/codex/remote/thread/"
+        f"{thread_id}?hostId=slingshot%3Aenv_e_0123abc%3A8765"
+    )
+    status = AgentStatus(
+        provider="codex",
+        agent_id=f"codex:session:remote:mini:{thread_id}",
+        display_name="Remote task",
+        mode=AgentMode.WORKING,
+        updated_at=datetime.now(timezone.utc),
+        event_name="PreToolUse",
+        session_id=f"remote:mini:{thread_id}",
+        deep_link=deep_link,
+    )
+    monkeypatch.setattr(la, "_DEEP_LINKS", Stub())
+
+    assert status_row(status)["deepLink"] == deep_link
 
 
 def test_deep_link_resolver_retries_a_miss_after_ttl(tmp_path, monkeypatch):

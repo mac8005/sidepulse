@@ -22,6 +22,7 @@ import os
 import queue
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
@@ -30,6 +31,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from uuid import UUID
 
 from .collector import AgentMonitor
 from .ipc import HookEventServer
@@ -212,9 +215,9 @@ def _truncate(value: str, limit: int) -> str:
 
 
 class DeepLinkResolver:
-    """Finds a Claude session's claude.ai/code URL from its transcript.
+    """Finds the exact mobile URL for a Claude or Codex session.
 
-    Three sources, cheapest first: the per-pid session registry
+    Claude uses three sources, cheapest first: the per-pid session registry
     ~/.claude/sessions/<pid>.json (workers the remote-control daemon spawns
     record their `bridgeSessionId` only here, never in the transcript), then
     ~/.claude/projects/**/<session_id>.jsonl for a `bridgeSessionId` on a
@@ -222,22 +225,35 @@ class DeepLinkResolver:
     sessions started with --rc). The bridge id is the claude.ai/code URL
     suffix — prefixed cse_ in transcripts and session_ in the registry.
     Only the session's own URL is safe to deep-link; the environment URL
-    spawns a NEW session when at capacity. Codex has no equivalent, so
-    those rows get no link.
+    spawns a NEW session when at capacity.
+
+    Codex Remote links combine the thread UUID with the owning Mac's current
+    Remote environment id. The /app wrapper is claimed by ChatGPT's iOS
+    associated domains and unwraps to the native remote-thread route.
     """
 
     MISS_TTL_SECONDS = 120.0
+    CODEX_ENVIRONMENT_KEY = "electron-local-remote-control-environment-id"
 
     def __init__(self) -> None:
         self._cache: dict[str, str] = {}
         self._misses: dict[str, float] = {}
         self._roots = [Path.home() / ".claude" / "projects"]
         self._registry = Path.home() / ".claude" / "sessions"
+        self._codex_state_dir = Path.home() / ".codex"
+        self._codex_global_state = self._codex_state_dir / ".codex-global-state.json"
+        self._codex_environment: str | None = None
+        self._codex_environment_checked_at: float | None = None
 
     def link_for(self, provider: str, session_id: str | None) -> str | None:
         # remote: rows live on another host, so their transcript can never
-        # be found locally — skip the tree walk entirely.
-        if provider != "claude" or not session_id or session_id.startswith("remote:"):
+        # be found locally and their Codex host id would be wrong. The origin
+        # host attaches those links before streaming the event.
+        if not session_id or session_id.startswith("remote:"):
+            return None
+        if provider == "codex":
+            return self._codex_link(session_id)
+        if provider != "claude":
             return None
         cached = self._cache.get(session_id)
         if cached is not None:
@@ -254,6 +270,88 @@ class DeepLinkResolver:
         else:
             self._misses[session_id] = time.time()
         return url
+
+    def _codex_link(self, session_id: str) -> str | None:
+        try:
+            thread_id = str(UUID(session_id))
+        except (AttributeError, ValueError):
+            return None
+        if thread_id != session_id.lower():
+            return None
+        environment_id = self._codex_environment_id()
+        if not environment_id:
+            return None
+        host_id = f"slingshot:{environment_id}:8765"
+        return (
+            f"https://chatgpt.com/app/codex/remote/thread/{thread_id}?"
+            + urlencode({"hostId": host_id})
+        )
+
+    def _codex_environment_id(self) -> str | None:
+        now = time.time()
+        if (
+            self._codex_environment_checked_at is not None
+            and now - self._codex_environment_checked_at < self.MISS_TTL_SECONDS
+        ):
+            return self._codex_environment
+
+        environment_id = self._codex_environment_from_global_state()
+        if environment_id is None:
+            environment_id = self._codex_environment_from_enrollments()
+        self._codex_environment = environment_id
+        self._codex_environment_checked_at = now
+        return environment_id
+
+    @staticmethod
+    def _valid_codex_environment_id(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.startswith("env_e_"):
+            return None
+        suffix = value[len("env_e_"):]
+        return value if suffix and suffix.isalnum() else None
+
+    def _codex_environment_from_global_state(self) -> str | None:
+        try:
+            state = json.loads(self._codex_global_state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict):
+            return None
+        return self._valid_codex_environment_id(state.get(self.CODEX_ENVIRONMENT_KEY))
+
+    def _codex_environment_from_enrollments(self) -> str | None:
+        newest: tuple[int, str] | None = None
+        try:
+            paths = tuple(self._codex_state_dir.glob("state_*.sqlite"))
+        except OSError:
+            return None
+        for path in paths:
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(
+                    path.resolve().as_uri() + "?mode=ro",
+                    uri=True,
+                    timeout=0.1,
+                )
+                row = connection.execute(
+                    "SELECT environment_id, updated_at "
+                    "FROM remote_control_enrollments "
+                    "WHERE remote_control_enabled = 1 "
+                    "ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+            except (OSError, sqlite3.Error):
+                continue
+            finally:
+                if connection is not None:
+                    connection.close()
+            if not row:
+                continue
+            environment_id = self._valid_codex_environment_id(row[0])
+            if environment_id is None:
+                continue
+            candidate = (int(row[1] or 0), environment_id)
+            if newest is None or candidate[0] > newest[0]:
+                newest = candidate
+        return newest[1] if newest else None
 
     def _scan(self, session_id: str) -> str | None:
         url = self._from_registry(session_id)
@@ -396,10 +494,11 @@ def status_row(status: AgentStatus) -> dict[str, Any]:
         "provider": status.provider,
         "cwd": _truncate(Path(status.cwd).name, MAX_DETAIL_CHARS) if status.cwd else None,
     }
-    if _DEEP_LINKS is not None:
+    link = status.deep_link
+    if not link and _DEEP_LINKS is not None:
         link = _DEEP_LINKS.link_for(status.provider, status.session_id)
-        if link:
-            row["deepLink"] = link
+    if link:
+        row["deepLink"] = link
     return row
 
 
@@ -1232,9 +1331,10 @@ class LiveActivityDaemon:
         if _DEEP_LINKS is not None:
             for agent_id, row in self._recent_finished.items():
                 if not row.get("deepLink"):
-                    link = _DEEP_LINKS.link_for(
-                        row.get("provider") or "", agent_id.rsplit(":", 1)[-1]
-                    )
+                    provider = row.get("provider") or ""
+                    prefix = f"{provider}:session:"
+                    session_id = agent_id[len(prefix):] if agent_id.startswith(prefix) else None
+                    link = _DEEP_LINKS.link_for(provider, session_id)
                     if link:
                         row["deepLink"] = link
 
