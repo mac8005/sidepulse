@@ -212,27 +212,44 @@ def _truncate(value: str, limit: int) -> str:
 
 
 class DeepLinkResolver:
-    """Finds a Claude session's Remote Control URL from its transcript.
+    """Finds a Claude session's claude.ai/code URL from its transcript.
 
-    Each ~/.claude/projects/**/<session_id>.jsonl carries a `url` field like
-    https://claude.ai/code/session_… that opens the exact session on the
-    phone. Codex has no equivalent, so those rows get no link.
+    ~/.claude/projects/**/<session_id>.jsonl offers two sources: a top-level
+    `url` field like https://claude.ai/code/session_… (written only by
+    sessions started with --rc), and the `bridgeSessionId` (cse_…) on the
+    bridge-session record that every phone-visible session writes — the
+    session URL is that id with cse_ swapped for session_. Either opens the
+    exact session on the phone. Only the session's own URL is safe to
+    deep-link; the environment URL spawns a NEW session when at capacity.
+    Codex has no equivalent, so those rows get no link.
     """
 
+    MISS_TTL_SECONDS = 120.0
+
     def __init__(self) -> None:
-        self._cache: dict[str, str | None] = {}
+        self._cache: dict[str, str] = {}
+        self._misses: dict[str, float] = {}
         self._roots = [Path.home() / ".claude" / "projects"]
 
     def link_for(self, provider: str, session_id: str | None) -> str | None:
-        if provider != "claude" or not session_id:
+        # remote: rows live on another host, so their transcript can never
+        # be found locally — skip the tree walk entirely.
+        if provider != "claude" or not session_id or session_id.startswith("remote:"):
             return None
-        if session_id in self._cache:
-            return self._cache[session_id]
-        # Only a session's own cloud URL is safe to deep-link; the
-        # environment URL spawns a NEW session when at capacity, so sessions
-        # without their own URL fall back to opening the app.
+        cached = self._cache.get(session_id)
+        if cached is not None:
+            return cached
+        # A session can attach to the bridge after we first looked, so a
+        # miss is retried once the TTL lapses instead of sticking forever.
+        missed_at = self._misses.get(session_id)
+        if missed_at is not None and time.time() - missed_at < self.MISS_TTL_SECONDS:
+            return None
         url = self._scan(session_id)
-        self._cache[session_id] = url
+        if url:
+            self._cache[session_id] = url
+            self._misses.pop(session_id, None)
+        else:
+            self._misses[session_id] = time.time()
         return url
 
     def _scan(self, session_id: str) -> str | None:
@@ -248,14 +265,16 @@ class DeepLinkResolver:
 
     def _extract(self, path: Path) -> str | None:
         # The url rides a top-level `url` field on an early `system` record;
-        # only the top-level key is trusted, so git output that happens to
-        # quote such a URL in a tool result is ignored.
+        # the bridge id a top-level `bridgeSessionId` on the bridge-session
+        # record at line 1. Only top-level keys are trusted, so git output
+        # that happens to quote such a URL in a tool result is ignored.
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as handle:
                 for lineno, raw in enumerate(handle):
                     if lineno > 5000:
                         break
-                    if '"url"' not in raw or "claude.ai/code/session_" not in raw:
+                    has_url = '"url"' in raw and "claude.ai/code/session_" in raw
+                    if not has_url and '"bridgeSessionId"' not in raw:
                         continue
                     try:
                         record = json.loads(raw)
@@ -264,6 +283,9 @@ class DeepLinkResolver:
                     url = record.get("url")
                     if isinstance(url, str) and "claude.ai/code/session_" in url:
                         return url
+                    bridge_id = record.get("bridgeSessionId")
+                    if isinstance(bridge_id, str) and bridge_id.startswith("cse_"):
+                        return "https://claude.ai/code/session_" + bridge_id[len("cse_"):]
         except OSError:
             return None
         return None

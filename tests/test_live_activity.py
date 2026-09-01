@@ -963,3 +963,51 @@ def test_a_reset_echoing_our_own_start_push_is_ignored(tmp_path, monkeypatch):
     daemon._last_start_push_at = 10_000.0
     assert daemon._is_reset_echo(10_001.0) is True, "one second later: our own echo"
     assert daemon._is_reset_echo(10_000.0 + RESET_ECHO_SECONDS + 1) is False, "later: genuine"
+
+
+def test_deep_link_resolver_builds_url_from_bridge_session_id(tmp_path):
+    from sidepulse.live_activity import DeepLinkResolver
+
+    project = tmp_path / "-Users-me-repo"
+    project.mkdir()
+    (project / "abc.jsonl").write_text(
+        json.dumps({
+            "type": "bridge-session",
+            "sessionId": "abc",
+            "bridgeSessionId": "cse_01Example",
+        }) + "\n"
+    )
+    (project / "rc.jsonl").write_text(
+        json.dumps({
+            "type": "system",
+            "url": "https://claude.ai/code/session_01FromUrlField",
+        }) + "\n"
+    )
+
+    resolver = DeepLinkResolver()
+    resolver._roots = [tmp_path]
+    assert resolver.link_for("claude", "abc") == "https://claude.ai/code/session_01Example"
+    assert resolver.link_for("claude", "rc") == "https://claude.ai/code/session_01FromUrlField"
+    assert resolver.link_for("codex", "abc") is None
+    assert resolver.link_for("claude", "remote:air:abc") is None
+
+
+def test_deep_link_resolver_retries_a_miss_after_ttl(tmp_path, monkeypatch):
+    from sidepulse.live_activity import DeepLinkResolver
+
+    project = tmp_path / "-Users-me-repo"
+    project.mkdir()
+    transcript = project / "late.jsonl"
+    transcript.write_text("{}\n")
+
+    resolver = DeepLinkResolver()
+    resolver._roots = [tmp_path]
+    now = 1000.0
+    monkeypatch.setattr("sidepulse.live_activity.time.time", lambda: now)
+
+    assert resolver.link_for("claude", "late") is None
+    # The bridge attaches only after the first look.
+    transcript.write_text(json.dumps({"bridgeSessionId": "cse_01Late"}) + "\n")
+    assert resolver.link_for("claude", "late") is None  # still inside the TTL
+    now += DeepLinkResolver.MISS_TTL_SECONDS + 1
+    assert resolver.link_for("claude", "late") == "https://claude.ai/code/session_01Late"
