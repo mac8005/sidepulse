@@ -214,14 +214,16 @@ def _truncate(value: str, limit: int) -> str:
 class DeepLinkResolver:
     """Finds a Claude session's claude.ai/code URL from its transcript.
 
-    ~/.claude/projects/**/<session_id>.jsonl offers two sources: a top-level
-    `url` field like https://claude.ai/code/session_… (written only by
-    sessions started with --rc), and the `bridgeSessionId` (cse_…) on the
-    bridge-session record that every phone-visible session writes — the
-    session URL is that id with cse_ swapped for session_. Either opens the
-    exact session on the phone. Only the session's own URL is safe to
-    deep-link; the environment URL spawns a NEW session when at capacity.
-    Codex has no equivalent, so those rows get no link.
+    Three sources, cheapest first: the per-pid session registry
+    ~/.claude/sessions/<pid>.json (workers the remote-control daemon spawns
+    record their `bridgeSessionId` only here, never in the transcript), then
+    ~/.claude/projects/**/<session_id>.jsonl for a `bridgeSessionId` on a
+    bridge-session record or a top-level `url` field (written only by
+    sessions started with --rc). The bridge id is the claude.ai/code URL
+    suffix — prefixed cse_ in transcripts and session_ in the registry.
+    Only the session's own URL is safe to deep-link; the environment URL
+    spawns a NEW session when at capacity. Codex has no equivalent, so
+    those rows get no link.
     """
 
     MISS_TTL_SECONDS = 120.0
@@ -230,6 +232,7 @@ class DeepLinkResolver:
         self._cache: dict[str, str] = {}
         self._misses: dict[str, float] = {}
         self._roots = [Path.home() / ".claude" / "projects"]
+        self._registry = Path.home() / ".claude" / "sessions"
 
     def link_for(self, provider: str, session_id: str | None) -> str | None:
         # remote: rows live on another host, so their transcript can never
@@ -253,6 +256,9 @@ class DeepLinkResolver:
         return url
 
     def _scan(self, session_id: str) -> str | None:
+        url = self._from_registry(session_id)
+        if url:
+            return url
         import glob as _glob
 
         for root in self._roots:
@@ -261,6 +267,34 @@ class DeepLinkResolver:
                 url = self._extract(Path(path))
                 if url:
                     return url
+        return None
+
+    def _from_registry(self, session_id: str) -> str | None:
+        def mtime(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        try:
+            entries = sorted(self._registry.glob("*.json"), key=mtime, reverse=True)
+        except OSError:
+            return None
+        for path in entries:
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict) or record.get("sessionId") != session_id:
+                continue
+            # The newest registry entry for the session decides; an older
+            # pid's bridge may belong to an archived incarnation.
+            bridge_id = record.get("bridgeSessionId")
+            if isinstance(bridge_id, str):
+                for prefix in ("session_", "cse_"):
+                    if bridge_id.startswith(prefix):
+                        return "https://claude.ai/code/session_" + bridge_id[len(prefix):]
+            return None
         return None
 
     def _extract(self, path: Path) -> str | None:
@@ -1190,6 +1224,19 @@ class LiveActivityDaemon:
                 continue
             if now - self._recent_finished[agent_id].get("finishedAt", 0.0) > RECENT_FINISHED_SECONDS:
                 del self._recent_finished[agent_id]
+
+        # Remembered rows outlive the collector (and daemon restarts), so a
+        # link that resolves late — or code that learned a new source —
+        # still reaches rows stored before it existed. Misses are cheap:
+        # the resolver TTL-caches them.
+        if _DEEP_LINKS is not None:
+            for agent_id, row in self._recent_finished.items():
+                if not row.get("deepLink"):
+                    link = _DEEP_LINKS.link_for(
+                        row.get("provider") or "", agent_id.rsplit(":", 1)[-1]
+                    )
+                    if link:
+                        row["deepLink"] = link
 
         self._last_rows = {status.agent_id: status_row(status) for status in current.values()}
         self._save_recent_finished()

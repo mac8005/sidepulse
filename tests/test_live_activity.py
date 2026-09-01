@@ -986,6 +986,7 @@ def test_deep_link_resolver_builds_url_from_bridge_session_id(tmp_path):
 
     resolver = DeepLinkResolver()
     resolver._roots = [tmp_path]
+    resolver._registry = tmp_path / "sessions"
     assert resolver.link_for("claude", "abc") == "https://claude.ai/code/session_01Example"
     assert resolver.link_for("claude", "rc") == "https://claude.ai/code/session_01FromUrlField"
     assert resolver.link_for("codex", "abc") is None
@@ -1002,6 +1003,7 @@ def test_deep_link_resolver_retries_a_miss_after_ttl(tmp_path, monkeypatch):
 
     resolver = DeepLinkResolver()
     resolver._roots = [tmp_path]
+    resolver._registry = tmp_path / "sessions"
     now = 1000.0
     monkeypatch.setattr("sidepulse.live_activity.time.time", lambda: now)
 
@@ -1011,3 +1013,47 @@ def test_deep_link_resolver_retries_a_miss_after_ttl(tmp_path, monkeypatch):
     assert resolver.link_for("claude", "late") is None  # still inside the TTL
     now += DeepLinkResolver.MISS_TTL_SECONDS + 1
     assert resolver.link_for("claude", "late") == "https://claude.ai/code/session_01Late"
+
+
+def test_deep_link_resolver_reads_the_session_registry(tmp_path):
+    from sidepulse.live_activity import DeepLinkResolver
+
+    # Remote-control workers record their bridge id only in the per-pid
+    # registry, never in the transcript.
+    registry = tmp_path / "sessions"
+    registry.mkdir()
+    (registry / "123.json").write_text(
+        json.dumps({
+            "pid": 123,
+            "sessionId": "worker",
+            "bridgeSessionId": "session_01FromRegistry",
+        })
+    )
+    (registry / "456.json").write_text(json.dumps({"pid": 456, "sessionId": "other"}))
+
+    resolver = DeepLinkResolver()
+    resolver._roots = [tmp_path / "projects"]
+    resolver._registry = registry
+    assert resolver.link_for("claude", "worker") == "https://claude.ai/code/session_01FromRegistry"
+    assert resolver.link_for("claude", "other") is None
+
+
+def test_remembered_finished_rows_backfill_deep_links(tmp_path, monkeypatch):
+    import sidepulse.live_activity as la
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = la.LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
+    daemon = la.LiveActivityDaemon(config, token_store=la.TokenStore(tmp_path / "tok.json"))
+    daemon._recent_finished["claude:session:abc"] = {
+        "id": "claude:session:abc", "name": "Old", "mode": "completed",
+        "provider": "claude", "finishedAt": 1.0, "unread": True,
+    }
+
+    class Stub:
+        def link_for(self, provider, session_id):
+            assert (provider, session_id) == ("claude", "abc")
+            return "https://claude.ai/code/session_01X"
+
+    monkeypatch.setattr(la, "_DEEP_LINKS", Stub())
+    daemon._remember_finished([], 2.0)
+    assert daemon._recent_finished["claude:session:abc"]["deepLink"] == "https://claude.ai/code/session_01X"
