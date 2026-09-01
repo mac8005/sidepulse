@@ -428,6 +428,14 @@ private struct SettingsView: View {
                 }
 
                 DotBehaviorControls(model: model)
+
+                Toggle("Keep mirroring in background", isOn: $model.dotBackgroundEnabled)
+
+                if model.dotBackgroundEnabled {
+                    Text("Keeps SidePulse running after you switch away by playing silent audio, so the Dot follows the agents like the Live Activity. Uses more battery; the Dot pauses during calls and while another app plays audio.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section {

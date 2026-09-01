@@ -13,12 +13,13 @@ struct SidePulseApp: App {
                 }
         }
         .onChange(of: scenePhase) { phase in
-            // The Dot mirror needs the app in front to write to the drive.
+            // The Dot mirror runs while the app is in front and, if enabled,
+            // keeps the process alive in the background (see DotKeepalive).
             switch phase {
             case .active:
                 DotStatusMirror.shared.start(model: AppModel.shared)
             case .background:
-                DotStatusMirror.shared.suspend()
+                DotStatusMirror.shared.background()
             default:
                 break
             }
