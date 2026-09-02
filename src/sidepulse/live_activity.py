@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from .collector import AgentMonitor
@@ -100,11 +100,14 @@ DOT_PUSH_FAILURE_RETRY_SECONDS = 60.0
 DOT_PUSH_FAILURE_MAX_RETRY_SECONDS = 20 * 60.0
 DOT_PUSH_RETRY_OFFSETS_SECONDS = (0.0, 2 * 60.0, 20 * 60.0)
 DOT_RESYNC_COOLDOWN_SECONDS = 60.0
+DOT_WORKING_REFRESH_SECONDS = 20 * 60.0
 DOT_COLLAPSE_ID = "sidepulse-dot-state"
 DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
 DOT_UNAVAILABLE_MIN_SECONDS = 60.0
 DOT_UNAVAILABLE_MAX_SECONDS = 24 * 60 * 60.0
 DOT_REPORTED_AT_MAX_FUTURE_SECONDS = 5 * 60.0
+DOT_DND_TRANSITION_MAX_FUTURE_SECONDS = 3 * 24 * 60 * 60.0
+DOT_STREAM_TOKEN_MAX_CHARS = 512
 DOT_UNAVAILABLE_REASONS = {
     "brightness_zero",
     "disconnected",
@@ -118,6 +121,12 @@ DOT_UNAVAILABLE_METADATA_KEYS = (
     "dot_unavailable_reason",
     "dot_status_at",
     "dot_client_reported_at",
+    "dot_dnd_schedule_enabled",
+    "dot_next_dnd_transition_at",
+    "dot_next_dnd_transition_enabled",
+    "dot_schedule_reported_at",
+    "dot_focus_active",
+    "dot_focus_reported_at",
 )
 
 # Modes worth interrupting the user for, and their notification titles.
@@ -173,6 +182,14 @@ class PendingDotPush:
     next_attempt_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class DotDndSchedule:
+    enabled: bool
+    next_transition_at: float | None
+    next_transition_enabled: bool | None
+    reported_at: float
+
+
 class StaleCompletionError(Exception):
     """The client tried to acknowledge an older completion generation."""
 
@@ -217,6 +234,71 @@ def _parse_dot_availability(
         ),
         client_time,
     )
+
+
+def _parse_dot_dnd_schedule(body: dict[str, Any]) -> DotDndSchedule | None:
+    """Validate optional next-boundary metadata from the elected phone."""
+    keys = {
+        "dndScheduleEnabled",
+        "nextDndTransitionAt",
+        "nextDndTransitionEnabled",
+    }
+    if not keys.intersection(body):
+        return None
+
+    enabled = body.get("dndScheduleEnabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("dndScheduleEnabled must be a boolean")
+    reported_at = body.get("reportedAt")
+    if (
+        isinstance(reported_at, bool)
+        or not isinstance(reported_at, (int, float))
+        or not math.isfinite(reported_at)
+    ):
+        raise ValueError("reportedAt is required with DND schedule metadata")
+    if reported_at > time.time() + DOT_REPORTED_AT_MAX_FUTURE_SECONDS:
+        raise ValueError("reportedAt is too far in the future")
+
+    transition_at = body.get("nextDndTransitionAt")
+    transition_enabled = body.get("nextDndTransitionEnabled")
+    if not enabled:
+        if transition_at is not None or transition_enabled is not None:
+            raise ValueError("disabled DND schedule cannot have a next transition")
+        return DotDndSchedule(False, None, None, float(reported_at))
+    if (
+        isinstance(transition_at, bool)
+        or not isinstance(transition_at, (int, float))
+        or not math.isfinite(transition_at)
+        or transition_at <= 0
+    ):
+        raise ValueError("nextDndTransitionAt must be a positive number")
+    if transition_at > reported_at + DOT_DND_TRANSITION_MAX_FUTURE_SECONDS:
+        raise ValueError("nextDndTransitionAt is too far in the future")
+    if not isinstance(transition_enabled, bool):
+        raise ValueError("nextDndTransitionEnabled must be a boolean")
+    return DotDndSchedule(
+        True,
+        float(transition_at),
+        transition_enabled,
+        float(reported_at),
+    )
+
+
+def _parse_dot_focus(body: dict[str, Any]) -> tuple[bool, float]:
+    """Validate an ordered Focus-state report."""
+    focused = body.get("focused")
+    if not isinstance(focused, bool):
+        raise ValueError("focused must be a boolean")
+    reported_at = body.get("reportedAt")
+    if (
+        isinstance(reported_at, bool)
+        or not isinstance(reported_at, (int, float))
+        or not math.isfinite(reported_at)
+    ):
+        raise ValueError("reportedAt must be a number")
+    if reported_at > time.time() + DOT_REPORTED_AT_MAX_FUTURE_SECONDS:
+        raise ValueError("reportedAt is too far in the future")
+    return focused, float(reported_at)
 
 
 def _log(message: str) -> None:
@@ -1533,6 +1615,8 @@ class LiveActivityDaemon:
         self._pending_dot: PendingDotPush | None = None
         self._dot_lock = threading.RLock()
         self._last_dot_resync_at = 0.0
+        self._last_dot_working_ack_at: float | None = None
+        self._dot_streams: dict[str, int] = {}
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -2456,6 +2540,35 @@ class LiveActivityDaemon:
             return token, float(unavailable_until), reason, False
         return token, None, None, bool(valid_until and unavailable_until <= now)
 
+    def _dot_owner_stream_count(self) -> int:
+        entries = self.tokens.entries("dot_device")
+        if not entries:
+            return 0
+        owner = next(iter(entries))
+        return self._dot_streams.get(owner, 0)
+
+    def _dot_stream_connected(self, token: str | None) -> bool:
+        """Track only a bounded, exact match for the elected Dot owner."""
+        if not token or len(token) > DOT_STREAM_TOKEN_MAX_CHARS:
+            return False
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries or next(iter(entries)) != token:
+                return False
+            self._dot_streams[token] = self._dot_streams.get(token, 0) + 1
+        return True
+
+    def _dot_stream_disconnected(self, token: str) -> None:
+        with self._dot_lock:
+            count = self._dot_streams.get(token, 0)
+            if count <= 1:
+                self._dot_streams.pop(token, None)
+            else:
+                self._dot_streams[token] = count - 1
+        # A state may have settled while the foreground stream suppressed its
+        # background push. Process that pending command immediately.
+        self._wake.set()
+
     def report_dot_availability(
         self,
         token: str,
@@ -2463,23 +2576,51 @@ class LiveActivityDaemon:
         reason: str | None = None,
         retry_after_seconds: float | None = None,
         reported_at: float | None = None,
+        dnd_schedule: DotDndSchedule | None = None,
         *,
         now: float | None = None,
         force_resync: bool = True,
     ) -> bool:
         """Persist a bounded suppression lease for the elected Dot owner."""
-        owner_matched, applied = self._record_dot_availability(
-            token,
-            available,
-            reason,
-            retry_after_seconds,
-            reported_at,
-            now=now,
-        )
-        if owner_matched and applied and available and force_resync:
-            moment = time.time() if now is None else now
-            with self._dot_lock:
-                self.request_dot_resync(now=moment, force=True)
+        moment = time.time() if now is None else now
+        with self._dot_lock:
+            metadata = self.tokens.entries("dot_device").get(token, {})
+            was_unavailable = (
+                metadata.get("dot_unavailable_reason") in DOT_UNAVAILABLE_REASONS
+            )
+            owner_matched, applied = self._record_dot_availability(
+                token,
+                available,
+                reason,
+                retry_after_seconds,
+                reported_at,
+                now=moment,
+            )
+            if owner_matched and dnd_schedule is not None:
+                self._record_dot_dnd_schedule(
+                    token,
+                    dnd_schedule,
+                    now=moment,
+                )
+
+            should_wake = False
+            if owner_matched and applied and available and force_resync:
+                current_applied = self._current_dot_content_state is not None and (
+                    self._last_dot_state,
+                    self._last_dot_has_unread_finished,
+                ) == (
+                    self._current_dot_state,
+                    _has_unread_finished(self._current_dot_content_state),
+                )
+                if was_unavailable:
+                    should_wake = self._rearm_current_dot(
+                        moment, include_accepted=True
+                    )
+                elif not current_applied:
+                    should_wake = self._rearm_current_dot(
+                        moment, include_accepted=False
+                    )
+            if should_wake:
                 self._wake.set()
         return owner_matched
 
@@ -2507,6 +2648,28 @@ class LiveActivityDaemon:
             metadata = self.tokens.entries("dot_device").get(token)
             if metadata is None:
                 return False, False
+            focus_reported_at = metadata.get("dot_focus_reported_at")
+            focus_active = metadata.get("dot_focus_active")
+            availability_focus = (
+                False
+                if available
+                else True
+                if reason == "focus"
+                else None
+            )
+            if (
+                isinstance(focus_active, bool)
+                and not isinstance(focus_reported_at, bool)
+                and isinstance(focus_reported_at, (int, float))
+                and math.isfinite(focus_reported_at)
+                and availability_focus is not None
+                and availability_focus != focus_active
+                and (ordered_at is None or ordered_at <= focus_reported_at)
+            ):
+                # Focus Intents and main-app availability reports travel on
+                # independent requests. A delayed report must not undo the
+                # newer Focus generation in either direction.
+                return True, False
             previous_client_time = metadata.get("dot_client_reported_at")
             if (
                 ordered_at is not None
@@ -2544,15 +2707,156 @@ class LiveActivityDaemon:
                 return False, False
         return True, True
 
+    def _record_dot_dnd_schedule(
+        self,
+        token: str,
+        schedule: DotDndSchedule,
+        *,
+        now: float | None,
+    ) -> tuple[bool, bool]:
+        moment = time.time() if now is None else now
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries or next(iter(entries)) != token:
+                return False, False
+            metadata = entries[token]
+            previous = metadata.get("dot_schedule_reported_at")
+            if (
+                isinstance(previous, (int, float))
+                and not isinstance(previous, bool)
+                and math.isfinite(previous)
+                and schedule.reported_at <= previous
+            ):
+                return True, False
+            values: dict[str, Any] = {
+                "dot_status_at": moment,
+                "dot_dnd_schedule_enabled": schedule.enabled,
+                "dot_next_dnd_transition_at": schedule.next_transition_at,
+                "dot_next_dnd_transition_enabled": schedule.next_transition_enabled,
+                "dot_schedule_reported_at": schedule.reported_at,
+            }
+            return True, self.tokens.update_metadata("dot_device", token, values)
+
+    def _rearm_current_dot(self, now: float, *, include_accepted: bool) -> bool:
+        """Reuse a viable command; allocate a new id only when none can run."""
+        dot_state = self._current_dot_state
+        content_state = self._current_dot_content_state
+        if dot_state is None or content_state is None:
+            return False
+        signature = (dot_state, _has_unread_finished(content_state))
+        pending = self._pending_dot
+        if (
+            pending is not None
+            and (pending.state, pending.has_unread_finished) == signature
+            and now < pending.created_at + DOT_PUSH_EXPIRY_SECONDS
+            and pending.accepted_attempts < len(DOT_PUSH_RETRY_OFFSETS_SECONDS)
+        ):
+            if include_accepted or pending.accepted_attempts == 0:
+                pending.next_attempt_at = now
+                return True
+            return False
+        return self._queue_dot_state(dot_state, content_state, now, force=True)
+
+    def _apply_due_dot_dnd_transition(self, now: float) -> bool:
+        """Consume one persisted DND boundary and queue a current-state wake."""
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries:
+                return False
+            token, metadata = next(iter(entries.items()))
+            transition_at = metadata.get("dot_next_dnd_transition_at")
+            transition_enabled = metadata.get("dot_next_dnd_transition_enabled")
+            if (
+                metadata.get("dot_dnd_schedule_enabled") is not True
+                or isinstance(transition_at, bool)
+                or not isinstance(transition_at, (int, float))
+                or not math.isfinite(transition_at)
+                or transition_at > now
+                or not isinstance(transition_enabled, bool)
+                or self._current_dot_state is None
+                or self._current_dot_content_state is None
+            ):
+                return False
+            values: dict[str, Any] = {
+                "dot_next_dnd_transition_at": None,
+                "dot_next_dnd_transition_enabled": None,
+            }
+            if (
+                transition_enabled is False
+                and metadata.get("dot_unavailable_reason") == "dnd"
+            ):
+                values.update(
+                    {
+                        "dot_unavailable_until": None,
+                        "dot_unavailable_reason": None,
+                    }
+                )
+            if not self.tokens.update_metadata("dot_device", token, values):
+                return False
+            queued = self.request_dot_resync(now=now, force=True)
+            if queued:
+                self._wake.set()
+            return queued
+
+    def report_dot_focus(
+        self,
+        token: str,
+        focused: bool,
+        reported_at: float,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, bool]:
+        """Persist an ordered owner Focus report and queue its LED refresh."""
+        moment = time.time() if now is None else now
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries or next(iter(entries)) != token:
+                return False, False
+            metadata = entries[token]
+            previous_time = metadata.get("dot_focus_reported_at")
+            if (
+                isinstance(previous_time, (int, float))
+                and not isinstance(previous_time, bool)
+                and math.isfinite(previous_time)
+                and reported_at <= previous_time
+            ):
+                return True, False
+            owner, unavailable_until, reason, _ = self._dot_owner_availability(moment)
+            values: dict[str, Any] = {
+                "dot_status_at": moment,
+                "dot_focus_active": focused,
+                "dot_focus_reported_at": reported_at,
+            }
+            if not focused and reason == "focus":
+                values.update(
+                    {
+                        "dot_unavailable_until": None,
+                        "dot_unavailable_reason": None,
+                    }
+                )
+            if not self.tokens.update_metadata("dot_device", token, values):
+                return False, False
+
+            another_suppression = (
+                owner is not None
+                and unavailable_until is not None
+                and reason not in (None, "focus")
+            )
+            should_force = (focused and not another_suppression) or not focused
+            if should_force and self.request_dot_resync(now=moment, force=True):
+                self._wake.set()
+            return True, True
+
     def _observe_dot_state(
         self, dot_state: str, content_state: dict[str, Any], now: float
     ) -> bool:
         """Coalesce brief state flaps before consuming a silent-push slot."""
         signature = (dot_state, _has_unread_finished(content_state))
         with self._dot_lock:
+            previous = self._dot_candidate_signature
             self._current_dot_state = dot_state
             self._current_dot_content_state = dict(content_state)
-            if self._dot_candidate_signature != signature:
+            if previous != signature:
                 self._dot_candidate_signature = signature
                 self._dot_candidate_since = now
                 if self._pending_dot is not None and (
@@ -2560,7 +2864,14 @@ class LiveActivityDaemon:
                     self._pending_dot.has_unread_finished,
                 ) != signature:
                     self._pending_dot = None
-            settled = now - self._dot_candidate_since >= DOT_STATE_SETTLE_SECONDS
+            unread_changed = (
+                previous is not None and previous[1] != signature[1]
+            ) or (previous is None and signature[1])
+            settled = (
+                dot_state in {"ask", "done"}
+                or unread_changed
+                or now - self._dot_candidate_since >= DOT_STATE_SETTLE_SECONDS
+            )
         if not settled:
             return False
         return self._queue_dot_state(dot_state, content_state, now)
@@ -2607,6 +2918,7 @@ class LiveActivityDaemon:
         availability: tuple[
             bool, str | None, float | None, float | None
         ] | None = None,
+        dnd_schedule: DotDndSchedule | None = None,
         *,
         now: float | None = None,
     ) -> bool:
@@ -2629,6 +2941,16 @@ class LiveActivityDaemon:
                         availability[3],
                         now=now,
                     )
+            if dnd_schedule is not None:
+                owner, _, _, _ = self._dot_owner_availability(
+                    time.time() if now is None else now
+                )
+                if owner is not None:
+                    self._record_dot_dnd_schedule(
+                        owner,
+                        dnd_schedule,
+                        now=now,
+                    )
             delivered = status in DOT_ACK_SUCCESS_STATUSES and (
                 availability is None
                 or not availability_applied
@@ -2639,6 +2961,14 @@ class LiveActivityDaemon:
             else:
                 self._last_dot_state = pending.state
                 self._last_dot_has_unread_finished = pending.has_unread_finished
+                if pending.state == "working":
+                    self._last_dot_working_ack_at = (
+                        time.time() if now is None else now
+                    )
+                else:
+                    # A later working transition must settle and earn its own
+                    # ACK before periodic refreshes can begin again.
+                    self._last_dot_working_ack_at = None
                 self._pending_dot = None
                 state = pending.state
         if delivered:
@@ -2650,10 +2980,11 @@ class LiveActivityDaemon:
     def _send_pending_dot_if_due(self, now: float) -> bool:
         """Send at most three accepted copies over the command's one-hour TTL."""
         with self._dot_lock:
+            self._apply_due_dot_dnd_transition(now)
             owner, unavailable_until, _, lease_expired = (
                 self._dot_owner_availability(now)
             )
-            if owner is None or unavailable_until is not None:
+            if owner is None:
                 return False
             if lease_expired:
                 if not self.tokens.update_metadata(
@@ -2666,6 +2997,25 @@ class LiveActivityDaemon:
                 ):
                     return False
                 self.request_dot_resync(now=now, force=True)
+            if self._dot_owner_stream_count() > 0 or unavailable_until is not None:
+                return False
+            if (
+                # A maxed-out or expired command deliberately remains pending:
+                # a state/resync event may replace it, but ticks must not mint
+                # fresh UUIDs and silently exceed the background-push budget.
+                self._pending_dot is None
+                and self._current_dot_state == "working"
+                and self._current_dot_content_state is not None
+                and self._last_dot_working_ack_at is not None
+                and now
+                >= self._last_dot_working_ack_at + DOT_WORKING_REFRESH_SECONDS
+            ):
+                self._queue_dot_state(
+                    "working",
+                    self._current_dot_content_state,
+                    now,
+                    force=True,
+                )
             pending = self._pending_dot
             if (
                 pending is None
@@ -2762,6 +3112,13 @@ class LiveActivityDaemon:
                 "dotPendingCommand": (
                     pending.command_id[:8] if pending is not None else None
                 ),
+                "dotForegroundStreams": self._dot_owner_stream_count(),
+                "dotFocusActive": (
+                    self.tokens.entries("dot_device")
+                    .get(owner or "", {})
+                    .get("dot_focus_active")
+                    is True
+                ),
             }
 
     def _end_stale_activity(self, reason: str) -> None:
@@ -2826,7 +3183,8 @@ class LiveActivityDaemon:
                 self.wfile.write(data)
 
             def do_GET(self) -> None:
-                if self.path == "/health":
+                parsed = urlsplit(self.path)
+                if parsed.path == "/health":
                     self._json(
                         200,
                         {
@@ -2853,23 +3211,33 @@ class LiveActivityDaemon:
                             "hostLabel": daemon.config.host_label,
                         },
                     )
-                elif self.path == "/snapshot":
+                elif parsed.path == "/snapshot":
                     with daemon._condition:
                         latest = daemon._latest
                     self._json(200, latest or {})
-                elif self.path == "/stream":
-                    self._stream()
+                elif parsed.path == "/stream":
+                    self._stream(parsed.query)
                 else:
                     self._json(404, {"error": "not found"})
 
-            def _stream(self) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
-                self.end_headers()
-                last_sent: object = object()
+            def _stream(self, query: str) -> None:
                 try:
+                    values = parse_qs(
+                        query,
+                        keep_blank_values=True,
+                        max_num_fields=4,
+                    ).get("dotToken", [])
+                except ValueError:
+                    values = []
+                token = values[0] if len(values) == 1 else None
+                tracked = daemon._dot_stream_connected(token)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    last_sent: object = object()
                     while not daemon._stop.is_set():
                         with daemon._condition:
                             if daemon._latest is last_sent:
@@ -2892,6 +3260,9 @@ class LiveActivityDaemon:
                         last_sent = latest
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
+                finally:
+                    if tracked and token is not None:
+                        daemon._dot_stream_disconnected(token)
 
             def do_POST(self) -> None:
                 if self.path == "/dot-ack":
@@ -2911,11 +3282,12 @@ class LiveActivityDaemon:
                         return
                     try:
                         availability = _parse_dot_availability(body)
+                        dnd_schedule = _parse_dot_dnd_schedule(body)
                     except ValueError as exc:
                         self._json(400, {"error": str(exc)})
                         return
                     acknowledged = daemon.ack_dot(
-                        command_id, status, availability
+                        command_id, status, availability, dnd_schedule
                     )
                     self._json(200, {"ok": True, "acknowledged": acknowledged})
                     return
@@ -2932,10 +3304,16 @@ class LiveActivityDaemon:
                     token = body.get("token")
                     try:
                         availability = _parse_dot_availability(body)
+                        dnd_schedule = _parse_dot_dnd_schedule(body)
                     except ValueError as exc:
                         self._json(400, {"error": str(exc)})
                         return
-                    if not isinstance(token, str) or not token or availability is None:
+                    if (
+                        not isinstance(token, str)
+                        or not token
+                        or len(token) > DOT_STREAM_TOKEN_MAX_CHARS
+                        or availability is None
+                    ):
                         self._json(400, {"error": "token and available are required"})
                         return
                     updated = daemon.report_dot_availability(
@@ -2944,11 +3322,46 @@ class LiveActivityDaemon:
                         availability[1],
                         availability[2],
                         availability[3],
+                        dnd_schedule,
                     )
                     if not updated:
                         self._json(409, {"ok": False, "error": "not_dot_owner"})
                         return
                     self._json(200, {"ok": True, **daemon._dot_health()})
+                    return
+                if self.path == "/dot-focus":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, OSError):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    if not isinstance(body, dict):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    token = body.get("token")
+                    if (
+                        not isinstance(token, str)
+                        or not token
+                        or len(token) > DOT_STREAM_TOKEN_MAX_CHARS
+                    ):
+                        self._json(400, {"error": "token is required"})
+                        return
+                    try:
+                        focused, reported_at = _parse_dot_focus(body)
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    owner, updated = daemon.report_dot_focus(
+                        token, focused, reported_at
+                    )
+                    if not owner:
+                        self._json(409, {"ok": False, "error": "not_dot_owner"})
+                        return
+                    self._json(
+                        200,
+                        {"ok": True, "updated": updated, **daemon._dot_health()},
+                    )
                     return
                 if self.path == "/seen":
                     try:

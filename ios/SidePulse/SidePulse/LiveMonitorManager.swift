@@ -9,6 +9,32 @@ private struct DotAvailabilityReportSignature: Equatable {
     let serverURL: String
     let token: String
     let availability: DotAvailability
+    let dndSchedule: DotDndScheduleMetadata
+}
+
+private struct DotDndScheduleMetadata: Equatable {
+    let enabled: Bool
+    let nextTransitionAt: TimeInterval?
+    let nextTransitionEnabled: Bool?
+    let identity: String
+
+    @MainActor
+    init(model: AppModel, now: Date) {
+        enabled = model.dndScheduleEnabled
+        identity = "\(model.dndScheduleEnabled)|\(model.dndStartTime)|\(model.dndEndTime)"
+        if model.dndScheduleEnabled,
+           let transition = DndSchedule.nextTransition(
+               startTime: model.dndStartTime,
+               endTime: model.dndEndTime,
+               after: now
+           ) {
+            nextTransitionAt = transition.date.timeIntervalSince1970
+            nextTransitionEnabled = transition.enabled
+        } else {
+            nextTransitionAt = nil
+            nextTransitionEnabled = nil
+        }
+    }
 }
 
 private struct DotAvailabilityReport {
@@ -378,9 +404,11 @@ final class LiveMonitorManager: ObservableObject {
             "commandID": commandID,
             "status": status,
         ]
+        let now = Date()
         addDotAvailability(
             availability,
-            reportedAt: Date().timeIntervalSince1970,
+            reportedAt: now.timeIntervalSince1970,
+            dndSchedule: DotDndScheduleMetadata(model: model, now: now),
             to: &payload
         )
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
@@ -419,13 +447,15 @@ final class LiveMonitorManager: ObservableObject {
         if model.hasFolderAccess {
             ensureDotDeviceRegistration(model: model)
         }
+        let now = Date()
         let report = DotAvailabilityReport(
             signature: DotAvailabilityReportSignature(
                 serverURL: model.liveMonitorServerURL,
                 token: token,
-                availability: availability
+                availability: availability,
+                dndSchedule: DotDndScheduleMetadata(model: model, now: now)
             ),
-            reportedAt: Date().timeIntervalSince1970
+            reportedAt: now.timeIntervalSince1970
         )
         latestDotAvailabilityReport = report
         enqueueDotAvailability(report)
@@ -475,6 +505,7 @@ final class LiveMonitorManager: ObservableObject {
         addDotAvailability(
             report.signature.availability,
             reportedAt: report.reportedAt,
+            dndSchedule: report.signature.dndSchedule,
             to: &payload
         )
 
@@ -507,10 +538,17 @@ final class LiveMonitorManager: ObservableObject {
     private func addDotAvailability(
         _ availability: DotAvailability,
         reportedAt: TimeInterval,
+        dndSchedule: DotDndScheduleMetadata,
         to payload: inout [String: Any]
     ) {
         payload["available"] = availability.available
         payload["reportedAt"] = reportedAt
+        payload["dndScheduleEnabled"] = dndSchedule.enabled
+        if let nextTransitionAt = dndSchedule.nextTransitionAt,
+           let nextTransitionEnabled = dndSchedule.nextTransitionEnabled {
+            payload["nextDndTransitionAt"] = nextTransitionAt
+            payload["nextDndTransitionEnabled"] = nextTransitionEnabled
+        }
         if availability.available {
             return
         }

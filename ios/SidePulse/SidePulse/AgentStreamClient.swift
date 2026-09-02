@@ -36,21 +36,44 @@ final class AgentStreamClient: ObservableObject {
     @Published var snapshot: AgentSnapshot?
 
     private var task: Task<Void, Never>?
+    private var connectionBaseURL: String?
+    private var connectionDotToken: String?
 
-    func start(baseURL: String) {
+    func start(baseURL: String, dotToken: String? = nil) {
+        let qualifiedToken = dotToken.flatMap { $0.isEmpty ? nil : $0 }
+        if task != nil,
+           connectionBaseURL == baseURL,
+           connectionDotToken == qualifiedToken {
+            return
+        }
         stop()
-        task = Task { await run(baseURL: baseURL) }
+        connectionBaseURL = baseURL
+        connectionDotToken = qualifiedToken
+        task = Task { await run(baseURL: baseURL, dotToken: qualifiedToken) }
     }
 
     func stop() {
         task?.cancel()
         task = nil
+        connectionBaseURL = nil
+        connectionDotToken = nil
         snapshot = nil
         state = .idle
     }
 
-    private func run(baseURL: String) async {
-        guard let url = URL(string: baseURL)?.appendingPathComponent("stream") else {
+    private func run(baseURL: String, dotToken: String?) async {
+        guard let streamURL = URL(string: baseURL)?.appendingPathComponent("stream"),
+              var components = URLComponents(url: streamURL, resolvingAgainstBaseURL: false)
+        else {
+            state = .failed("Invalid server URL")
+            return
+        }
+        if let dotToken {
+            components.queryItems = (components.queryItems ?? []) + [
+                URLQueryItem(name: "dotToken", value: dotToken)
+            ]
+        }
+        guard let url = components.url else {
             state = .failed("Invalid server URL")
             return
         }

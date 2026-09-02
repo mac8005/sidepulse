@@ -6,7 +6,10 @@ final class AppModel: ObservableObject {
     static let shared = AppModel()
 
     @Published var pushToken: String {
-        didSet { UserDefaults.standard.set(pushToken, forKey: Defaults.pushToken) }
+        didSet {
+            UserDefaults.standard.set(pushToken, forKey: Defaults.pushToken)
+            mirrorFocusStatusSettings()
+        }
     }
 
     @Published var selectedFolderPath: String = "No USB folder selected"
@@ -29,7 +32,10 @@ final class AppModel: ObservableObject {
     }
 
     @Published var liveMonitorServerURL: String {
-        didSet { UserDefaults.standard.set(liveMonitorServerURL, forKey: Defaults.liveMonitorServerURL) }
+        didSet {
+            UserDefaults.standard.set(liveMonitorServerURL, forKey: Defaults.liveMonitorServerURL)
+            mirrorFocusStatusSettings()
+        }
     }
 
     // SidePulse Dot behaviour, same keys as the Mac app's settings.
@@ -82,7 +88,10 @@ final class AppModel: ObservableObject {
 
     /// Keep the Dot off while an iOS Focus (Sleep, Do Not Disturb, …) is on.
     @Published var focusDndEnabled: Bool {
-        didSet { UserDefaults.standard.set(focusDndEnabled, forKey: Defaults.focusDndEnabled) }
+        didSet {
+            UserDefaults.standard.set(focusDndEnabled, forKey: Defaults.focusDndEnabled)
+            mirrorFocusStatusSettings()
+        }
     }
 
     @Published var lastMessage: String = "Ready"
@@ -133,6 +142,7 @@ final class AppModel: ObservableObject {
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
         refreshFolderStatus()
+        mirrorFocusStatusSettings()
     }
 
     /// Port of `apply_due_dnd_schedule`: once a schedule boundary has passed,
@@ -298,6 +308,14 @@ final class AppModel: ObservableObject {
         if let data = try? JSONEncoder().encode(receivedPushes) {
             UserDefaults.standard.set(data, forKey: Defaults.receivedPushes)
         }
+    }
+
+    private func mirrorFocusStatusSettings() {
+        FocusStatusShared.store(
+            serverURL: liveMonitorServerURL,
+            pushToken: pushToken,
+            isEnabled: focusDndEnabled
+        )
     }
 
     private static func loadReceivedPushes() -> [ReceivedPush] {

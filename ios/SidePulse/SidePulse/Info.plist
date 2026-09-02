@@ -31,8 +31,12 @@
     </array>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>SidePulseFocusKeychainAccessGroup</key>
+    <string>$(AppIdentifierPrefix)sidepulse.focus</string>
     <key>NSFocusStatusUsageDescription</key>
     <string>SidePulse keeps the Dot off while a Focus such as Sleep or Do Not Disturb is on.</string>
+    <key>NSSiriUsageDescription</key>
+    <string>SidePulse receives Focus status changes so it can keep the SidePulse Dot off.</string>
     <key>NSSupportsLiveActivities</key>
     <true/>
     <key>NSSupportsLiveActivitiesFrequentUpdates</key>
