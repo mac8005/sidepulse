@@ -20,7 +20,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
 
         if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
-            processNotification(userInfo, source: "Launch notification")
+            if !handleDotNotification(userInfo, completion: { _ in }) {
+                processNotification(userInfo, source: "Launch notification")
+            }
         }
 
         return true
@@ -51,12 +53,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        // The daemon's Dot mirror push: rewrite LEDS.LED and go back to sleep.
-        if let mode = (userInfo["dot"] as? [String: Any])?["aggregateMode"] as? String {
-            let written = MainActor.assumeIsolated {
-                DotStatusMirror.shared.applyPush(aggregateMode: mode, model: AppModel.shared)
-            }
-            completionHandler(written ? .newData : .noData)
+        if handleDotNotification(userInfo, completion: completionHandler) {
             return
         }
         let didHandle = processNotification(userInfo, source: "Background push")
@@ -149,5 +146,57 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
 
         return status != .failed
+    }
+
+    /// The daemon's Dot mirror push: rewrite LEDS.LED, acknowledge the
+    /// matching command only after it was applied, then go back to sleep.
+    private func handleDotNotification(
+        _ userInfo: [AnyHashable: Any],
+        completion: @escaping (UIBackgroundFetchResult) -> Void
+    ) -> Bool {
+        guard let dot = userInfo["dot"] as? [String: Any],
+              let mode = dot["aggregateMode"] as? String
+        else { return false }
+
+        let commandID = dot["commandID"] as? String
+        let issuedAt = (dot["issuedAt"] as? NSNumber)?.doubleValue
+        let sourceUpdatedAt = (dot["updatedAt"] as? NSNumber)?.doubleValue
+        let host = dot["host"] as? String
+        let result = MainActor.assumeIsolated {
+            DotStatusMirror.shared.applyPush(
+                aggregateMode: mode,
+                commandID: commandID,
+                issuedAt: issuedAt,
+                sourceUpdatedAt: sourceUpdatedAt,
+                host: host,
+                model: AppModel.shared
+            )
+        }
+
+        let fetchResult: UIBackgroundFetchResult
+        switch result {
+        case .written:
+            fetchResult = .newData
+        case .alreadyCurrent:
+            fetchResult = .noData
+        case .noFolder:
+            fetchResult = .noData
+        case .failed:
+            fetchResult = .failed
+        }
+
+        guard let commandID else {
+            completion(fetchResult)
+            return true
+        }
+        Task { @MainActor in
+            await LiveMonitorManager.shared.acknowledgeDot(
+                commandID: commandID,
+                status: result.acknowledgementStatus,
+                model: AppModel.shared
+            )
+            completion(fetchResult)
+        }
+        return true
     }
 }

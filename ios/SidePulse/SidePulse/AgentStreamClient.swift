@@ -45,6 +45,7 @@ final class AgentStreamClient: ObservableObject {
     func stop() {
         task?.cancel()
         task = nil
+        snapshot = nil
         state = .idle
     }
 

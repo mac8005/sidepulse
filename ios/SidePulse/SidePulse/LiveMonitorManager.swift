@@ -45,7 +45,7 @@ final class LiveMonitorManager: ObservableObject {
         // The daemon sends alert pushes (finished / needs input / blocked)
         // to the app's normal APNs device token.
         if !model.pushToken.isEmpty, let tokenData = Data(hexString: model.pushToken) {
-            Task { await self.register(kind: "device", token: tokenData, model: model) }
+            registerDeviceToken(tokenData, model: model)
         }
 
         Task {
@@ -80,7 +80,12 @@ final class LiveMonitorManager: ObservableObject {
     /// needs it for the Dot mirror's silent pushes.
     func registerDeviceToken(_ token: Data, model: AppModel) {
         guard model.liveMonitorEnabled else { return }
-        Task { await register(kind: "device", token: token, model: model) }
+        Task {
+            if model.hasFolderAccess {
+                await register(kind: "dot_device", token: token, model: model)
+            }
+            await register(kind: "device", token: token, model: model)
+        }
     }
 
     /// Keep exactly one activity: the freshest. Older ones are orphans whose
@@ -161,6 +166,46 @@ final class LiveMonitorManager: ObservableObject {
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["kind": "reset"])
         request.timeoutInterval = 10
         _ = try? await URLSession.shared.data(for: request)
+    }
+
+    /// Confirms the daemon's current Dot command only after the app applied
+    /// it. If this request is lost, the daemon's bounded retry delivers the
+    /// same command again and the app acknowledges it idempotently.
+    func acknowledgeDot(commandID: String, status: String, model: AppModel) async {
+        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("dot-ack") else {
+            EventLog.append("Dot ACK failed: invalid server URL")
+            model.refreshEventLog()
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "commandID": commandID,
+            "status": status,
+        ])
+        request.timeoutInterval = 8
+
+        for attempt in 1...2 {
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(code) {
+                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    let acknowledged = object?["acknowledged"] as? Bool ?? false
+                    let suffix = acknowledged ? "confirmed" : "not current or still pending"
+                    EventLog.append("Dot ACK \(commandID.prefix(8)): \(status), \(suffix)")
+                    model.refreshEventLog()
+                    return
+                }
+                EventLog.append("Dot ACK server error \(code)")
+            } catch {
+                EventLog.append("Dot ACK failed: \(error.localizedDescription)")
+            }
+            guard attempt == 1 else { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        model.refreshEventLog()
     }
 
     @available(iOS 17.2, *)

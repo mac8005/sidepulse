@@ -32,6 +32,22 @@ enum LedDisplayState: Equatable {
     }
 }
 
+enum DotPushApplyResult: Equatable {
+    case written
+    case alreadyCurrent
+    case noFolder
+    case failed
+
+    var acknowledgementStatus: String {
+        switch self {
+        case .written: return "written"
+        case .alreadyCurrent: return "alreadyCurrent"
+        case .noFolder: return "noFolder"
+        case .failed: return "failed"
+        }
+    }
+}
+
 /// LEDS.LED programs for the 2-LED SidePulse Dot — the same text the Mac app
 /// writes (`program_for_display_state` with `led_count=2`), so the Dot looks
 /// identical whichever machine it is plugged into.
@@ -39,9 +55,14 @@ enum DotPrograms {
     static let off = "off"
     static let askAmber = "#FF3A00"
     static let workingCyan = "#00E5FF"
+    static let workingHoldCyan = "#002D33"
     static let doneGreen = "#00FF66"
 
-    static func program(for state: LedDisplayState, kittMode: Bool) -> String {
+    static func program(
+        for state: LedDisplayState,
+        kittMode: Bool,
+        finiteWorking: Bool = false
+    ) -> String {
         switch state {
         case .idle:
             return off
@@ -50,18 +71,22 @@ enum DotPrograms {
         case .done:
             return doneGreen
         case .working:
-            return kittMode ? kittScanner(workingCyan) : rolling(workingCyan)
+            return kittMode
+                ? kittScanner(workingCyan, finite: finiteWorking)
+                : rolling(workingCyan, finite: finiteWorking)
         }
     }
 
     /// `rolling_program(color, led_count=2)`.
-    static func rolling(_ color: String) -> String {
-        "off 160ms cosine\n0:\(color) 760ms pulse 0ms; 1:\(color) 760ms pulse 260ms\nrepeat"
+    static func rolling(_ color: String, finite: Bool = false) -> String {
+        let ending = finite ? "repeat 100\n\(workingHoldCyan)" : "repeat"
+        return "off 160ms cosine\n0:\(color) 760ms pulse 0ms; 1:\(color) 760ms pulse 260ms\n\(ending)"
     }
 
     /// `kitt_scanner_program(color, led_count=2)`: scan out, then back.
-    static func kittScanner(_ color: String) -> String {
-        "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\nrepeat"
+    static func kittScanner(_ color: String, finite: Bool = false) -> String {
+        let ending = finite ? "repeat 125\n\(workingHoldCyan)" : "repeat"
+        return "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\n\(ending)"
     }
 }
 
@@ -152,6 +177,13 @@ final class DotStatusMirror: ObservableObject {
     private var lastWriteSignature: DotWriteSignature?
     private var lastError: String?
     private var lastAttempt: Date = .distantPast
+    private let lastPushCommandIDKey = "lastDotPushCommandID"
+    private let lastPushIssuedAtKey = "lastDotPushIssuedAt"
+    private let lastStreamUpdatedAtKey = "lastSuccessfulDotStreamUpdatedAt"
+    private let streamServerURLKey = "lastSuccessfulDotStreamServerURL"
+    private var lastPushSourceUpdatedAt: TimeInterval = 0
+    private var lastSuccessfullyAppliedStreamUpdatedAt: TimeInterval = 0
+    private var streamServerURL: String?
     /// True while a Focus that shares its status with this app is on. iOS
     /// has no in-app change notification, so it is re-read on every sync
     /// (and by the 15 s timer).
@@ -166,6 +198,7 @@ final class DotStatusMirror: ObservableObject {
     func start(model: AppModel) {
         guard self.model == nil else { return }
         self.model = model
+        configureStreamScope(serverURL: model.liveMonitorServerURL)
         model.applyDueDndSchedule()
         stream.start(baseURL: model.liveMonitorServerURL)
 
@@ -201,9 +234,35 @@ final class DotStatusMirror: ObservableObject {
     }
 
     /// Scene-background: drop the stream and timer. The Dot keeps its last
-    /// state; from here on the Mac's pushes update it.
+    /// state; from here on the Mac's pushes update it. Replace a foreground
+    /// infinite working animation with a finite one first, so a suppressed
+    /// terminal push can never leave the Dot blinking forever.
     func suspend() {
         guard model != nil else { return }
+        if let model,
+           model.hasFolderAccess,
+           case .live = stream.state,
+           let snapshot = stream.snapshot
+        {
+            model.applyDueDndSchedule()
+            refreshFocusStatus(model: model, allowPrompt: false)
+            let resolved = resolve(
+                mode: snapshot.aggregateMode,
+                unreachable: false,
+                model: model
+            )
+            let written = write(
+                DotPrograms.program(
+                    for: resolved.state,
+                    kittMode: model.kittModeEnabled,
+                    finiteWorking: resolved.state == .working
+                ),
+                label: resolved.label
+            )
+            if written {
+                recordSuccessfulStreamWrite(updatedAt: snapshot.updatedAt)
+            }
+        }
         cancellables.removeAll()
         scheduleTimer?.invalidate()
         scheduleTimer = nil
@@ -217,35 +276,71 @@ final class DotStatusMirror: ObservableObject {
     /// Silent push from the daemon (`dot` payload). The app may have been
     /// launched for it with no scene, so everything needed is read here.
     /// Every push leaves a line in the diagnostics log, since a background
-    /// wake is otherwise invisible. Returns false when the Dot could not be
-    /// written.
+    /// wake is otherwise invisible. Returns the result used by the daemon's
+    /// write acknowledgement protocol.
     @discardableResult
-    func applyPush(aggregateMode: String, model: AppModel) -> Bool {
+    func applyPush(
+        aggregateMode: String,
+        commandID: String? = nil,
+        issuedAt: TimeInterval? = nil,
+        sourceUpdatedAt: TimeInterval? = nil,
+        host: String? = nil,
+        model: AppModel
+    ) -> DotPushApplyResult {
         defer { model.refreshEventLog() }
-        // In front the stream is authoritative.
-        guard self.model == nil else {
-            EventLog.append("Dot push (\(aggregateMode)): app in front, stream in charge")
-            return true
+        configureStreamScope(serverURL: model.liveMonitorServerURL)
+        let scope = host ?? "unknown"
+        let commandKey = "\(lastPushCommandIDKey).\(scope)"
+        let issuedKey = "\(lastPushIssuedAtKey).\(scope)"
+        if let commandID, let issuedAt {
+            let defaults = UserDefaults.standard
+            let appliedAt = defaults.double(forKey: issuedKey)
+            let appliedID = defaults.string(forKey: commandKey)
+            if issuedAt < appliedAt || (issuedAt == appliedAt && commandID == appliedID) {
+                EventLog.append("Dot push (\(aggregateMode)): already current or stale")
+                return .alreadyCurrent
+            }
+        }
+        if let sourceUpdatedAt,
+           lastSuccessfullyAppliedStreamUpdatedAt > sourceUpdatedAt {
+            recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
+            EventLog.append("Dot push (\(aggregateMode)): newer stream state already applied")
+            return .alreadyCurrent
         }
         guard model.hasFolderAccess else {
             EventLog.append("Dot push (\(aggregateMode)): no Dot folder selected")
-            return false
+            return .noFolder
         }
         model.applyDueDndSchedule()
         // No prompting from the background: an unanswered request reads as
         // "no Focus" until the app is opened again.
         refreshFocusStatus(model: model, allowPrompt: false)
         let resolved = resolve(mode: aggregateMode, unreachable: false, model: model)
+        let program = DotPrograms.program(
+            for: resolved.state,
+            kittMode: model.kittModeEnabled,
+            finiteWorking: resolved.state == .working
+        )
+        let signature = DotWriteSignature(
+            program: program,
+            brightness: DotBrightness.configuredValue
+        )
+        let alreadyCurrent = signature == lastWriteSignature && lastError == nil
         let written = write(
-            DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled),
+            program,
             label: resolved.label
         )
         if written {
+            recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
+            if let sourceUpdatedAt {
+                lastPushSourceUpdatedAt = max(lastPushSourceUpdatedAt, sourceUpdatedAt)
+            }
             EventLog.append("Dot push (\(aggregateMode)): \(resolved.label)")
+            return alreadyCurrent ? .alreadyCurrent : .written
         } else {
             EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError ?? "unknown error")")
+            return .failed
         }
-        return written
     }
 
     /// Focus status needs the user's one-time consent (system prompt) and, per
@@ -295,14 +390,76 @@ final class DotStatusMirror: ObservableObject {
             return
         }
 
-        var unreachable = false
-        if case .failed = stream.state { unreachable = true }
-        let resolved = resolve(mode: stream.snapshot?.aggregateMode, unreachable: unreachable, model: model)
+        let mode: String?
+        let unreachable: Bool
+        var streamUpdatedAt: TimeInterval?
+        switch stream.state {
+        case .live:
+            guard let snapshot = stream.snapshot else { return }
+            guard snapshot.updatedAt >= lastPushSourceUpdatedAt else {
+                statusText = "Waiting for current Mac state"
+                return
+            }
+            mode = snapshot.aggregateMode
+            streamUpdatedAt = snapshot.updatedAt
+            unreachable = false
+        case .failed:
+            mode = nil
+            unreachable = true
+        case .idle, .connecting:
+            statusText = "Connecting to Mac…"
+            return
+        }
+        let resolved = resolve(mode: mode, unreachable: unreachable, model: model)
         var label = resolved.label
         if let focusAccessHint {
             label += focusAccessHint
         }
-        write(DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled), label: label)
+        let written = write(
+            DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled),
+            label: label
+        )
+        if written, let streamUpdatedAt {
+            recordSuccessfulStreamWrite(updatedAt: streamUpdatedAt)
+        }
+    }
+
+    private func recordPushCommand(
+        commandID: String?,
+        issuedAt: TimeInterval?,
+        scope: String
+    ) {
+        guard let commandID, let issuedAt else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(commandID, forKey: "\(lastPushCommandIDKey).\(scope)")
+        defaults.set(issuedAt, forKey: "\(lastPushIssuedAtKey).\(scope)")
+    }
+
+    private func recordSuccessfulStreamWrite(updatedAt: TimeInterval) {
+        lastSuccessfullyAppliedStreamUpdatedAt = max(
+            lastSuccessfullyAppliedStreamUpdatedAt,
+            updatedAt
+        )
+        let defaults = UserDefaults.standard
+        defaults.set(lastSuccessfullyAppliedStreamUpdatedAt, forKey: lastStreamUpdatedAtKey)
+        if updatedAt >= lastPushSourceUpdatedAt {
+            lastPushSourceUpdatedAt = 0
+        }
+    }
+
+    private func configureStreamScope(serverURL: String) {
+        guard streamServerURL != serverURL else { return }
+        let defaults = UserDefaults.standard
+        let storedURL = defaults.string(forKey: streamServerURLKey)
+        lastPushSourceUpdatedAt = 0
+        lastSuccessfullyAppliedStreamUpdatedAt = storedURL == serverURL
+            ? defaults.double(forKey: lastStreamUpdatedAtKey)
+            : 0
+        if storedURL != serverURL {
+            defaults.set(serverURL, forKey: streamServerURLKey)
+            defaults.removeObject(forKey: lastStreamUpdatedAtKey)
+        }
+        streamServerURL = serverURL
     }
 
     private func resolve(mode: String?, unreachable: Bool, model: AppModel) -> (state: LedDisplayState, label: String) {

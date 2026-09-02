@@ -162,10 +162,15 @@ def test_token_store_round_trip(tmp_path):
     store = TokenStore(tmp_path / "tokens.json")
     store.register("push_to_start", "aa11", {"device": "iPhone"})
     store.register("update", "bb22", {"device": "iPhone", "activity_id": "A1"})
+    store.register("dot_device", "cc33", {"device": "iPhone"})
 
     reloaded = TokenStore(tmp_path / "tokens.json")
     assert reloaded.tokens("push_to_start") == ["aa11"]
     assert reloaded.tokens("update") == ["bb22"]
+    assert reloaded.tokens("dot_device") == ["cc33"]
+    assert reloaded.replace("dot_device", "dd44", {"device": "new iPhone"}) is True
+    assert reloaded.replace("dot_device", "dd44", {"device": "new iPhone"}) is False
+    assert reloaded.tokens("dot_device") == ["dd44"]
 
     reloaded.drop("update", "bb22")
     assert reloaded.tokens("update") == []
@@ -468,6 +473,242 @@ def test_apns_send_retries_transient_transport_errors(monkeypatch):
     status, body = client.send("tok", {"aps": {}})
     assert status == 0 and "boom" in body
     assert len(attempts) == 3
+
+
+def test_apns_send_supports_persistent_collapsed_dot_headers(monkeypatch):
+    from pathlib import Path as _Path
+
+    from sidepulse.live_activity import APNsLiveActivityClient, LiveActivityConfig
+
+    config = LiveActivityConfig(
+        apns_key_path=_Path("/tmp/k.p8"), apns_key_id="K", apns_team_id="T"
+    )
+    client = APNsLiveActivityClient(config)
+    monkeypatch.setattr(client, "_token", lambda: "jwt")
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+    class FakeClient:
+        def post(self, url, json, headers):
+            captured.update(headers)
+            return FakeResponse()
+
+    client._client = FakeClient()
+    status, _ = client.send(
+        "tok",
+        {"aps": {"content-available": 1}},
+        priority=5,
+        push_type="background",
+        topic=config.bundle_id,
+        expiration=4600,
+        collapse_id="sidepulse-dot-state",
+    )
+
+    assert status == 200
+    assert captured["apns-priority"] == "5"
+    assert captured["apns-expiration"] == "4600"
+    assert captured["apns-collapse-id"] == "sidepulse-dot-state"
+
+
+def _make_dot_daemon(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("device", "device-token", {"device": "phone"})
+    return daemon
+
+
+def _dot_state(mode="completed", active_count=0, updated_at=100.0):
+    return {
+        "aggregateMode": mode,
+        "activeCount": active_count,
+        "agents": [],
+        "updatedAt": updated_at,
+    }
+
+
+def test_dot_rejection_stays_pending_and_accepted_delivery_retries_are_bounded(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import DOT_PUSH_RETRY_OFFSETS_SECONDS
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    calls = []
+    responses = [(500, "server error"), (200, ""), (200, ""), (200, "")]
+
+    def send(token, payload, **kwargs):
+        calls.append((payload, kwargs))
+        return responses.pop(0)
+
+    monkeypatch.setattr(daemon.apns, "send", send)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    command_id = daemon._pending_dot.command_id
+
+    daemon._send_pending_dot_if_due(100.0)
+    assert daemon._pending_dot.command_id == command_id
+    assert daemon._pending_dot.accepted_attempts == 0
+
+    daemon._send_pending_dot_if_due(159.9)
+    assert len(calls) == 1
+    daemon._send_pending_dot_if_due(160.0)
+    assert daemon._pending_dot.accepted_attempts == 1
+
+    first_retry = 160.0 + DOT_PUSH_RETRY_OFFSETS_SECONDS[1]
+    daemon._send_pending_dot_if_due(first_retry - 0.1)
+    assert len(calls) == 2
+    daemon._send_pending_dot_if_due(first_retry)
+
+    second_retry = first_retry + (
+        DOT_PUSH_RETRY_OFFSETS_SECONDS[2] - DOT_PUSH_RETRY_OFFSETS_SECONDS[1]
+    )
+    daemon._send_pending_dot_if_due(second_retry)
+    daemon._send_pending_dot_if_due(second_retry + 1_000)
+    assert len(calls) == 4
+    assert {call[0]["dot"]["commandID"] for call in calls} == {command_id}
+    assert all(call[1]["collapse_id"] == "sidepulse-dot-state" for call in calls)
+
+
+def test_dot_push_prefers_the_elected_dot_device(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.tokens.register("device", "other-phone", {"device": "iPad"})
+    daemon.tokens.register("dot_device", "dot-phone", {"device": "iPhone"})
+    tokens = []
+
+    def send(token, payload, **kwargs):
+        tokens.append(token)
+        return 200, ""
+
+    monkeypatch.setattr(daemon.apns, "send", send)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+
+    daemon._send_pending_dot_if_due(100.0)
+
+    assert tokens == ["dot-phone"]
+
+
+def test_expired_dot_command_waits_for_registration_before_reissuing(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import DOT_PUSH_EXPIRY_SECONDS
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    calls = []
+
+    def reject(token, payload, **kwargs):
+        calls.append((payload, kwargs))
+        return 500, "server error"
+
+    monkeypatch.setattr(daemon.apns, "send", reject)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    expired_id = daemon._pending_dot.command_id
+    daemon._send_pending_dot_if_due(100.0)
+
+    renewal_time = 100.0 + DOT_PUSH_EXPIRY_SECONDS
+    daemon._send_pending_dot_if_due(renewal_time)
+    assert daemon._pending_dot.command_id == expired_id
+    assert len(calls) == 1
+
+    assert daemon.request_dot_resync(now=renewal_time + 1) is True
+    assert daemon._pending_dot.command_id != expired_id
+    daemon._send_pending_dot_if_due(renewal_time + 1)
+    assert calls[-1][0]["dot"]["commandID"] == daemon._pending_dot.command_id
+    assert calls[-1][1]["expiration"] == int(
+        renewal_time + 1 + DOT_PUSH_EXPIRY_SECONDS
+    )
+
+
+def test_dot_ack_only_clears_the_matching_current_command(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    old_id = daemon._pending_dot.command_id
+
+    daemon._queue_dot_state(
+        "working", _dot_state("working", active_count=1, updated_at=101.0), now=101.0
+    )
+    current_id = daemon._pending_dot.command_id
+    assert current_id != old_id
+
+    assert daemon.ack_dot(old_id, "written") is False
+    assert daemon._pending_dot.command_id == current_id
+    assert daemon.ack_dot(current_id, "failed") is False
+    assert daemon._pending_dot.command_id == current_id
+    assert daemon.ack_dot(current_id, "noFolder") is False
+    assert daemon._pending_dot.command_id == current_id
+    assert daemon.ack_dot(current_id, "alreadyCurrent") is True
+    assert daemon._pending_dot is None
+    assert daemon._last_dot_state == "working"
+
+
+def test_dot_state_must_settle_and_same_state_does_not_reset_pending(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import DOT_STATE_SETTLE_SECONDS
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    state = _dot_state("working", active_count=1)
+
+    daemon._observe_dot_state("working", state, now=100.0)
+    daemon._observe_dot_state(
+        "working",
+        {**state, "updatedAt": 109.0},
+        now=100.0 + DOT_STATE_SETTLE_SECONDS - 0.1,
+    )
+    assert daemon._pending_dot is None
+
+    daemon._observe_dot_state(
+        "working",
+        {**state, "updatedAt": 110.0},
+        now=100.0 + DOT_STATE_SETTLE_SECONDS,
+    )
+    pending = daemon._pending_dot
+    assert pending is not None
+
+    daemon._observe_dot_state(
+        "working", {**state, "updatedAt": 120.0}, now=120.0
+    )
+    assert daemon._pending_dot.command_id == pending.command_id
+    assert daemon._pending_dot.created_at == pending.created_at
+
+
+def test_device_registration_can_requeue_the_current_dot_state(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    state = _dot_state()
+    daemon._observe_dot_state("done", state, now=100.0)
+    daemon._observe_dot_state("done", state, now=200.0)
+    command_id = daemon._pending_dot.command_id
+    assert daemon.ack_dot(command_id, "written") is True
+    assert daemon._pending_dot is None
+
+    assert daemon.request_dot_resync(now=300.0) is True
+    assert daemon._pending_dot is not None
+    assert daemon._pending_dot.state == "done"
+    assert daemon._pending_dot.command_id != command_id
+    resync_id = daemon._pending_dot.command_id
+    assert daemon.request_dot_resync(now=302.0) is False
+    assert daemon._pending_dot.command_id == resync_id
+
+
+def test_changed_dot_owner_forces_a_new_command_id(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    state = _dot_state()
+    daemon._observe_dot_state("done", state, now=100.0)
+    daemon._observe_dot_state("done", state, now=200.0)
+    old_id = daemon._pending_dot.command_id
+
+    assert daemon.request_dot_resync(now=201.0, force=True) is True
+    assert daemon._pending_dot.command_id != old_id
+    assert daemon.ack_dot(old_id, "written") is False
+    assert daemon._pending_dot is not None
 
 
 def test_structure_signature_ignores_text_churn():

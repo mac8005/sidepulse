@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .collector import AgentMonitor
 from .ipc import HookEventServer
@@ -91,9 +91,19 @@ MAX_UNANSWERED_START_PUSHES = 3
 ACTIVITY_MAX_AGE_SECONDS = 7.5 * 3600
 SSE_HEARTBEAT_SECONDS = 10.0
 ATTRIBUTES_TYPE = "AgentActivityAttributes"
-# A Dot plugged into the phone shows one of four states. iOS rations silent
-# background pushes, so the app is only woken when that state changes.
-DOT_PUSH_MIN_INTERVAL_SECONDS = 5.0
+# A Dot plugged into the phone shows one of four states. Background pushes
+# are best-effort and heavily budgeted by iOS, so brief aggregate-mode flaps
+# settle before becoming commands. APNs may retain the newest collapsed
+# command for an hour; accepted commands retry twice within that TTL unless
+# the phone acknowledges the actual LED write.
+DOT_STATE_SETTLE_SECONDS = 10.0
+DOT_PUSH_EXPIRY_SECONDS = 3600.0
+DOT_PUSH_FAILURE_RETRY_SECONDS = 60.0
+DOT_PUSH_FAILURE_MAX_RETRY_SECONDS = 20 * 60.0
+DOT_PUSH_RETRY_OFFSETS_SECONDS = (0.0, 2 * 60.0, 20 * 60.0)
+DOT_RESYNC_COOLDOWN_SECONDS = 60.0
+DOT_COLLAPSE_ID = "sidepulse-dot-state"
+DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
 
 # Modes worth interrupting the user for, and their notification titles.
 ALERT_MODES = {
@@ -130,6 +140,18 @@ class LiveActivityConfig:
         return f"{self.bundle_id}.push-type.liveactivity"
 
 
+@dataclass
+class PendingDotPush:
+    command_id: str
+    state: str
+    content_state: dict[str, Any]
+    created_at: float
+    issued_at: float
+    accepted_attempts: int = 0
+    rejected_attempts: int = 0
+    next_attempt_at: float = 0.0
+
+
 def _log(message: str) -> None:
     """One timestamped daemon line.
 
@@ -154,6 +176,7 @@ class TokenStore:
             "push_to_start": {},
             "update": {},
             "device": {},
+            "dot_device": {},
         }
         self._load()
 
@@ -162,7 +185,7 @@ class TokenStore:
             raw = json.loads(self.path.read_text())
         except (OSError, ValueError):
             return
-        for kind in ("push_to_start", "update", "device"):
+        for kind in ("push_to_start", "update", "device", "dot_device"):
             entries = raw.get(kind)
             if isinstance(entries, dict):
                 self._data[kind] = {
@@ -184,6 +207,16 @@ class TokenStore:
             meta["registered_at"] = datetime.now(timezone.utc).isoformat()
             self._data[kind][token] = meta
             self._save()
+
+    def replace(self, kind: str, token: str, meta: dict[str, Any]) -> bool:
+        """Atomically elect one token; return whether the owner changed."""
+        with self._lock:
+            changed = list(self._data[kind]) != [token]
+            meta = dict(meta)
+            meta["registered_at"] = datetime.now(timezone.utc).isoformat()
+            self._data[kind] = {token: meta}
+            self._save()
+            return changed
 
     def tokens(self, kind: str) -> list[str]:
         with self._lock:
@@ -666,6 +699,8 @@ class APNsLiveActivityClient:
         priority: int = 10,
         push_type: str = "liveactivity",
         topic: str | None = None,
+        expiration: int = 0,
+        collapse_id: str | None = None,
     ) -> tuple[int, str]:
         import httpx
 
@@ -675,8 +710,10 @@ class APNsLiveActivityClient:
             "apns-topic": topic or self.config.liveactivity_topic,
             "apns-push-type": push_type,
             "apns-priority": str(priority),
-            "apns-expiration": "0",
+            "apns-expiration": str(expiration),
         }
+        if collapse_id:
+            headers["apns-collapse-id"] = collapse_id
         last_error = ""
         for attempt in range(3):
             if self._client is None:
@@ -1167,7 +1204,14 @@ class LiveActivityDaemon:
         self._last_start_push_at = 0.0
         self._pushes_this_activity = 0
         self._last_dot_state: str | None = None
-        self._last_dot_push_at = 0.0
+        self._last_dot_issued_at = 0.0
+        self._current_dot_state: str | None = None
+        self._current_dot_content_state: dict[str, Any] | None = None
+        self._dot_candidate_state: str | None = None
+        self._dot_candidate_since = 0.0
+        self._pending_dot: PendingDotPush | None = None
+        self._dot_lock = threading.Lock()
+        self._last_dot_resync_at = 0.0
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -1304,14 +1348,11 @@ class LiveActivityDaemon:
 
         # The Dot plugged into the phone (DotStatusMirror in the iOS app):
         # while the app is in the background only a push can wake it to
-        # rewrite LEDS.LED, so send one whenever the display state changes.
+        # rewrite LEDS.LED. Brief mode flaps coalesce, and the resulting
+        # command remains pending until the phone confirms the file write.
         dot_state = display_state_for_mode(snapshot.aggregate.mode).value
-        if (
-            dot_state != self._last_dot_state
-            and self.tokens.tokens("device")
-            and now - self._last_dot_push_at >= DOT_PUSH_MIN_INTERVAL_SECONDS
-        ):
-            self._push_dot(dot_state, content_state, now)
+        self._observe_dot_state(dot_state, content_state, now)
+        self._send_pending_dot_if_due(now)
 
         if active:
             self._idle_since = None
@@ -1676,12 +1717,23 @@ class LiveActivityDaemon:
         priority: int = 10,
         push_type: str = "liveactivity",
         topic: str | None = None,
-    ) -> None:
+        expiration: int | None = None,
+        collapse_id: str | None = None,
+    ) -> bool:
         payload = shrink_payload(payload)
+        accepted = False
         for token in self.tokens.tokens(kind):
-            status, body = self.apns.send(
-                token, payload, priority=priority, push_type=push_type, topic=topic
-            )
+            options: dict[str, Any] = {
+                "priority": priority,
+                "push_type": push_type,
+                "topic": topic,
+            }
+            if expiration is not None:
+                options["expiration"] = expiration
+            if collapse_id is not None:
+                options["collapse_id"] = collapse_id
+            status, body = self.apns.send(token, payload, **options)
+            accepted = accepted or status == 200
             if kind == "update" and status == 200:
                 self._pushes_this_activity += 1
             if status == 410 or (status == 400 and "BadDeviceToken" in body):
@@ -1695,6 +1747,7 @@ class LiveActivityDaemon:
                     self._start_push_attempts = 0
             elif status != 200:
                 _log(f"APNs {kind} push -> {status} {body[:120]}")
+        return accepted
 
     def _defer_finished_alerts(
         self, alerts: list[dict[str, str]], statuses, now: float
@@ -1867,25 +1920,193 @@ class LiveActivityDaemon:
         self._last_pushed_signature = _structure_signature(content_state)
         self._last_pushed_state = content_state
 
-    def _push_dot(self, dot_state: str, content_state: dict[str, Any], now: float) -> None:
-        """Silent push to the app's device token: no alert, priority 5 as
-        APNs requires for background pushes. The phone applies its own DND /
-        Focus / KITT settings to the mode before writing the Dot."""
-        self._last_dot_push_at = now
-        self._last_dot_state = dot_state
-        payload = {
-            "aps": {"content-available": 1},
-            "dot": {
-                "aggregateMode": content_state["aggregateMode"],
-                "activeCount": content_state["activeCount"],
-                "host": self.config.host_label,
-                "updatedAt": content_state["updatedAt"],
-            },
-        }
-        _log(f"dot -> {dot_state}")
-        self._apns_fanout(
-            "device", payload, priority=5, push_type="background", topic=self.config.bundle_id
+    def _queue_dot_state(
+        self,
+        dot_state: str,
+        content_state: dict[str, Any],
+        now: float,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Create one current Dot command; a newer state supersedes it."""
+        with self._dot_lock:
+            self._current_dot_state = dot_state
+            self._current_dot_content_state = dict(content_state)
+            if not force:
+                if self._pending_dot is not None and self._pending_dot.state == dot_state:
+                    return False
+                if self._last_dot_state == dot_state:
+                    self._pending_dot = None
+                    return False
+            issued_at = max(now, self._last_dot_issued_at + 0.001)
+            self._last_dot_issued_at = issued_at
+            self._pending_dot = PendingDotPush(
+                command_id=str(uuid4()),
+                state=dot_state,
+                content_state=dict(content_state),
+                created_at=now,
+                issued_at=issued_at,
+                next_attempt_at=now,
+            )
+        return True
+
+    def _observe_dot_state(
+        self, dot_state: str, content_state: dict[str, Any], now: float
+    ) -> bool:
+        """Coalesce brief state flaps before consuming a silent-push slot."""
+        with self._dot_lock:
+            self._current_dot_state = dot_state
+            self._current_dot_content_state = dict(content_state)
+            if self._dot_candidate_state != dot_state:
+                self._dot_candidate_state = dot_state
+                self._dot_candidate_since = now
+                if self._pending_dot is not None and self._pending_dot.state != dot_state:
+                    self._pending_dot = None
+            settled = now - self._dot_candidate_since >= DOT_STATE_SETTLE_SECONDS
+        if not settled:
+            return False
+        return self._queue_dot_state(dot_state, content_state, now)
+
+    def request_dot_resync(
+        self, now: float | None = None, *, force: bool = False
+    ) -> bool:
+        """A registering phone asks for the current command even if unchanged."""
+        moment = time.time() if now is None else now
+        with self._dot_lock:
+            dot_state = self._current_dot_state
+            content_state = (
+                dict(self._current_dot_content_state)
+                if self._current_dot_content_state is not None
+                else None
+            )
+            pending = self._pending_dot
+            if (
+                not force
+                and moment - self._last_dot_resync_at < DOT_RESYNC_COOLDOWN_SECONDS
+            ):
+                return False
+            self._last_dot_resync_at = moment
+            if (
+                not force
+                and pending is not None
+                and pending.state == dot_state
+                and pending.accepted_attempts < len(DOT_PUSH_RETRY_OFFSETS_SECONDS)
+                and moment < pending.created_at + DOT_PUSH_EXPIRY_SECONDS
+            ):
+                return False
+        if dot_state is None or content_state is None:
+            return False
+        return self._queue_dot_state(dot_state, content_state, moment, force=True)
+
+    def ack_dot(self, command_id: str, status: str) -> bool:
+        """Commit delivery only after iOS handled the matching LED command."""
+        with self._dot_lock:
+            pending = self._pending_dot
+            if pending is None or pending.command_id != command_id:
+                return False
+            if status not in DOT_ACK_SUCCESS_STATUSES:
+                state = pending.state
+            else:
+                self._last_dot_state = pending.state
+                self._pending_dot = None
+                state = pending.state
+        if status in DOT_ACK_SUCCESS_STATUSES:
+            _log(f"dot ack <- {state} ({status})")
+            return True
+        _log(f"dot ack <- {state} ({status}); still pending")
+        return False
+
+    def _send_pending_dot_if_due(self, now: float) -> bool:
+        """Send at most three accepted copies over the command's one-hour TTL."""
+        token_kind = "dot_device" if self.tokens.tokens("dot_device") else "device"
+        if not self.tokens.tokens(token_kind):
+            return False
+        with self._dot_lock:
+            pending = self._pending_dot
+            if (
+                pending is None
+                or now >= pending.created_at + DOT_PUSH_EXPIRY_SECONDS
+                or pending.accepted_attempts >= len(DOT_PUSH_RETRY_OFFSETS_SECONDS)
+                or now < pending.next_attempt_at
+            ):
+                return False
+            payload = {
+                "aps": {"content-available": 1},
+                "dot": {
+                    "aggregateMode": pending.content_state["aggregateMode"],
+                    "activeCount": pending.content_state["activeCount"],
+                    "host": self.config.host_label,
+                    "updatedAt": pending.content_state["updatedAt"],
+                    "commandID": pending.command_id,
+                    "issuedAt": pending.issued_at,
+                },
+            }
+            command_id = pending.command_id
+            state = pending.state
+            attempt = pending.accepted_attempts + 1
+            expiration = int(pending.created_at + DOT_PUSH_EXPIRY_SECONDS)
+
+        _log(
+            f"dot -> {state} (attempt {attempt}/{len(DOT_PUSH_RETRY_OFFSETS_SECONDS)}, "
+            f"command {command_id[:8]})"
         )
+        accepted = self._apns_fanout(
+            token_kind,
+            payload,
+            priority=5,
+            push_type="background",
+            topic=self.config.bundle_id,
+            expiration=expiration,
+            collapse_id=DOT_COLLAPSE_ID,
+        )
+        with self._dot_lock:
+            if self._pending_dot is not pending:
+                return accepted
+            if accepted:
+                pending.accepted_attempts += 1
+                pending.rejected_attempts = 0
+                if pending.accepted_attempts < len(DOT_PUSH_RETRY_OFFSETS_SECONDS):
+                    previous_offset = DOT_PUSH_RETRY_OFFSETS_SECONDS[
+                        pending.accepted_attempts - 1
+                    ]
+                    next_offset = DOT_PUSH_RETRY_OFFSETS_SECONDS[
+                        pending.accepted_attempts
+                    ]
+                    pending.next_attempt_at = min(
+                        now + next_offset - previous_offset,
+                        pending.created_at + DOT_PUSH_EXPIRY_SECONDS,
+                    )
+                else:
+                    pending.next_attempt_at = float("inf")
+            else:
+                pending.rejected_attempts += 1
+                delay = min(
+                    DOT_PUSH_FAILURE_RETRY_SECONDS
+                    * (2 ** min(pending.rejected_attempts - 1, 8)),
+                    DOT_PUSH_FAILURE_MAX_RETRY_SECONDS,
+                )
+                pending.next_attempt_at = min(
+                    now + delay,
+                    pending.created_at + DOT_PUSH_EXPIRY_SECONDS,
+                )
+        return accepted
+
+    def _dot_health(self) -> dict[str, Any]:
+        with self._dot_lock:
+            pending = self._pending_dot
+            return {
+                "dotState": self._last_dot_state,
+                "dotPendingState": pending.state if pending is not None else None,
+                "dotPendingAttempts": (
+                    pending.accepted_attempts if pending is not None else 0
+                ),
+                "dotPendingRejected": (
+                    pending.rejected_attempts if pending is not None else 0
+                ),
+                "dotPendingCommand": (
+                    pending.command_id[:8] if pending is not None else None
+                ),
+            }
 
     def _end_stale_activity(self, reason: str) -> None:
         with self._condition:
@@ -1968,7 +2189,7 @@ class LiveActivityDaemon:
                                 else None
                             ),
                             "pushesThisActivity": daemon._pushes_this_activity,
-                            "dotState": daemon._last_dot_state,
+                            **daemon._dot_health(),
                             # The app needs this to label an activity it
                             # starts itself; attributes are fixed at creation.
                             "hostLabel": daemon.config.host_label,
@@ -2005,6 +2226,21 @@ class LiveActivityDaemon:
                     return
 
             def do_POST(self) -> None:
+                if self.path == "/dot-ack":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, OSError):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    command_id = body.get("commandID")
+                    status = body.get("status")
+                    if not isinstance(command_id, str) or not isinstance(status, str):
+                        self._json(400, {"error": "commandID and status are required"})
+                        return
+                    acknowledged = daemon.ack_dot(command_id, status)
+                    self._json(200, {"ok": True, "acknowledged": acknowledged})
+                    return
                 if self.path == "/seen":
                     try:
                         length = int(self.headers.get("Content-Length", "0"))
@@ -2039,11 +2275,11 @@ class LiveActivityDaemon:
                     self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                     return
                 if (
-                    kind not in ("push_to_start", "update", "device")
+                    kind not in ("push_to_start", "update", "device", "dot_device")
                     or not isinstance(token, str)
                     or not token
                 ):
-                    self._json(400, {"error": "kind must be push_to_start|update|device with a token"})
+                    self._json(400, {"error": "invalid token kind or empty token"})
                     return
                 meta = {
                     "device": str(body.get("device", "")),
@@ -2058,7 +2294,13 @@ class LiveActivityDaemon:
                         started if started is not None else time.time()
                     )
                 is_new = not daemon.tokens.contains(kind, token)
-                daemon.tokens.register(kind, token, meta)
+                dot_owner_changed = False
+                if kind == "dot_device":
+                    # Alert pushes may target several phones, but only the
+                    # most recently registered Dot owner receives LED writes.
+                    dot_owner_changed = daemon.tokens.replace(kind, token, meta)
+                else:
+                    daemon.tokens.register(kind, token, meta)
                 if kind == "update":
                     daemon._activity_live = True
                     daemon._start_push_attempts = 0
@@ -2074,6 +2316,9 @@ class LiveActivityDaemon:
                         # unanswered start pushes (iOS drops them while an app
                         # stays force-quit) should not keep the cap closed.
                         daemon._start_push_attempts = 0
+                elif kind in ("device", "dot_device"):
+                    if daemon.request_dot_resync(force=dot_owner_changed):
+                        daemon._wake.set()
                 _log(f"registered {kind} token from {meta['device'] or 'unknown'}")
                 self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
 
