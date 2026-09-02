@@ -935,8 +935,11 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
 
     command = []
 
-    def fake_run(args, **_kwargs):
+    call = {}
+
+    def fake_run(args, **kwargs):
         command.extend(args)
+        call.update(kwargs)
         return SimpleNamespace(
             returncode=0,
             stdout="Kleido: Deploy TestFlight build; upload running\n",
@@ -957,9 +960,11 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
     ) == (
         "Deploy TestFlight build; upload running"
     )
+    assert "task; latest state" in call["input"].lower()
+    assert call["input"] not in command
     tools_index = command.index("--tools")
     assert command[tools_index + 1] == ""
-    prompt = command[command.index("-p") + 1].lower()
+    prompt = call["input"].lower()
     assert "kleido" not in prompt
     assert "sidepulse:" not in prompt
     assert "task; latest state" in prompt
@@ -984,14 +989,88 @@ def test_summarizer_never_returns_a_cached_result_for_changed_content():
         f"{SUMMARY_PROMPT_VERSION}\0\0old source".encode()
     ).hexdigest()[:16]
     summarizer._results = {key: (old_hash, "Old task; old state")}
+    summarizer._requested_hashes = {}
     summarizer._pending = set()
     summarizer._lock = threading.Lock()
     summarizer._queue = queue.Queue()
+    summarizer._failure_count = 0
+    summarizer._retry_after = 0.0
 
     assert summarizer.summary_for("s1", "new source", style="task") is None
     assert summarizer.summary_for("s1", None, style="task") is None
     queued = summarizer._queue.get_nowait()
     assert queued[2] == "new source"
+    summarizer._record_generation_result(queued[0], queued[1], None)
+    assert summarizer.summary_for("s1", None, style="task") is None
+
+
+def test_summarizer_failure_backoff_is_global_and_resets_on_success(monkeypatch):
+    import queue
+    import threading
+
+    from sidepulse.live_activity import SessionSummarizer
+
+    now = [100.0]
+    monkeypatch.setattr("sidepulse.live_activity.time.monotonic", lambda: now[0])
+    summarizer = object.__new__(SessionSummarizer)
+    summarizer._results = {}
+    summarizer._requested_hashes = {}
+    summarizer._pending = {"first"}
+    summarizer._lock = threading.Lock()
+    summarizer._queue = queue.Queue()
+    summarizer._failure_count = 0
+    summarizer._retry_after = 0.0
+
+    assert summarizer._record_generation_result("first", "hash", None) == 60.0
+    assert summarizer.summary_for("second", "source", style="task") is None
+    assert summarizer._queue.empty()
+
+    # A concurrent failure in the same wave does not double the backoff.
+    now[0] = 101.0
+    assert summarizer._record_generation_result("other", "hash", None) == 0.0
+    assert summarizer._failure_count == 1
+
+    now[0] = 160.0
+    assert summarizer.summary_for("second", "source", style="task") is None
+    queued = summarizer._queue.get_nowait()
+    assert queued[0].startswith("second|")
+    assert summarizer._record_generation_result(queued[0], queued[1], None) == 120.0
+
+    for expected_delay in (240.0, 480.0, 900.0, 900.0):
+        now[0] = summarizer._retry_after
+        assert (
+            summarizer._record_generation_result("retry", "hash", None)
+            == expected_delay
+        )
+
+    summarizer._record_generation_result("success", "new", "Task; done")
+    assert summarizer._failure_count == 0
+    assert summarizer._retry_after == 0.0
+
+
+def test_summarizer_logs_cli_errors_from_stdout(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from sidepulse.live_activity import SessionSummarizer
+
+    messages = []
+    summarizer = object.__new__(SessionSummarizer)
+    summarizer.model = "claude-haiku-test"
+    summarizer.claude = "/usr/local/bin/claude"
+    summarizer.workdir = tmp_path
+    summarizer.moonside_dir = tmp_path / "moonside"
+    monkeypatch.setattr(
+        "sidepulse.live_activity.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="You've hit your session limit\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr("sidepulse.live_activity._log", messages.append)
+
+    assert summarizer._generate("Content", "", style="task") is None
+    assert any("session limit" in message for message in messages)
 
 
 def test_summarizer_rejects_a_title_without_task_and_state(tmp_path, monkeypatch):

@@ -738,6 +738,8 @@ class APNsLiveActivityClient:
 
 SUMMARY_MAX_CHARS = 90
 SUMMARY_PROMPT_VERSION = 3
+SUMMARY_FAILURE_BACKOFF_BASE_SECONDS = 60.0
+SUMMARY_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60.0
 SUMMARY_PROGRESS_REFRESH_SECONDS = 45.0
 GENERIC_WORKDIR_NAMES = {
     "android",
@@ -1030,9 +1032,12 @@ class SessionSummarizer:
         self.model = model
         self.claude = shutil.which("claude") or "/opt/homebrew/bin/claude"
         self._results: dict[str, tuple[str, str]] = {}  # session -> (source_hash, summary)
+        self._requested_hashes: dict[str, str] = {}
         self._pending: set[str] = set()
         self._lock = threading.Lock()
-        self._queue: "queue.Queue[tuple[str, str, str, str]]" = queue.Queue()
+        self._queue: "queue.Queue[tuple[str, str, str, str, str]]" = queue.Queue()
+        self._failure_count = 0
+        self._retry_after = 0.0
         base = default_state_dir() / "summarizer"
         # "memories" is on the ignored-directory list, hiding these runs
         # from every sidepulse consumer.
@@ -1057,15 +1062,23 @@ class SessionSummarizer:
             with self._lock:
                 cached = self._results.get(key)
                 pending = key in self._pending
-            return cached[1] if cached and not pending else None
+                requested_hash = self._requested_hashes.get(key)
+            return (
+                cached[1]
+                if cached
+                and not pending
+                and (requested_hash is None or cached[0] == requested_hash)
+                else None
+            )
         source_hash = hashlib.sha256(
             f"{SUMMARY_PROMPT_VERSION}\0{context}\0{message}".encode()
         ).hexdigest()[:16]
         with self._lock:
+            self._requested_hashes[key] = source_hash
             cached = self._results.get(key)
             if cached and cached[0] == source_hash:
                 return cached[1]
-            if key not in self._pending:
+            if key not in self._pending and time.monotonic() >= self._retry_after:
                 self._pending.add(key)
                 self._queue.put((key, source_hash, message, context, style))
             # A cached phrase for different source text is stale. Showing it
@@ -1095,13 +1108,38 @@ class SessionSummarizer:
     def _worker(self) -> None:
         while True:
             key, source_hash, message, context, style = self._queue.get()
-            summary = self._generate(message, context, style)
             with self._lock:
-                self._pending.discard(key)
-                if summary:
-                    self._results[key] = (source_hash, summary)
+                if time.monotonic() < self._retry_after:
+                    self._pending.discard(key)
+                    continue
+            summary = self._generate(message, context, style)
+            delay = self._record_generation_result(key, source_hash, summary)
+            if delay:
+                _log(f"summary generation paused for {delay:.0f}s after failure")
             if summary:
                 self._save_cache()
+
+    def _record_generation_result(
+        self, key: str, source_hash: str, summary: str | None
+    ) -> float:
+        """Finish one job and arm one global backoff per failure wave."""
+        now = time.monotonic()
+        delay = 0.0
+        with self._lock:
+            self._pending.discard(key)
+            if summary:
+                self._results[key] = (source_hash, summary)
+                self._failure_count = 0
+                self._retry_after = 0.0
+            elif now >= self._retry_after:
+                self._failure_count += 1
+                delay = min(
+                    SUMMARY_FAILURE_BACKOFF_BASE_SECONDS
+                    * (2 ** min(self._failure_count - 1, 4)),
+                    SUMMARY_FAILURE_BACKOFF_MAX_SECONDS,
+                )
+                self._retry_after = now + delay
+        return delay
 
     def _generate(self, message: str, context: str, style: str = "outcome") -> str | None:
         if style == "task":
@@ -1138,7 +1176,7 @@ class SessionSummarizer:
             result = subprocess.run(
                 [
                     self.claude,
-                    "-p", prompt,
+                    "-p",
                     "--model", self.model,
                     # Strip startup weight: no MCP servers, no hooks, no
                     # session persistence. Roughly halves the latency.
@@ -1151,6 +1189,7 @@ class SessionSummarizer:
                 ],
                 capture_output=True,
                 text=True,
+                input=prompt,
                 timeout=120,
                 cwd=self.workdir,
                 env=env,
@@ -1159,7 +1198,8 @@ class SessionSummarizer:
             _log(f"summary generation failed: {exc}")
             return None
         if result.returncode != 0:
-            _log(f"claude -p exited {result.returncode}: {result.stderr[:120]}")
+            detail = (result.stderr.strip() or result.stdout.strip()).replace("\n", " ")
+            _log(f"claude -p exited {result.returncode}: {detail[:120]}")
             return None
         line = result.stdout.strip().splitlines()
         # Models sometimes add a trailing period or stray spaces; row text
