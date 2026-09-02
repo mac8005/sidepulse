@@ -847,6 +847,113 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(modes[f"claude:session:{session_id}"], AgentMode.COMPLETED)
         self.assertEqual(modes["claude:agent:af896bde23bba0adc"], AgentMode.COMPLETED)
         self.assertNotEqual(snapshot.aggregate.mode, AgentMode.WAITING_FOR_INPUT)
+    def test_live_sidepulse_recovers_stop_missed_during_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            latest = base / "latest.json"
+            codex_log = base / "codex.jsonl"
+            session_id = "codex-session"
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            stop_at = prompt_at + timedelta(seconds=5)
+            latest.write_text(
+                json.dumps(
+                    {
+                        "updated_at": prompt_at.isoformat(),
+                        "statuses": [
+                            {
+                                "provider": "codex",
+                                "agent_id": f"codex:session:{session_id}",
+                                "display_name": "project: Restart recovery",
+                                "mode": "working",
+                                "updated_at": prompt_at.isoformat(),
+                                "event_name": "UserPromptSubmit",
+                                "session_id": session_id,
+                                "cwd": "/tmp/project",
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+            codex_log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": stop_at.isoformat(),
+                        "event": {
+                            "hook_event_name": "Stop",
+                            "session_id": session_id,
+                            "cwd": "/tmp/project",
+                            "last_assistant_message": "Finished.",
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            monitor = LiveAgentMonitor(
+                sources=(SourceSpec("event-bus", base / "events.sock"),),
+                recovery_sources=(SourceSpec("codex", codex_log),),
+                stale_after_seconds=3600,
+                latest_state_path=latest,
+            )
+
+            status = monitor.snapshot().statuses[0]
+            self.assertEqual(status.mode, AgentMode.COMPLETED)
+            self.assertEqual(status.event_name, "Stop")
+            persisted = json.loads(latest.read_text())["statuses"][0]
+            self.assertEqual(persisted["mode"], AgentMode.COMPLETED.value)
+            self.assertEqual(persisted["event_name"], "Stop")
+
+    def test_live_sidepulse_recovery_does_not_replace_newer_cached_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            latest = base / "latest.json"
+            codex_log = base / "codex.jsonl"
+            session_id = "codex-session"
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            stop_at = prompt_at + timedelta(seconds=5)
+            latest.write_text(
+                json.dumps(
+                    {
+                        "updated_at": stop_at.isoformat(),
+                        "statuses": [
+                            {
+                                "provider": "codex",
+                                "agent_id": f"codex:session:{session_id}",
+                                "display_name": "project: Restart recovery",
+                                "mode": "completed",
+                                "updated_at": stop_at.isoformat(),
+                                "event_name": "Stop",
+                                "session_id": session_id,
+                                "cwd": "/tmp/project",
+                            }
+                        ],
+                    }
+                )
+                + "\n"
+            )
+            codex_log.write_text(
+                json.dumps(
+                    {
+                        "logged_at": prompt_at.isoformat(),
+                        "event": {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": session_id,
+                            "cwd": "/tmp/project",
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+            monitor = LiveAgentMonitor(
+                recovery_sources=(SourceSpec("codex", codex_log),),
+                latest_state_path=latest,
+            )
+
+            status = monitor.snapshot().statuses[0]
+            self.assertEqual(status.mode, AgentMode.COMPLETED)
+            self.assertEqual(status.event_name, "Stop")
 
     def test_status_bar_session_menu_title_is_task_and_project(self) -> None:
         try:
@@ -2220,6 +2327,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.skipTest(str(exc))
 
         with tempfile.TemporaryDirectory() as tmp:
+            recovery_source = SourceSpec("codex", Path(tmp) / "codex.jsonl")
             fake = SimpleNamespace(
                 settings=AgentMonitorSettings(idle_timeout_seconds=1234)
             )
@@ -2232,10 +2340,15 @@ class AgentMonitorTests(unittest.TestCase):
                     "sidepulse.status_bar.default_latest_state_path",
                     return_value=Path(tmp) / "latest.json",
                 ),
+                patch(
+                    "sidepulse.status_bar.default_sources",
+                    return_value=(recovery_source,),
+                ),
             ):
                 monitor = status_bar.StatusBarController.build_monitor(fake)
 
         self.assertEqual(monitor.stale_after_seconds, 1234)
+        self.assertEqual(monitor.recovery_sources, (recovery_source,))
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:

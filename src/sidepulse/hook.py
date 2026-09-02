@@ -112,10 +112,19 @@ def hook_log_main(provider: str, log_path: Path) -> int:
             log_path,
             sys.stdin.read(),
         )
-        if not hook_event_socket_disabled():
-            send_hook_event(actual_provider, line)
-        write_hook_line(actual_log_path, line)
-        write_hook_status_audit(actual_provider, line)
+        try:
+            write_hook_line(actual_log_path, line)
+        except Exception:
+            pass
+        try:
+            write_hook_status_audit(actual_provider, line)
+        except Exception:
+            pass
+        try:
+            if not hook_event_socket_disabled():
+                send_hook_event(actual_provider, line)
+        except Exception:
+            pass
     except Exception:
         return 0
     return 0
