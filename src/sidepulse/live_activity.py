@@ -823,6 +823,9 @@ def _summary_cache_key(session_id: str, style: str) -> str:
 def _title_with_state(title: str, state: str) -> str:
     """Replace a title's state without truncating the new state away."""
     task = title.rsplit("; ", 1)[0].strip()
+    if ": " in task:
+        project, task_body = task.split(": ", 1)
+        task = f"{_project_display_name(project)}: {task_body}"
     suffix = f"; {state}"
     return _truncate(task, max(12, SUMMARY_MAX_CHARS - len(suffix))) + suffix
 
@@ -1474,9 +1477,12 @@ class LiveActivityDaemon:
         prefix = f"{project}: "
         if "; " not in action:
             return _truncate(prefix + action, SUMMARY_MAX_CHARS)
+        if len(prefix) + len(action) <= SUMMARY_MAX_CHARS:
+            return prefix + action
         task, state = action.rsplit("; ", 1)
-        state = _truncate(state, max(12, SUMMARY_MAX_CHARS // 3))
-        task_limit = max(12, SUMMARY_MAX_CHARS - len(prefix) - len(state) - 2)
+        body_limit = max(24, SUMMARY_MAX_CHARS - len(prefix))
+        state = _truncate(state, max(12, body_limit - 14))
+        task_limit = max(12, body_limit - len(state) - 2)
         return _truncate(
             f"{prefix}{_truncate(task, task_limit)}; {state}",
             SUMMARY_MAX_CHARS,
@@ -1605,6 +1611,9 @@ class LiveActivityDaemon:
                 self._recent_finished = {
                     str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)
                 }
+                for row in self._recent_finished.values():
+                    if row.get("mode") == "completed" and isinstance(row.get("name"), str):
+                        row["name"] = _title_with_state(row["name"], "completed")
         except (OSError, ValueError):
             pass
 

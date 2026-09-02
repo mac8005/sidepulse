@@ -983,6 +983,15 @@ def test_title_truncation_preserves_latest_state(tmp_path, monkeypatch):
     assert len(title) <= 90
     assert title.endswith("; blocked by failing tests")
 
+    fitting = daemon._summary_title(
+        "s1",
+        "Improve session titles; pushed code, service restarting on Mini",
+        "/Users/x/Git/sidepulse",
+    )
+    assert fitting == (
+        "SidePulse: Improve session titles; pushed code, service restarting on Mini"
+    )
+
 
 def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
     import time as _time
@@ -1097,6 +1106,46 @@ def test_vanished_session_replaces_working_state_with_completed(tmp_path, monkey
 
     assert daemon._recent_finished[agent_id]["name"] == (
         "SidePulse: Improve session titles; completed"
+    )
+
+
+def test_loaded_finished_rows_gain_canonical_project_and_completed_state(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "recent_finished.json").write_text(
+        json.dumps(
+            {
+                "claude:session:s1": {
+                    "id": "claude:session:s1",
+                    "name": "sidepulse: Verifying restarted agents stay up",
+                    "mode": "completed",
+                    "provider": "claude",
+                    "finishedAt": 1.0,
+                },
+                "claude:session:s2": {
+                    "id": "claude:session:s2",
+                    "name": "wardrobe-app: Pricing changes deployed; working",
+                    "mode": "completed",
+                    "provider": "claude",
+                    "finishedAt": 2.0,
+                },
+            }
+        )
+    )
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    assert daemon._recent_finished["claude:session:s1"]["name"] == (
+        "SidePulse: Verifying restarted agents stay up; completed"
+    )
+    assert daemon._recent_finished["claude:session:s2"]["name"] == (
+        "Kleido: Pricing changes deployed; completed"
     )
 
 
