@@ -135,6 +135,34 @@ final class DriveWriter {
         return targetURL
     }
 
+    /// Verify that the saved security-scoped drive is still mounted without
+    /// rewriting LEDS.LED or adding a diagnostics-log entry.
+    func probeAccess() throws {
+        let folderURL = try resolveFolderURL()
+        let startedAccess = folderURL.startAccessingSecurityScopedResource()
+        guard startedAccess else {
+            throw DriveWriterError.accessDenied
+        }
+        defer { folderURL.stopAccessingSecurityScopedResource() }
+
+        var isDirectory: ObjCBool = false
+        guard try folderURL.checkResourceIsReachable(),
+              FileManager.default.fileExists(
+                  atPath: folderURL.path,
+                  isDirectory: &isDirectory
+              ),
+              isDirectory.boolValue
+        else {
+            throw DriveWriterError.accessDenied
+        }
+
+        let targetURL = folderURL.appendingPathComponent(fileName, isDirectory: false)
+        if FileManager.default.fileExists(atPath: targetURL.path),
+           try !targetURL.checkResourceIsReachable() {
+            throw DriveWriterError.accessDenied
+        }
+    }
+
     private func resolveFolderURL() throws -> URL {
         guard let bookmark = UserDefaults.standard.data(forKey: bookmarkKey) else {
             throw DriveWriterError.noFolderSelected

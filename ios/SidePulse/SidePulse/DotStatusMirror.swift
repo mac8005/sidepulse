@@ -48,6 +48,51 @@ enum DotPushApplyResult: Equatable {
     }
 }
 
+/// The phone's current ability to accept Dot state changes. The retry lease
+/// lets the daemon avoid spending silent pushes while the output is known to
+/// be unavailable.
+struct DotAvailability: Equatable {
+    let available: Bool
+    let reason: String?
+    let retryAfterSeconds: Int?
+    private let leaseIdentity: String
+
+    static let ready = DotAvailability(
+        available: true,
+        reason: nil,
+        retryAfterSeconds: nil,
+        leaseIdentity: "available"
+    )
+
+    static func unavailable(
+        reason: String,
+        retryAfterSeconds: Int,
+        leaseIdentity: String? = nil
+    ) -> DotAvailability {
+        DotAvailability(
+            available: false,
+            reason: reason,
+            retryAfterSeconds: retryAfterSeconds,
+            leaseIdentity: leaseIdentity ?? reason
+        )
+    }
+
+    static func == (lhs: DotAvailability, rhs: DotAvailability) -> Bool {
+        lhs.available == rhs.available
+            && lhs.reason == rhs.reason
+            && lhs.leaseIdentity == rhs.leaseIdentity
+    }
+}
+
+struct DotPushApplyOutcome: Equatable {
+    let result: DotPushApplyResult
+    let availability: DotAvailability
+
+    var acknowledgementStatus: String {
+        result.acknowledgementStatus
+    }
+}
+
 /// LEDS.LED programs for the 2-LED SidePulse Dot — the same text the Mac app
 /// writes (`program_for_display_state` with `led_count=2`), so the Dot looks
 /// identical whichever machine it is plugged into.
@@ -155,6 +200,30 @@ enum DndSchedule {
         return DndScheduleTransition(key: key, enabled: latest.enabled)
     }
 
+    static func nextTransitionDate(startTime: String, endTime: String, after now: Date = Date()) -> Date? {
+        guard let start = parse(startTime), let end = parse(endTime) else { return nil }
+        var times = [start]
+        if start != end {
+            times.append(end)
+        }
+
+        let calendar = Calendar.current
+        var candidates: [Date] = []
+        for dayOffset in 0...2 {
+            guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now) else { continue }
+            var components = calendar.dateComponents([.year, .month, .day], from: day)
+            for time in times {
+                components.hour = time.hour
+                components.minute = time.minute
+                components.second = 0
+                if let date = calendar.date(from: components), date > now {
+                    candidates.append(date)
+                }
+            }
+        }
+        return candidates.min()
+    }
+
     static func parse(_ value: String) -> (hour: Int, minute: Int)? {
         let parts = value.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
         guard parts.count == 2,
@@ -193,6 +262,7 @@ final class DotStatusMirror: ObservableObject {
     private var scheduleTimer: Timer?
     private var lastWriteSignature: DotWriteSignature?
     private var lastError: String?
+    private var hasSuccessfulWrite = false
     private var lastAttempt: Date = .distantPast
     private let lastPushCommandIDKey = "lastDotPushCommandID"
     private let lastPushIssuedAtKey = "lastDotPushIssuedAt"
@@ -211,6 +281,11 @@ final class DotStatusMirror: ObservableObject {
     /// Matches `STATUS_BAR_REFRESH_SECONDS`, which is how often the Mac
     /// checks whether a DND schedule boundary has passed.
     private let scheduleCheckSeconds: TimeInterval = 15
+    /// Re-touch an unchanged program periodically while foregrounded so a
+    /// removed drive becomes `write_failed` instead of staying ready forever.
+    private let connectivityProbeSeconds: TimeInterval = 60
+    private let oneHourRetrySeconds = 60 * 60
+    private let oneDayRetrySeconds = 24 * 60 * 60
 
     func start(model: AppModel) {
         guard self.model == nil else { return }
@@ -231,6 +306,9 @@ final class DotStatusMirror: ObservableObject {
             model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$showFinishedEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$dndScheduleEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$dndStartTime.map { _ in () }.eraseToAnyPublisher(),
+            model.$dndEndTime.map { _ in () }.eraseToAnyPublisher(),
             model.$focusDndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$hasFolderAccess.map { _ in () }.eraseToAnyPublisher(),
         ]
@@ -281,6 +359,10 @@ final class DotStatusMirror: ObservableObject {
             if written {
                 recordSuccessfulStreamWrite(updatedAt: snapshot.updatedAt)
             }
+            reportAvailability(
+                availabilityAfterWrite(written, model: model, now: Date()),
+                model: model
+            )
         }
         cancellables.removeAll()
         scheduleTimer?.invalidate()
@@ -306,35 +388,67 @@ final class DotStatusMirror: ObservableObject {
         sourceUpdatedAt: TimeInterval? = nil,
         host: String? = nil,
         model: AppModel
-    ) -> DotPushApplyResult {
+    ) -> DotPushApplyOutcome {
         defer { model.refreshEventLog() }
         configureStreamScope(serverURL: model.liveMonitorServerURL)
+        let now = Date()
+        model.applyDueDndSchedule(now: now)
+        // This must happen before command deduplication: a retry can be the
+        // first wake after a DND boundary or Focus change.
+        refreshFocusStatus(model: model, allowPrompt: false)
         let scope = host ?? "unknown"
         let commandKey = "\(lastPushCommandIDKey).\(scope)"
         let issuedKey = "\(lastPushIssuedAtKey).\(scope)"
+        let defaults = UserDefaults.standard
+        let appliedAt = defaults.double(forKey: issuedKey)
+        let appliedID = defaults.string(forKey: commandKey)
+        var staleCommand = false
+        var duplicateCommand = false
         if let commandID, let issuedAt {
-            let defaults = UserDefaults.standard
-            let appliedAt = defaults.double(forKey: issuedKey)
-            let appliedID = defaults.string(forKey: commandKey)
-            if issuedAt < appliedAt || (issuedAt == appliedAt && commandID == appliedID) {
-                EventLog.append("Dot push (\(aggregateMode)): already current or stale")
-                return .alreadyCurrent
-            }
+            staleCommand = issuedAt < appliedAt
+            duplicateCommand = issuedAt == appliedAt && commandID == appliedID
         }
         if let sourceUpdatedAt,
            lastSuccessfullyAppliedStreamUpdatedAt > sourceUpdatedAt {
-            recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
-            EventLog.append("Dot push (\(aggregateMode)): newer stream state already applied")
-            return .alreadyCurrent
+            staleCommand = true
         }
+
         guard model.hasFolderAccess else {
+            hasSuccessfulWrite = false
             EventLog.append("Dot push (\(aggregateMode)): no Dot folder selected")
-            return .noFolder
+            return DotPushApplyOutcome(
+                result: .noFolder,
+                availability: .unavailable(
+                    reason: "no_folder",
+                    retryAfterSeconds: oneDayRetrySeconds
+                )
+            )
         }
-        model.applyDueDndSchedule()
-        // No prompting from the background: an unanswered request reads as
-        // "no Focus" until the app is opened again.
-        refreshFocusStatus(model: model, allowPrompt: false)
+
+        LiveMonitorManager.shared.ensureDotDeviceRegistration(model: model)
+        let suppression = configuredUnavailability(model: model, now: now)
+        // Never let an old agent state replace a newer foreground write. A
+        // suppression still has to be applied, because the duplicate wake
+        // may be the first one after DND or Focus switched on.
+        if staleCommand, suppression == nil {
+            let persistedSuccess = appliedAt > 0 && appliedID != nil
+            let newerStreamSuccess = sourceUpdatedAt.map {
+                lastSuccessfullyAppliedStreamUpdatedAt > $0
+            } ?? false
+            let currentWriteProven = lastError == nil
+                && (hasSuccessfulWrite || persistedSuccess || newerStreamSuccess)
+            EventLog.append("Dot push (\(aggregateMode)): newer state already applied")
+            return DotPushApplyOutcome(
+                result: .alreadyCurrent,
+                availability: currentWriteProven
+                    ? .ready
+                    : .unavailable(
+                        reason: "write_failed",
+                        retryAfterSeconds: oneHourRetrySeconds
+                    )
+            )
+        }
+
         let resolved = resolve(mode: aggregateMode, unreachable: false, model: model)
         let program = DotPrograms.program(
             for: resolved.state,
@@ -352,15 +466,27 @@ final class DotStatusMirror: ObservableObject {
             label: resolved.label
         )
         if written {
-            recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
-            if let sourceUpdatedAt {
+            if !staleCommand {
+                recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
+            }
+            if !staleCommand, let sourceUpdatedAt {
                 lastPushSourceUpdatedAt = max(lastPushSourceUpdatedAt, sourceUpdatedAt)
             }
-            EventLog.append("Dot push (\(aggregateMode)): \(resolved.label)")
-            return alreadyCurrent ? .alreadyCurrent : .written
+            let suffix = duplicateCommand && alreadyCurrent ? "already current" : resolved.label
+            EventLog.append("Dot push (\(aggregateMode)): \(suffix)")
+            return DotPushApplyOutcome(
+                result: alreadyCurrent ? .alreadyCurrent : .written,
+                availability: suppression ?? .ready
+            )
         } else {
             EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError ?? "unknown error")")
-            return .failed
+            return DotPushApplyOutcome(
+                result: .failed,
+                availability: .unavailable(
+                    reason: "write_failed",
+                    retryAfterSeconds: oneHourRetrySeconds
+                )
+            )
         }
     }
 
@@ -402,12 +528,37 @@ final class DotStatusMirror: ObservableObject {
 
     private func sync() {
         guard let model else { return }
+        let now = Date()
+        model.applyDueDndSchedule(now: now)
         // Before the folder check so switching the option on asks for Focus
         // access right away.
         refreshFocusStatus(model: model, allowPrompt: true)
         guard model.hasFolderAccess else {
             lastWriteSignature = nil
+            hasSuccessfulWrite = false
             statusText = "No SidePulse Dot folder selected"
+            reportAvailability(
+                .unavailable(reason: "no_folder", retryAfterSeconds: oneDayRetrySeconds),
+                model: model
+            )
+            return
+        }
+
+        LiveMonitorManager.shared.ensureDotDeviceRegistration(model: model)
+
+        if let suppression = configuredUnavailability(model: model, now: now) {
+            let label: String
+            switch suppression.reason {
+            case "brightness_zero": label = "Brightness is 0 — Dot off"
+            case "dnd": label = "DND on — Dot off"
+            case "focus": label = "iOS Focus on — Dot off"
+            default: label = "Dot unavailable"
+            }
+            let written = write(DotPrograms.off, label: label)
+            reportAvailability(
+                availabilityAfterWrite(written, model: model, now: now),
+                model: model
+            )
             return
         }
 
@@ -451,6 +602,10 @@ final class DotStatusMirror: ObservableObject {
         if written, let streamUpdatedAt {
             recordSuccessfulStreamWrite(updatedAt: streamUpdatedAt)
         }
+        reportAvailability(
+            availabilityAfterWrite(written, model: model, now: now),
+            model: model
+        )
     }
 
     private func recordPushCommand(
@@ -497,6 +652,56 @@ final class DotStatusMirror: ObservableObject {
         }
     }
 
+    private func configuredUnavailability(model: AppModel, now: Date) -> DotAvailability? {
+        guard model.hasFolderAccess else {
+            return .unavailable(reason: "no_folder", retryAfterSeconds: oneDayRetrySeconds)
+        }
+        if model.dotBrightness == 0 {
+            return .unavailable(reason: "brightness_zero", retryAfterSeconds: oneDayRetrySeconds)
+        }
+        if model.dndEnabled {
+            if model.dndScheduleEnabled,
+               DndSchedule.latestTransition(
+                   startTime: model.dndStartTime,
+                   endTime: model.dndEndTime,
+                   now: now
+               )?.enabled == true,
+               let boundary = DndSchedule.nextTransitionDate(
+                   startTime: model.dndStartTime,
+                   endTime: model.dndEndTime,
+                   after: now
+               )
+            {
+                let retry = max(1, Int(ceil(boundary.timeIntervalSince(now))))
+                return .unavailable(
+                    reason: "dnd",
+                    retryAfterSeconds: retry,
+                    leaseIdentity: "dnd:\(Int(boundary.timeIntervalSince1970))"
+                )
+            }
+            return .unavailable(reason: "dnd", retryAfterSeconds: oneDayRetrySeconds)
+        }
+        if focusActive {
+            return .unavailable(reason: "focus", retryAfterSeconds: oneHourRetrySeconds)
+        }
+        return nil
+    }
+
+    private func availabilityAfterWrite(
+        _ succeeded: Bool,
+        model: AppModel,
+        now: Date
+    ) -> DotAvailability {
+        guard succeeded else {
+            return .unavailable(reason: "write_failed", retryAfterSeconds: oneHourRetrySeconds)
+        }
+        return configuredUnavailability(model: model, now: now) ?? .ready
+    }
+
+    private func reportAvailability(_ availability: DotAvailability, model: AppModel) {
+        LiveMonitorManager.shared.reportDotAvailability(availability, model: model)
+    }
+
     private func resolve(mode: String?, unreachable: Bool, model: AppModel) -> (state: LedDisplayState, label: String) {
         if model.dndEnabled {
             return (.idle, "DND on — Dot off")
@@ -520,25 +725,43 @@ final class DotStatusMirror: ObservableObject {
             program: program,
             brightness: DotBrightness.configuredValue
         )
+        let now = Date()
         if signature == lastWriteSignature {
             if lastError == nil {
-                statusText = label
-                return true
+                if now.timeIntervalSince(lastAttempt) < connectivityProbeSeconds {
+                    statusText = label
+                    return true
+                }
+                lastAttempt = now
+                do {
+                    try DriveWriter.shared.probeAccess()
+                    hasSuccessfulWrite = true
+                    statusText = label
+                    return true
+                } catch {
+                    lastError = error.localizedDescription
+                    hasSuccessfulWrite = false
+                    statusText = "Dot access failed: \(error.localizedDescription)"
+                    return false
+                }
             }
-            if Date().timeIntervalSince(lastAttempt) < errorRetrySeconds {
+            if lastError != nil,
+               now.timeIntervalSince(lastAttempt) < errorRetrySeconds {
                 return false
             }
         }
 
-        lastAttempt = Date()
+        lastAttempt = now
         lastWriteSignature = signature
         do {
             try DriveWriter.shared.write(program)
             lastError = nil
+            hasSuccessfulWrite = true
             statusText = label
             return true
         } catch {
             lastError = error.localizedDescription
+            hasSuccessfulWrite = false
             statusText = "Dot write failed: \(error.localizedDescription)"
             return false
         }

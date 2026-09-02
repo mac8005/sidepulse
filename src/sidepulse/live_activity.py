@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -101,12 +102,34 @@ DOT_PUSH_RETRY_OFFSETS_SECONDS = (0.0, 2 * 60.0, 20 * 60.0)
 DOT_RESYNC_COOLDOWN_SECONDS = 60.0
 DOT_COLLAPSE_ID = "sidepulse-dot-state"
 DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
+DOT_UNAVAILABLE_MIN_SECONDS = 60.0
+DOT_UNAVAILABLE_MAX_SECONDS = 24 * 60 * 60.0
+DOT_REPORTED_AT_MAX_FUTURE_SECONDS = 5 * 60.0
+DOT_UNAVAILABLE_REASONS = {
+    "brightness_zero",
+    "disconnected",
+    "dnd",
+    "focus",
+    "no_folder",
+    "write_failed",
+}
+DOT_UNAVAILABLE_METADATA_KEYS = (
+    "dot_unavailable_until",
+    "dot_unavailable_reason",
+    "dot_status_at",
+    "dot_client_reported_at",
+)
 
 # Modes worth interrupting the user for, and their notification titles.
 ALERT_MODES = {
     "waiting_for_input": "Needs your input",
     "blocked_error": "Blocked",
     "completed": "Finished",
+}
+ALERT_SOUNDS = {
+    "completed": "AgentFinished.caf",
+    "waiting_for_input": "AgentNeedsInput.caf",
+    "blocked_error": "AgentBlocked.caf",
 }
 ALERT_COOLDOWN_SECONDS = 90.0
 FINISHED_ALERT_DEFER_SECONDS = 20.0
@@ -148,6 +171,52 @@ class PendingDotPush:
     accepted_attempts: int = 0
     rejected_attempts: int = 0
     next_attempt_at: float = 0.0
+
+
+class StaleCompletionError(Exception):
+    """The client tried to acknowledge an older completion generation."""
+
+
+def _parse_dot_availability(
+    body: dict[str, Any],
+) -> tuple[bool, str | None, float | None, float | None] | None:
+    """Validate optional Dot availability fields from an iOS report."""
+    if "available" not in body:
+        return None
+    available = body["available"]
+    if not isinstance(available, bool):
+        raise ValueError("available must be a boolean")
+    reported_at = body.get("reportedAt")
+    if reported_at is not None and (
+        isinstance(reported_at, bool)
+        or not isinstance(reported_at, (int, float))
+        or not math.isfinite(reported_at)
+    ):
+        raise ValueError("reportedAt must be a number")
+    client_time = float(reported_at) if reported_at is not None else None
+    if available:
+        return True, None, None, client_time
+
+    reason = body.get("reason")
+    if reason not in DOT_UNAVAILABLE_REASONS:
+        raise ValueError("invalid Dot unavailability reason")
+    retry_after = body.get("retryAfterSeconds")
+    if (
+        isinstance(retry_after, bool)
+        or not isinstance(retry_after, (int, float))
+        or not math.isfinite(retry_after)
+        or retry_after <= 0
+    ):
+        raise ValueError("retryAfterSeconds must be a positive number")
+    return (
+        False,
+        reason,
+        max(
+            DOT_UNAVAILABLE_MIN_SECONDS,
+            min(float(retry_after), DOT_UNAVAILABLE_MAX_SECONDS),
+        ),
+        client_time,
+    )
 
 
 def _log(message: str) -> None:
@@ -243,6 +312,24 @@ class TokenStore:
     def contains(self, kind: str, token: str) -> bool:
         with self._lock:
             return token in self._data[kind]
+
+    def update_metadata(
+        self, kind: str, token: str, values: dict[str, Any]
+    ) -> bool:
+        """Update one registered token without changing token ownership."""
+        with self._lock:
+            current = self._data[kind].get(token)
+            if current is None:
+                return False
+            updated = dict(current)
+            for key, value in values.items():
+                if value is None:
+                    updated.pop(key, None)
+                else:
+                    updated[key] = value
+            self._data[kind][token] = updated
+            self._save()
+            return True
 
     def drop(self, kind: str, token: str) -> None:
         with self._lock:
@@ -656,12 +743,16 @@ def compute_alerts(
     if not previous_modes:
         return alerts, new_modes
 
-    def fire(key: tuple[str, str], title: str, body: str, thread_id: str) -> None:
+    def fire(
+        key: tuple[str, str], title: str, body: str, thread_id: str, kind: str
+    ) -> None:
         last_sent = last_alerts.get(key)
         if last_sent is not None and now - last_sent < ALERT_COOLDOWN_SECONDS:
             return
         last_alerts[key] = now
-        alerts.append({"title": title, "body": body, "thread_id": thread_id})
+        alerts.append(
+            {"title": title, "body": body, "thread_id": thread_id, "kind": kind}
+        )
 
     for status in statuses:
         mode = status.mode.value
@@ -674,6 +765,7 @@ def compute_alerts(
             f"{ALERT_MODES[mode]}: {_truncate(status.display_name, MAX_NAME_CHARS)}",
             status.tool_name or status.message or status.mode_label,
             status.agent_id,
+            mode,
         )
 
     for group_key, members in groups.items():
@@ -694,6 +786,7 @@ def compute_alerts(
             f"{ALERT_MODES['completed']}: {_truncate(main.display_name, MAX_NAME_CHARS)}",
             main.mode_label,
             group_key,
+            "completed",
         )
     return alerts, new_modes
 
@@ -1438,7 +1531,7 @@ class LiveActivityDaemon:
         self._dot_candidate_signature: tuple[str, bool] | None = None
         self._dot_candidate_since = 0.0
         self._pending_dot: PendingDotPush | None = None
-        self._dot_lock = threading.Lock()
+        self._dot_lock = threading.RLock()
         self._last_dot_resync_at = 0.0
         self._idle_since: float | None = None
         self._activity_live = False
@@ -1446,6 +1539,7 @@ class LiveActivityDaemon:
         self._agent_modes: dict[str, str] = {}
         self._last_alerts: dict[tuple[str, str], float] = {}
         self._last_rows: dict[str, dict[str, Any]] = {}
+        self._recent_finished_lock = threading.RLock()
         self._recent_finished: dict[str, dict[str, Any]] = {}
         self._recent_finished_path = default_state_dir() / "recent_finished.json"
         self._load_recent_finished()
@@ -1521,19 +1615,21 @@ class LiveActivityDaemon:
         if self.summarizer is not None:
             self._prompt_tracker.poll()
             statuses = [self._apply_summary(status) for status in statuses]
-        self._remember_finished(statuses, now_ts)
-        self._refresh_finished_summaries()
-        content_state = build_content_state(
-            statuses,
-            snapshot.aggregate.mode.value,
-            recent_finished=list(self._recent_finished.values()),
-        )
-
-        with self._condition:
-            changed = self._meaningfully_changed(content_state)
-            self._latest = content_state
-            if changed:
-                self._condition.notify_all()
+        with self._recent_finished_lock:
+            self._remember_finished(statuses, now_ts)
+            self._refresh_finished_summaries()
+            recent_finished = [dict(row) for row in self._recent_finished.values()]
+            has_recent_finished = bool(self._recent_finished)
+            content_state = build_content_state(
+                statuses,
+                snapshot.aggregate.mode.value,
+                recent_finished=recent_finished,
+            )
+            with self._condition:
+                changed = self._meaningfully_changed(content_state)
+                self._latest = content_state
+                if changed:
+                    self._condition.notify_all()
 
         now = time.time()
         active = content_state["activeCount"] > 0
@@ -1589,7 +1685,7 @@ class LiveActivityDaemon:
                 self._idle_since = now
             elif (
                 self._activity_live
-                and not self._recent_finished
+                and not has_recent_finished
                 and now - self._idle_since >= self.config.idle_end_minutes * 60
             ):
                 # Nothing active and nothing recently finished — safe to end.
@@ -1600,7 +1696,7 @@ class LiveActivityDaemon:
         # arrives, whatever an earlier start push claimed. Finished rows earn
         # an island too: gating this on active work meant an activity that
         # died while the host idled stayed dead until new work began.
-        if (active or self._recent_finished) and not self.tokens.tokens("update"):
+        if (active or has_recent_finished) and not self.tokens.tokens("update"):
             self._maybe_push_to_start(content_state, now)
 
     def _sync_background_tasks(self, statuses, now: float) -> None:
@@ -1913,14 +2009,52 @@ class LiveActivityDaemon:
         except (OSError, ValueError):
             pass
 
-    def mark_finished_seen(self, agent_id: str) -> bool:
+    def mark_finished_seen(
+        self,
+        agent_id: str,
+        finished_at: float | int | None = None,
+    ) -> bool:
         """The user opened this finished session in the app; stop
         highlighting it everywhere on the next push."""
-        row = self._recent_finished.get(agent_id)
-        if not row or not row.get("unread"):
-            return False
-        row["unread"] = False
-        self._save_recent_finished()
+        with self._recent_finished_lock:
+            row = self._recent_finished.get(agent_id)
+            if finished_at is not None and (
+                row is None or row.get("finishedAt") != finished_at
+            ):
+                raise StaleCompletionError
+            if not row or not row.get("unread"):
+                return False
+
+            row["unread"] = False
+            self._save_recent_finished()
+            marked_finished_at = row.get("finishedAt")
+
+        # Do not wait for the next collector poll to make the daemon's
+        # authoritative foreground snapshot agree with persisted state.
+        with self._condition:
+            latest = self._latest
+            agents = latest.get("agents") if latest is not None else None
+            if isinstance(agents, list):
+                updated_agents = []
+                snapshot_changed = False
+                for visible in agents:
+                    if (
+                        isinstance(visible, dict)
+                        and visible.get("id") == agent_id
+                        and visible.get("mode") == "completed"
+                        and visible.get("finishedAt") == marked_finished_at
+                        and visible.get("unread") is not False
+                    ):
+                        visible = {**visible, "unread": False}
+                        snapshot_changed = True
+                    updated_agents.append(visible)
+                if snapshot_changed:
+                    self._latest = {
+                        **latest,
+                        "agents": updated_agents,
+                        "updatedAt": round(time.time(), 1),
+                    }
+            self._condition.notify_all()
         return True
 
     def _save_recent_finished(self) -> None:
@@ -1996,7 +2130,7 @@ class LiveActivityDaemon:
             session_id = alert["thread_id"].split(":")[-1]
             if (
                 self.summarizer is None
-                or not alert["title"].startswith(ALERT_MODES["completed"])
+                or alert["kind"] != "completed"
                 or self.summarizer.summary_for(session_id, None, style="outcome")
             ):
                 ready.append(alert)
@@ -2029,11 +2163,15 @@ class LiveActivityDaemon:
                         "title": f"{ALERT_MODES['completed']}: {_truncate(summary, MAX_NAME_CHARS)}",
                         "body": pending["body"],
                         "thread_id": pending["thread_id"],
+                        "kind": pending["kind"],
                     }
                 )
             elif now >= pending["deadline"]:
                 ready.append(
-                    {k: pending[k] for k in ("title", "body", "thread_id")}
+                    {
+                        k: pending[k]
+                        for k in ("title", "body", "thread_id", "kind")
+                    }
                 )
             else:
                 still_waiting.append(pending)
@@ -2238,7 +2376,7 @@ class LiveActivityDaemon:
             aps["alert"] = {
                 "title": alert["title"],
                 "body": alert["body"],
-                "sound": "default",
+                "sound": ALERT_SOUNDS.get(alert.get("kind"), "default"),
             }
         accepted = self._apns_fanout("update", {"aps": aps}, priority=priority)
         with self._push_state_lock:
@@ -2294,6 +2432,117 @@ class LiveActivityDaemon:
                 next_attempt_at=now,
             )
         return True
+
+    def _dot_owner_availability(
+        self, now: float
+    ) -> tuple[str | None, float | None, str | None, bool]:
+        """Return owner, active suppression, reason, and expiry transition."""
+        entries = self.tokens.entries("dot_device")
+        if not entries:
+            return None, None, None, False
+        token, meta = next(iter(entries.items()))
+        unavailable_until = meta.get("dot_unavailable_until")
+        valid_until = (
+            not isinstance(unavailable_until, bool)
+            and isinstance(unavailable_until, (int, float))
+            and math.isfinite(unavailable_until)
+        )
+        reason = meta.get("dot_unavailable_reason")
+        if (
+            valid_until
+            and unavailable_until > now
+            and reason in DOT_UNAVAILABLE_REASONS
+        ):
+            return token, float(unavailable_until), reason, False
+        return token, None, None, bool(valid_until and unavailable_until <= now)
+
+    def report_dot_availability(
+        self,
+        token: str,
+        available: bool,
+        reason: str | None = None,
+        retry_after_seconds: float | None = None,
+        reported_at: float | None = None,
+        *,
+        now: float | None = None,
+        force_resync: bool = True,
+    ) -> bool:
+        """Persist a bounded suppression lease for the elected Dot owner."""
+        owner_matched, applied = self._record_dot_availability(
+            token,
+            available,
+            reason,
+            retry_after_seconds,
+            reported_at,
+            now=now,
+        )
+        if owner_matched and applied and available and force_resync:
+            moment = time.time() if now is None else now
+            with self._dot_lock:
+                self.request_dot_resync(now=moment, force=True)
+                self._wake.set()
+        return owner_matched
+
+    def _record_dot_availability(
+        self,
+        token: str,
+        available: bool,
+        reason: str | None,
+        retry_after_seconds: float | None,
+        reported_at: float | None,
+        *,
+        now: float | None,
+    ) -> tuple[bool, bool]:
+        moment = time.time() if now is None else now
+        ordered_at = (
+            reported_at
+            if reported_at is None
+            or reported_at <= moment + DOT_REPORTED_AT_MAX_FUTURE_SECONDS
+            else None
+        )
+        with self._dot_lock:
+            owner, _, _, _ = self._dot_owner_availability(moment)
+            if owner != token:
+                return False, False
+            metadata = self.tokens.entries("dot_device").get(token)
+            if metadata is None:
+                return False, False
+            previous_client_time = metadata.get("dot_client_reported_at")
+            if (
+                ordered_at is not None
+                and not isinstance(previous_client_time, bool)
+                and isinstance(previous_client_time, (int, float))
+                and math.isfinite(previous_client_time)
+                and ordered_at < previous_client_time
+            ):
+                return True, False
+            values: dict[str, Any] = {"dot_status_at": moment}
+            if ordered_at is not None:
+                values["dot_client_reported_at"] = ordered_at
+            if available:
+                values.update(
+                    {
+                        "dot_unavailable_until": None,
+                        "dot_unavailable_reason": None,
+                    }
+                )
+            else:
+                lease_seconds = max(
+                    DOT_UNAVAILABLE_MIN_SECONDS,
+                    min(
+                        float(retry_after_seconds or DOT_UNAVAILABLE_MIN_SECONDS),
+                        DOT_UNAVAILABLE_MAX_SECONDS,
+                    ),
+                )
+                values.update(
+                    {
+                        "dot_unavailable_until": moment + lease_seconds,
+                        "dot_unavailable_reason": reason,
+                    }
+                )
+            if not self.tokens.update_metadata("dot_device", token, values):
+                return False, False
+        return True, True
 
     def _observe_dot_state(
         self, dot_state: str, content_state: dict[str, Any], now: float
@@ -2351,20 +2600,48 @@ class LiveActivityDaemon:
             return False
         return self._queue_dot_state(dot_state, content_state, moment, force=True)
 
-    def ack_dot(self, command_id: str, status: str) -> bool:
+    def ack_dot(
+        self,
+        command_id: str,
+        status: str,
+        availability: tuple[
+            bool, str | None, float | None, float | None
+        ] | None = None,
+        *,
+        now: float | None = None,
+    ) -> bool:
         """Commit delivery only after iOS handled the matching LED command."""
         with self._dot_lock:
             pending = self._pending_dot
             if pending is None or pending.command_id != command_id:
                 return False
-            if status not in DOT_ACK_SUCCESS_STATUSES:
+            availability_applied = False
+            if availability is not None:
+                owner, _, _, _ = self._dot_owner_availability(
+                    time.time() if now is None else now
+                )
+                if owner is not None:
+                    _, availability_applied = self._record_dot_availability(
+                        owner,
+                        availability[0],
+                        availability[1],
+                        availability[2],
+                        availability[3],
+                        now=now,
+                    )
+            delivered = status in DOT_ACK_SUCCESS_STATUSES and (
+                availability is None
+                or not availability_applied
+                or availability[0]
+            )
+            if not delivered:
                 state = pending.state
             else:
                 self._last_dot_state = pending.state
                 self._last_dot_has_unread_finished = pending.has_unread_finished
                 self._pending_dot = None
                 state = pending.state
-        if status in DOT_ACK_SUCCESS_STATUSES:
+        if delivered:
             _log(f"dot ack <- {state} ({status})")
             return True
         _log(f"dot ack <- {state} ({status}); still pending")
@@ -2372,10 +2649,23 @@ class LiveActivityDaemon:
 
     def _send_pending_dot_if_due(self, now: float) -> bool:
         """Send at most three accepted copies over the command's one-hour TTL."""
-        token_kind = "dot_device" if self.tokens.tokens("dot_device") else "device"
-        if not self.tokens.tokens(token_kind):
-            return False
         with self._dot_lock:
+            owner, unavailable_until, _, lease_expired = (
+                self._dot_owner_availability(now)
+            )
+            if owner is None or unavailable_until is not None:
+                return False
+            if lease_expired:
+                if not self.tokens.update_metadata(
+                    "dot_device",
+                    owner,
+                    {
+                        "dot_unavailable_until": None,
+                        "dot_unavailable_reason": None,
+                    },
+                ):
+                    return False
+                self.request_dot_resync(now=now, force=True)
             pending = self._pending_dot
             if (
                 pending is None
@@ -2406,7 +2696,7 @@ class LiveActivityDaemon:
             f"command {command_id[:8]})"
         )
         accepted = self._apns_fanout(
-            token_kind,
+            "dot_device",
             payload,
             priority=5,
             push_type="background",
@@ -2446,10 +2736,21 @@ class LiveActivityDaemon:
                 )
         return accepted
 
-    def _dot_health(self) -> dict[str, Any]:
+    def _dot_health(self, now: float | None = None) -> dict[str, Any]:
+        moment = time.time() if now is None else now
         with self._dot_lock:
+            owner, unavailable_until, reason, _ = self._dot_owner_availability(moment)
             pending = self._pending_dot
             return {
+                "dotOutputAvailable": owner is not None and unavailable_until is None,
+                "dotUnavailableReason": (
+                    "no_device" if owner is None else reason
+                ),
+                "dotRetryAfterSeconds": (
+                    max(0, math.ceil(unavailable_until - moment))
+                    if unavailable_until is not None
+                    else 0
+                ),
                 "dotState": self._last_dot_state,
                 "dotPendingState": pending.state if pending is not None else None,
                 "dotPendingAttempts": (
@@ -2567,9 +2868,20 @@ class LiveActivityDaemon:
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                last_sent: object = object()
                 try:
                     while not daemon._stop.is_set():
                         with daemon._condition:
+                            if daemon._latest is last_sent:
+                                daemon._condition.wait_for(
+                                    lambda: (
+                                        daemon._stop.is_set()
+                                        or daemon._latest is not last_sent
+                                    ),
+                                    SSE_HEARTBEAT_SECONDS,
+                                )
+                            if daemon._stop.is_set():
+                                return
                             latest = daemon._latest
                             if latest is not None:
                                 data = json.dumps(latest)
@@ -2577,8 +2889,7 @@ class LiveActivityDaemon:
                                 data = "{}"
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
-                        with daemon._condition:
-                            daemon._condition.wait(SSE_HEARTBEAT_SECONDS)
+                        last_sent = latest
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
 
@@ -2590,13 +2901,54 @@ class LiveActivityDaemon:
                     except (ValueError, OSError):
                         self._json(400, {"error": "invalid body"})
                         return
+                    if not isinstance(body, dict):
+                        self._json(400, {"error": "invalid body"})
+                        return
                     command_id = body.get("commandID")
                     status = body.get("status")
                     if not isinstance(command_id, str) or not isinstance(status, str):
                         self._json(400, {"error": "commandID and status are required"})
                         return
-                    acknowledged = daemon.ack_dot(command_id, status)
+                    try:
+                        availability = _parse_dot_availability(body)
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    acknowledged = daemon.ack_dot(
+                        command_id, status, availability
+                    )
                     self._json(200, {"ok": True, "acknowledged": acknowledged})
+                    return
+                if self.path == "/dot-availability":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, OSError):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    if not isinstance(body, dict):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    token = body.get("token")
+                    try:
+                        availability = _parse_dot_availability(body)
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    if not isinstance(token, str) or not token or availability is None:
+                        self._json(400, {"error": "token and available are required"})
+                        return
+                    updated = daemon.report_dot_availability(
+                        token,
+                        availability[0],
+                        availability[1],
+                        availability[2],
+                        availability[3],
+                    )
+                    if not updated:
+                        self._json(409, {"ok": False, "error": "not_dot_owner"})
+                        return
+                    self._json(200, {"ok": True, **daemon._dot_health()})
                     return
                 if self.path == "/seen":
                     try:
@@ -2605,7 +2957,24 @@ class LiveActivityDaemon:
                     except (ValueError, OSError):
                         self._json(400, {"error": "invalid body"})
                         return
-                    marked = daemon.mark_finished_seen(str(body.get("id", "")))
+                    if not isinstance(body, dict):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    finished_at = None
+                    if "finishedAt" in body:
+                        finished_at = body["finishedAt"]
+                        if isinstance(finished_at, bool) or not isinstance(
+                            finished_at, (int, float)
+                        ):
+                            self._json(400, {"error": "finishedAt must be a number"})
+                            return
+                    try:
+                        marked = daemon.mark_finished_seen(
+                            str(body.get("id", "")), finished_at
+                        )
+                    except StaleCompletionError:
+                        self._json(409, {"ok": False, "error": "stale_completion"})
+                        return
                     if marked:
                         daemon._wake.set()
                     self._json(200, {"ok": True, "marked": marked})
@@ -2653,6 +3022,11 @@ class LiveActivityDaemon:
                 elif kind == "dot_device":
                     # Alert pushes may target several phones, but only the
                     # most recently registered Dot owner receives LED writes.
+                    previous = daemon.tokens.entries(kind)
+                    if list(previous) == [token]:
+                        for key in DOT_UNAVAILABLE_METADATA_KEYS:
+                            if key in previous[token]:
+                                meta[key] = previous[token][key]
                     dot_owner_changed = daemon.tokens.replace(kind, token, meta)
                 elif kind == "device":
                     daemon.tokens.register(kind, token, meta)

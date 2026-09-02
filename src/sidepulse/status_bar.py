@@ -135,6 +135,15 @@ from .remote_hosts import (
     remove_remote_host,
     upsert_remote_host,
 )
+from .remote_state import (
+    CanonicalUnread,
+    OptimisticSeen,
+    RemoteUnreadStore,
+    canonical_status_for_unread,
+    fetch_unread_finished,
+    monitor_route_for_status,
+    post_seen,
+)
 from .remote_launch import (
     install_remote_launch_agent,
     remote_launch_agent_path,
@@ -314,6 +323,7 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 )
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
+REMOTE_UNREAD_POLL_SECONDS = 5.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
@@ -453,6 +463,7 @@ class StatusBarController(NSObject):
         self.timer = None
         self.lid_timer = None
         self.device_timer = None
+        self.remote_unread_timer = None
         self.settings_window = None
         self.setup_window = None
         self.settings_fields = {}
@@ -463,6 +474,15 @@ class StatusBarController(NSObject):
         self.finished_tracking_initialized = False
         self.observed_agent_modes = {}
         self.unread_finished_agent_ids = set()
+        self.remote_monitor_hosts = tuple(
+            host for host in load_remote_hosts() if host.monitor_url
+        )
+        self.remote_unread_store = RemoteUnreadStore()
+        self.remote_unread_poll_lock = threading.Lock()
+        self.remote_unread_network_lock = threading.Lock()
+        self.remote_unread_poll_in_flight = False
+        self.last_remote_unread_poll_monotonic = 0.0
+        self.remote_unread_errors = {}
         self.last_battery_snapshot = None
         self.last_battery_error = None
         self.last_power_connected = None
@@ -557,6 +577,13 @@ class StatusBarController(NSObject):
             None,
             True,
         )
+        self.remote_unread_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            REMOTE_UNREAD_POLL_SECONDS,
+            self,
+            "pollRemoteUnread:",
+            None,
+            True,
+        )
         self.show_setup_window_if_needed()
         if (
             SCREEN_BAR_FEATURE_ENABLED
@@ -569,6 +596,7 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def refresh_(self, _sender):
+        self.poll_remote_unread()
         self.apply_due_dnd_schedule()
         try:
             snapshot = self.monitor.snapshot(include_stale=False)
@@ -620,6 +648,7 @@ class StatusBarController(NSObject):
             self.menu.addItem_(item)
 
     def rebuild_status_menu(self) -> None:
+        self.poll_remote_unread()
         try:
             snapshot = self.monitor.snapshot(include_stale=False)
         except Exception as exc:
@@ -1027,6 +1056,185 @@ class StatusBarController(NSObject):
         self.event_refresh_pending = False
         self.refresh_(None)
 
+    @objc.IBAction
+    def pollRemoteUnread_(self, _sender):
+        self.poll_remote_unread()
+
+    def poll_remote_unread(self, *, force: bool = False) -> None:
+        hosts = tuple(host for host in load_remote_hosts() if host.monitor_url)
+        old_routes = {
+            host.name: host.monitor_url
+            for host in self.remote_monitor_hosts
+            if host.monitor_url
+        }
+        routes = {
+            host.name: host.monitor_url
+            for host in hosts
+            if host.monitor_url
+        }
+        routes_changed = routes != old_routes
+        self.remote_monitor_hosts = hosts
+        if self.remote_unread_store.retain_routes(routes):
+            self.schedule_remote_unread_changed()
+        if not hosts:
+            return
+
+        now = time.monotonic()
+        with self.remote_unread_poll_lock:
+            if self.remote_unread_poll_in_flight:
+                return
+            if (
+                not force
+                and not routes_changed
+                and now - self.last_remote_unread_poll_monotonic
+                < REMOTE_UNREAD_POLL_SECONDS
+            ):
+                return
+            self.remote_unread_poll_in_flight = True
+            self.last_remote_unread_poll_monotonic = now
+        threading.Thread(
+            target=self._poll_remote_unread_worker,
+            args=(hosts,),
+            daemon=True,
+        ).start()
+
+    def _poll_remote_unread_worker(self, hosts: tuple[RemoteHost, ...]) -> None:
+        changed = False
+        try:
+            with self.remote_unread_network_lock:
+                for host in hosts:
+                    if not host.monitor_url:
+                        continue
+                    try:
+                        rows = fetch_unread_finished(host.name, host.monitor_url)
+                    except Exception as exc:
+                        self.record_remote_unread_error(host.name, str(exc))
+                        continue
+                    self.record_remote_unread_error(host.name, None)
+                    changed = self.remote_unread_store.replace_host(
+                        host.name,
+                        rows,
+                        monitor_url=host.monitor_url,
+                    ) or changed
+        finally:
+            with self.remote_unread_poll_lock:
+                self.remote_unread_poll_in_flight = False
+        if changed:
+            self.schedule_remote_unread_changed()
+
+    def record_remote_unread_error(self, host_name: str, error: str | None) -> None:
+        previous = self.remote_unread_errors.get(host_name)
+        if error:
+            if error != previous:
+                log_status_bar(f"remote unread error {host_name}: {error}")
+            self.remote_unread_errors[host_name] = error
+        elif previous:
+            self.remote_unread_errors.pop(host_name, None)
+            log_status_bar(f"remote unread recovered {host_name}")
+
+    def schedule_remote_unread_changed(self) -> None:
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "remoteUnreadChanged:",
+            None,
+            False,
+        )
+
+    @objc.IBAction
+    def remoteUnreadChanged_(self, _sender):
+        self.reset_led_controllers_for_display_change()
+        if self.last_snapshot is not None:
+            self.sync_leds(
+                self.last_snapshot.aggregate.mode,
+                self.last_battery_snapshot,
+                self.active_led_display_kind(self.last_battery_snapshot),
+            )
+
+    def remote_monitor_route(self, status: AgentStatus) -> RemoteHost | None:
+        return monitor_route_for_status(
+            status,
+            getattr(self, "remote_monitor_hosts", ()),
+        )
+
+    def canonical_unread_for_status(
+        self,
+        status: AgentStatus,
+        *,
+        exact_generation: bool = False,
+    ) -> CanonicalUnread | None:
+        route = StatusBarController.remote_monitor_route(self, status)
+        if route is None or not route.monitor_url:
+            return None
+        return self.remote_unread_store.match_status(
+            route.name,
+            status,
+            monitor_url=route.monitor_url,
+            finished_at=(status.updated_at.timestamp() if exact_generation else None),
+        )
+
+    def canonical_route_is_authoritative(self, status: AgentStatus) -> bool:
+        route = StatusBarController.remote_monitor_route(self, status)
+        return bool(
+            route is not None
+            and route.monitor_url
+            and self.remote_unread_store.is_authoritative(
+                route.name,
+                route.monitor_url,
+            )
+        )
+
+    def canonical_menu_statuses(self) -> tuple[AgentStatus, ...]:
+        statuses = (
+            canonical_status_for_unread(row)
+            for row in self.remote_unread_store.rows()
+        )
+        return tuple(status for status in statuses if status is not None)
+
+    def is_status_unread(self, status: AgentStatus) -> bool:
+        if status.mode != AgentMode.COMPLETED:
+            return False
+        if StatusBarController.canonical_route_is_authoritative(self, status):
+            return (
+                StatusBarController.canonical_unread_for_status(self, status)
+                is not None
+            )
+        return status.agent_id in self.unread_finished_agent_ids
+
+    def clear_canonical_unread(self, row: CanonicalUnread) -> None:
+        token = self.remote_unread_store.optimistically_clear(row)
+        if token is None:
+            return
+        self.schedule_remote_unread_changed()
+        threading.Thread(
+            target=self._post_seen_worker,
+            args=(token,),
+            daemon=True,
+        ).start()
+
+    def _post_seen_worker(self, token: OptimisticSeen) -> None:
+        row = token.row
+        changed = False
+        with self.remote_unread_network_lock:
+            success = post_seen(row)
+            if not success:
+                changed = self.remote_unread_store.restore(token)
+                log_status_bar(
+                    f"remote seen failed {row.host_name} id={row.server_id}"
+                )
+
+            try:
+                rows = fetch_unread_finished(row.host_name, row.monitor_url)
+            except Exception as exc:
+                self.record_remote_unread_error(row.host_name, str(exc))
+            else:
+                self.record_remote_unread_error(row.host_name, None)
+                changed = self.remote_unread_store.replace_host(
+                    row.host_name,
+                    rows,
+                    monitor_url=row.monitor_url,
+                ) or changed
+        if changed:
+            self.schedule_remote_unread_changed()
+
     def show_settings_window(self) -> None:
         if self.settings_window is None:
             self.settings_window = build_settings_window(self)
@@ -1333,6 +1541,7 @@ class StatusBarController(NSObject):
             popup.lastItem().setEnabled_(False)
             set_text_control_value(self.settings_fields.get("remote_host_name"), "")
             set_text_control_value(self.settings_fields.get("remote_ssh_target"), "")
+            set_text_control_value(self.settings_fields.get("remote_monitor_url"), "")
         else:
             selected_index = 0
             for index, host in enumerate(hosts):
@@ -1372,6 +1581,10 @@ class StatusBarController(NSObject):
             self.settings_fields.get("remote_ssh_target"),
             selected.ssh_target,
         )
+        set_text_control_value(
+            self.settings_fields.get("remote_monitor_url"),
+            selected.monitor_url or "",
+        )
 
     def save_remote_host_from_fields(self) -> None:
         name = text_control_value(
@@ -1380,8 +1593,11 @@ class StatusBarController(NSObject):
         ssh_target = text_control_value(
             self.settings_fields.get("remote_ssh_target")
         ).strip()
+        monitor_url = text_control_value(
+            self.settings_fields.get("remote_monitor_url")
+        ).strip()
         try:
-            host = RemoteHost(name, ssh_target)
+            host = RemoteHost(name, ssh_target, monitor_url=monitor_url or None)
             upsert_remote_host(host)
             install_remote_launch_agent(start=True)
         except Exception as exc:
@@ -1390,8 +1606,15 @@ class StatusBarController(NSObject):
             return
 
         self.reload_monitor()
+        if hasattr(self, "remote_unread_store"):
+            StatusBarController.poll_remote_unread(self, force=True)
         self.set_settings_message(
-            f"Monitoring Claude and Codex on {host.name} via {host.ssh_target}."
+            f"Monitoring Claude and Codex on {host.name} via {host.ssh_target}. "
+            + (
+                f"NEW/read sync: {host.monitor_url}."
+                if host.monitor_url
+                else "NEW/read sync is not configured."
+            )
         )
         self.refresh_remote_host_controls()
         self.refresh_(None)
@@ -1827,6 +2050,25 @@ class StatusBarController(NSObject):
     def open_session(self, status: AgentStatus | object, action: str | None, *, remember: bool) -> None:
         if not isinstance(status, AgentStatus):
             return
+        has_remote_state = hasattr(self, "remote_unread_store")
+        canonical_unread = (
+            StatusBarController.canonical_unread_for_status(
+                self,
+                status,
+                exact_generation=True,
+            )
+            if has_remote_state
+            else None
+        )
+        canonical_route = (
+            StatusBarController.remote_monitor_route(self, status)
+            if has_remote_state
+            else None
+        )
+        canonical_authoritative = bool(
+            has_remote_state
+            and StatusBarController.canonical_route_is_authoritative(self, status)
+        )
         provider = status.provider.lower()
         requested_action = (
             action
@@ -1867,8 +2109,11 @@ class StatusBarController(NSObject):
                 self.set_settings_message(f"Could not save open preference: {exc}")
                 self.settings = load_settings()
 
-        if (
+        if status.mode == AgentMode.COMPLETED and canonical_unread is not None:
+            StatusBarController.clear_canonical_unread(self, canonical_unread)
+        elif (
             status.mode == AgentMode.COMPLETED
+            and (canonical_route is None or not canonical_authoritative)
             and status.agent_id in self.unread_finished_agent_ids
         ):
             self.unread_finished_agent_ids.discard(status.agent_id)
@@ -2145,6 +2390,18 @@ class StatusBarController(NSObject):
             for agent_id, mode in current_modes.items()
             if mode == AgentMode.COMPLETED
         }
+        completed_ids = {
+            status.agent_id
+            for status in menu_statuses(snapshot, self.settings)
+            if status.agent_id in completed_ids
+            and not (
+                hasattr(self, "remote_unread_store")
+                and StatusBarController.canonical_route_is_authoritative(
+                    self,
+                    status,
+                )
+            )
+        }
         if self.finished_tracking_initialized:
             for agent_id in completed_ids:
                 if self.observed_agent_modes.get(agent_id) != AgentMode.COMPLETED:
@@ -2155,9 +2412,25 @@ class StatusBarController(NSObject):
         self.observed_agent_modes = current_modes
 
     def should_show_finished_on_leds(self, mode: AgentMode) -> bool:
+        store = getattr(self, "remote_unread_store", None)
+        has_canonical_unread = bool(store is not None and store.has_unread())
+        has_local_unread = bool(self.unread_finished_agent_ids)
+        last_snapshot = getattr(self, "last_snapshot", None)
+        if has_local_unread and last_snapshot is not None:
+            has_local_unread = any(
+                status.agent_id in self.unread_finished_agent_ids
+                and not (
+                    store is not None
+                    and StatusBarController.canonical_route_is_authoritative(
+                        self,
+                        status,
+                    )
+                )
+                for status in menu_statuses(last_snapshot, self.settings)
+            )
         return (
             self.settings.show_finished_enabled
-            and bool(self.unread_finished_agent_ids)
+            and (has_canonical_unread or has_local_unread)
             and mode
             in {
                 AgentMode.WORKING,
@@ -2874,7 +3147,14 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
 
     menu.addItem_(disabled_menu_item("Agents"))
 
-    statuses = recent_statuses(snapshot, target.settings)
+    canonical_statuses = getattr(target, "canonical_menu_statuses", None)
+    statuses = recent_statuses(
+        snapshot,
+        target.settings,
+        canonical_statuses=(
+            canonical_statuses() if callable(canonical_statuses) else ()
+        ),
+    )
     if not statuses:
         menu.addItem_(disabled_menu_item("No recent sessions"))
     else:
@@ -4092,24 +4372,27 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     remote_ssh_target = add_editable_field(remote_tab, "", 160, 200, 250, 24)
     add_label(remote_tab, "Example: macmini", 424, 244, 170, 22)
     add_label(remote_tab, "Example: mini or user@host", 424, 202, 190, 22)
+    add_label(remote_tab, "Monitor URL", 32, 160, 120, 22)
+    remote_monitor_url = add_editable_field(remote_tab, "", 160, 158, 250, 24)
+    add_label(remote_tab, "Example: http://macmini8005:8787", 424, 160, 205, 22)
 
     add_button(
         remote_tab,
         "Add or Update Host",
         160,
-        150,
+        112,
         170,
         30,
         target,
         "saveRemoteHost:",
     )
-    remote_host_status = add_label(remote_tab, "", 32, 104, 590, 22)
-    remote_config_path = add_label(remote_tab, "", 32, 74, 590, 22)
+    remote_host_status = add_label(remote_tab, "", 32, 76, 590, 22)
+    remote_config_path = add_label(remote_tab, "", 32, 50, 590, 22)
     add_label(
         remote_tab,
-        "The client uses an outbound SSH connection; no listening port or relay is created.",
+        "Session events use outbound SSH. Monitor URL syncs NEW/read state over HTTP.",
         32,
-        34,
+        20,
         590,
         22,
     )
@@ -4146,6 +4429,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "remote_host_popup": remote_host_popup,
         "remote_host_name": remote_host_name,
         "remote_ssh_target": remote_ssh_target,
+        "remote_monitor_url": remote_monitor_url,
         "remote_host_status": remote_host_status,
         "remote_config_path": remote_config_path,
         "sleep_prevention_min_battery_percent": min_battery_percent,
@@ -4703,9 +4987,17 @@ def build_session_menu_item(
     *,
     width: float | None = None,
     disambiguate_title: bool = False,
+    unread: bool | None = None,
 ) -> NSMenuItem:
+    if unread is None:
+        checker = getattr(target, "is_status_unread", None)
+        unread = bool(checker(status)) if callable(checker) else False
     item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        native_session_menu_title(status, disambiguate=disambiguate_title),
+        native_session_menu_title(
+            status,
+            disambiguate=disambiguate_title,
+            unread=unread,
+        ),
         "openSessionPrimary:",
         "",
     )
@@ -4717,14 +5009,20 @@ def build_session_menu_item(
     return item
 
 
-def native_session_menu_title(status: AgentStatus, *, disambiguate: bool = False) -> str:
+def native_session_menu_title(
+    status: AgentStatus,
+    *,
+    disambiguate: bool = False,
+    unread: bool = False,
+) -> str:
     title, project = session_title_parts(status)
     if disambiguate and status.session_id:
         title = f"{title} ({status.session_id[:8]})"
     parts = [title]
     if project:
         parts.append(project)
-    return "  ".join(parts)
+    label = "  ".join(parts)
+    return f"NEW — {label}" if unread else label
 
 
 def build_session_options_menu(
@@ -5041,8 +5339,13 @@ def recent_statuses(
     settings=None,
     *,
     limit: int = STATUS_BAR_SESSION_HISTORY_LIMIT,
+    canonical_statuses=(),
 ) -> list[AgentStatus]:
-    statuses = coalesced_menu_statuses(menu_statuses(snapshot, settings))
+    statuses = merge_canonical_menu_statuses(
+        menu_statuses(snapshot, settings),
+        canonical_statuses,
+    )
+    statuses = coalesced_menu_statuses(statuses)
     statuses.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
     return statuses[:limit]
 
@@ -5066,6 +5369,34 @@ def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
         and status.age_seconds(now) <= retention_seconds
     )
     return tuple(statuses)
+
+
+def merge_canonical_menu_statuses(
+    statuses,
+    canonical_statuses,
+) -> list[AgentStatus]:
+    canonical_by_key: dict[tuple[str, ...], AgentStatus] = {}
+    canonical_without_key: list[AgentStatus] = []
+    for status in canonical_statuses:
+        key = menu_session_coalesce_key(status)
+        if key is None:
+            canonical_without_key.append(status)
+            continue
+        previous = canonical_by_key.get(key)
+        if previous is None or status.updated_at > previous.updated_at:
+            canonical_by_key[key] = status
+
+    merged = [
+        status
+        for status in statuses
+        if not (
+            status.mode == AgentMode.COMPLETED
+            and menu_session_coalesce_key(status) in canonical_by_key
+        )
+    ]
+    merged.extend(canonical_by_key.values())
+    merged.extend(canonical_without_key)
+    return merged
 
 
 def session_title_collision_keys(statuses: list[AgentStatus]) -> set[tuple[str, str]]:

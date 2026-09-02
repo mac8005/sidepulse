@@ -338,6 +338,10 @@ def add_sidepulse_remote_parser(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument("name", help="Stable display name, for example macmini.")
     add.add_argument("--ssh", dest="ssh_target", required=True, help="SSH host or config alias.")
     add.add_argument(
+        "--monitor-url",
+        help="SidePulse live-activity server URL used to sync NEW/read state.",
+    )
+    add.add_argument(
         "--provider",
         action="append",
         choices=HOOK_PROVIDERS,
@@ -1102,13 +1106,20 @@ def cmd_hook_log(args: argparse.Namespace) -> int:
 def cmd_remote_add(args: argparse.Namespace) -> int:
     providers = tuple(args.provider or DEFAULT_REMOTE_PROVIDERS)
     try:
-        host = RemoteHost(args.name, args.ssh_target, tuple(dict.fromkeys(providers)))
+        host = RemoteHost(
+            args.name,
+            args.ssh_target,
+            tuple(dict.fromkeys(providers)),
+            monitor_url=getattr(args, "monitor_url", None),
+        )
     except ValueError as exc:
         print(f"remote: {exc}", file=sys.stderr)
         return 2
     target = upsert_remote_host(host)
     print(f"remote: saved {host.name} ({host.ssh_target})")
     print(f"  providers: {', '.join(host.providers)}")
+    if host.monitor_url:
+        print(f"  monitor URL: {host.monitor_url}")
     print(f"  config: {target}")
     if not args.no_start:
         from .remote_launch import install_remote_launch_agent
@@ -1147,7 +1158,8 @@ def cmd_remote_list(args: argparse.Namespace) -> int:
         print("No remote hosts configured.")
         return 0
     for host in hosts:
-        print(f"{host.name}: {host.ssh_target} ({', '.join(host.providers)})")
+        monitor = f"; monitor {host.monitor_url}" if host.monitor_url else ""
+        print(f"{host.name}: {host.ssh_target} ({', '.join(host.providers)}){monitor}")
     return 0
 
 

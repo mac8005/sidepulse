@@ -218,6 +218,8 @@ def test_compute_alerts_completed_and_blocked():
     assert any("Blocked" in title for title in titles)
     blocked_alert = next(alert for alert in alerts if "Blocked" in alert["title"])
     assert blocked_alert["body"] == "pytest"
+    assert blocked_alert["kind"] == "blocked_error"
+    assert next(alert for alert in alerts if "Finished" in alert["title"])["kind"] == "completed"
 
 
 def test_finished_waits_for_subagents():
@@ -525,10 +527,11 @@ def _make_dot_daemon(tmp_path, monkeypatch):
         apns_key_path=tmp_path / "k.p8",
         apns_key_id="X",
         apns_team_id="Y",
+        port=0,
         summaries_enabled=False,
     )
     daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
-    daemon.tokens.register("device", "device-token", {"device": "phone"})
+    daemon.tokens.register("dot_device", "device-token", {"device": "phone"})
     return daemon
 
 
@@ -539,6 +542,30 @@ def _dot_state(mode="completed", active_count=0, updated_at=100.0):
         "agents": [],
         "updatedAt": updated_at,
     }
+
+
+def _post_json(daemon, path, payload):
+    import threading
+    from http.client import HTTPConnection
+
+    server = daemon._build_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request(
+            "POST",
+            path,
+            body=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_dot_rejection_stays_pending_and_accepted_delivery_retries_are_bounded(
@@ -585,7 +612,7 @@ def test_dot_rejection_stays_pending_and_accepted_delivery_retries_are_bounded(
 def test_dot_push_prefers_the_elected_dot_device(tmp_path, monkeypatch):
     daemon = _make_dot_daemon(tmp_path, monkeypatch)
     daemon.tokens.register("device", "other-phone", {"device": "iPad"})
-    daemon.tokens.register("dot_device", "dot-phone", {"device": "iPhone"})
+    daemon.tokens.replace("dot_device", "dot-phone", {"device": "iPhone"})
     tokens = []
 
     def send(token, payload, **kwargs):
@@ -598,6 +625,335 @@ def test_dot_push_prefers_the_elected_dot_device(tmp_path, monkeypatch):
     daemon._send_pending_dot_if_due(100.0)
 
     assert tokens == ["dot-phone"]
+
+
+def test_dot_push_does_not_fall_back_to_a_generic_device(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.tokens.clear("dot_device")
+    daemon.tokens.register("device", "generic-phone", {"device": "iPhone"})
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda *args, **kwargs: (sent.append(args[0]) or (200, "")),
+    )
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+
+    assert daemon._send_pending_dot_if_due(100.0) is False
+    assert sent == []
+
+
+def test_dot_unavailable_lease_suppresses_pushes_and_persists(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda *args, **kwargs: (sent.append(args[0]) or (200, "")),
+    )
+
+    assert daemon.report_dot_availability(
+        "device-token", False, "focus", 1.0, now=100.0
+    )
+    daemon._queue_dot_state("working", _dot_state("working", 1), now=100.0)
+    pending = daemon._pending_dot
+
+    assert daemon._send_pending_dot_if_due(159.9) is False
+    assert sent == []
+    assert daemon._pending_dot is pending
+    assert pending.accepted_attempts == 0
+    assert pending.rejected_attempts == 0
+    health = daemon._dot_health(now=100.0)
+    assert health["dotPendingState"] == "working"
+    assert health["dotPendingAttempts"] == 0
+    assert health["dotPendingRejected"] == 0
+    assert health["dotPendingCommand"] == pending.command_id[:8]
+    assert health["dotOutputAvailable"] is False
+    assert health["dotUnavailableReason"] == "focus"
+    assert health["dotRetryAfterSeconds"] == 60
+
+    persisted = TokenStore(tmp_path / "tok.json").entries("dot_device")["device-token"]
+    assert persisted["dot_unavailable_until"] == 160.0
+    assert persisted["dot_unavailable_reason"] == "focus"
+
+
+def test_expired_dot_lease_reissues_one_fresh_current_command(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **kwargs: (sent.append(payload) or (200, "")),
+    )
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    expired_command = daemon._pending_dot.command_id
+    daemon.report_dot_availability(
+        "device-token", False, "dnd", 60.0, now=100.0
+    )
+
+    assert daemon._send_pending_dot_if_due(159.9) is False
+    assert daemon._send_pending_dot_if_due(160.0) is True
+    assert len(sent) == 1
+    assert daemon._pending_dot.command_id != expired_command
+    assert sent[0]["dot"]["commandID"] == daemon._pending_dot.command_id
+    metadata = daemon.tokens.entries("dot_device")["device-token"]
+    assert "dot_unavailable_until" not in metadata
+    assert "dot_unavailable_reason" not in metadata
+
+
+def test_dot_availability_endpoint_requires_the_elected_owner_and_resyncs(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    old_command = daemon._pending_dot.command_id
+
+    status, body = _post_json(
+        daemon,
+        "/dot-availability",
+        {
+            "token": "stale-token",
+            "available": False,
+            "reason": "disconnected",
+            "retryAfterSeconds": 300,
+        },
+    )
+    assert status == 409
+    assert body == {"ok": False, "error": "not_dot_owner"}
+    assert daemon._dot_health()["dotOutputAvailable"] is True
+
+    status, body = _post_json(
+        daemon,
+        "/dot-availability",
+        {
+            "token": "device-token",
+            "available": False,
+            "reason": "brightness_zero",
+            "retryAfterSeconds": 300,
+        },
+    )
+    assert status == 200
+    assert body["dotOutputAvailable"] is False
+
+    daemon._wake.clear()
+    status, body = _post_json(
+        daemon,
+        "/dot-availability",
+        {"token": "device-token", "available": True},
+    )
+    assert status == 200
+    assert body["dotOutputAvailable"] is True
+    assert daemon._wake.is_set()
+    assert daemon._pending_dot.command_id != old_command
+
+
+def test_stale_dot_ack_cannot_change_availability(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon._queue_dot_state("done", _dot_state(), now=100.0)
+    stale_command = daemon._pending_dot.command_id
+    daemon._queue_dot_state(
+        "working", _dot_state("working", 1, 101.0), now=101.0
+    )
+    current_command = daemon._pending_dot.command_id
+    unavailable = {
+        "available": False,
+        "reason": "write_failed",
+        "retryAfterSeconds": 600,
+        "reportedAt": 200.0,
+    }
+
+    status, body = _post_json(
+        daemon,
+        "/dot-ack",
+        {"commandID": stale_command, "status": "failed", **unavailable},
+    )
+    assert status == 200
+    assert body == {"ok": True, "acknowledged": False}
+    assert daemon._dot_health()["dotOutputAvailable"] is True
+
+    status, body = _post_json(
+        daemon,
+        "/dot-ack",
+        {"commandID": current_command, "status": "failed", **unavailable},
+    )
+    assert status == 200
+    assert body == {"ok": True, "acknowledged": False}
+    assert daemon._dot_health()["dotOutputAvailable"] is False
+    assert daemon._pending_dot.command_id == current_command
+
+
+def test_dot_availability_rejects_malformed_reports(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    malformed = [
+        {"token": "device-token", "available": "false"},
+        {
+            "token": "device-token",
+            "available": False,
+            "reason": "unknown",
+            "retryAfterSeconds": 60,
+        },
+        {
+            "token": "device-token",
+            "available": False,
+            "reason": "focus",
+            "retryAfterSeconds": 0,
+        },
+        {"token": "device-token", "available": True, "reportedAt": "later"},
+    ]
+
+    for payload in malformed:
+        status, body = _post_json(daemon, "/dot-availability", payload)
+        assert status == 400
+        assert "error" in body
+    assert daemon._dot_health()["dotOutputAvailable"] is True
+
+
+def test_older_dot_availability_cannot_overwrite_a_newer_report(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    status, _ = _post_json(
+        daemon,
+        "/dot-availability",
+        {"token": "device-token", "available": True, "reportedAt": 200.0},
+    )
+    assert status == 200
+    status, body = _post_json(
+        daemon,
+        "/dot-availability",
+        {
+            "token": "device-token",
+            "available": False,
+            "reason": "focus",
+            "retryAfterSeconds": 600.0,
+            "reportedAt": 100.0,
+        },
+    )
+
+    assert status == 200
+    assert body["dotOutputAvailable"] is True
+    metadata = daemon.tokens.entries("dot_device")["device-token"]
+    assert metadata["dot_client_reported_at"] == 200.0
+    assert "dot_unavailable_until" not in metadata
+
+
+def test_legacy_dot_availability_uses_arrival_order_without_losing_timestamp(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    assert daemon.report_dot_availability(
+        "device-token", True, reported_at=200.0, now=100.0
+    )
+    assert daemon.report_dot_availability(
+        "device-token", False, "dnd", 600.0, now=101.0
+    )
+    assert daemon.report_dot_availability(
+        "device-token", True, reported_at=100.0, now=102.0
+    )
+
+    metadata = daemon.tokens.entries("dot_device")["device-token"]
+    assert metadata["dot_client_reported_at"] == 200.0
+    assert metadata["dot_unavailable_reason"] == "dnd"
+    assert metadata["dot_unavailable_until"] == 701.0
+
+
+def test_future_dot_report_cannot_poison_client_timestamp_ordering(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    assert daemon.report_dot_availability(
+        "device-token", True, reported_at=200.0, now=100.0
+    )
+    assert daemon.report_dot_availability(
+        "device-token",
+        False,
+        "focus",
+        600.0,
+        reported_at=10_000.0,
+        now=101.0,
+    )
+    assert daemon.report_dot_availability(
+        "device-token", True, reported_at=202.0, now=102.0
+    )
+
+    metadata = daemon.tokens.entries("dot_device")["device-token"]
+    assert metadata["dot_client_reported_at"] == 202.0
+    assert "dot_unavailable_until" not in metadata
+    assert "dot_unavailable_reason" not in metadata
+
+
+def test_dot_suppression_does_not_block_live_activity_pushes(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.tokens.register("update", "activity-token", {"activity_id": "a"})
+    daemon.tokens.register("push_to_start", "start-token", {"device": "phone"})
+    daemon.report_dot_availability(
+        "device-token", False, "focus", 600.0, now=100.0
+    )
+    daemon._queue_dot_state("working", _dot_state("working", 1), now=100.0)
+    sent = []
+
+    def send(token, payload, **kwargs):
+        sent.append((token, kwargs["push_type"]))
+        return 200, ""
+
+    monkeypatch.setattr(daemon.apns, "send", send)
+    assert daemon._send_pending_dot_if_due(100.0) is False
+    daemon._push_update(_dot_state("working", 1), now=100.0)
+    daemon._maybe_push_to_start(_dot_state("working", 1), now=100.0)
+
+    assert sent == [
+        ("activity-token", "liveactivity"),
+        ("start-token", "liveactivity"),
+    ]
+
+
+def test_activity_alerts_use_the_bundled_sound_for_each_kind(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    payloads = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: (payloads.append(payload) or True),
+    )
+    sounds = {
+        "completed": "AgentFinished.caf",
+        "waiting_for_input": "AgentNeedsInput.caf",
+        "blocked_error": "AgentBlocked.caf",
+    }
+
+    for index, (kind, sound) in enumerate(sounds.items()):
+        daemon._push_update(
+            _dot_state("working", 1),
+            now=100.0 + index,
+            alert={"kind": kind, "title": "Title", "body": "Body"},
+        )
+        assert payloads[-1]["aps"]["alert"]["sound"] == sound
+
+
+def test_deferred_finished_alert_preserves_its_kind(tmp_path, monkeypatch):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+
+    class Summarizer:
+        ready = False
+
+        def summary_for(self, *args, **kwargs):
+            return "Task; completed" if self.ready else None
+
+    summarizer = Summarizer()
+    daemon.summarizer = summarizer
+    alert = {
+        "kind": "completed",
+        "title": "Finished: Task",
+        "body": "Completed",
+        "thread_id": "group:codex:s1",
+    }
+
+    assert daemon._defer_finished_alerts([alert], [], now=100.0) == []
+    summarizer.ready = True
+    ready = daemon._defer_finished_alerts([], [], now=101.0)
+    assert ready[0]["kind"] == "completed"
 
 
 def test_dot_push_reports_unread_finished_rows_without_changing_public_mode(
@@ -1089,6 +1445,154 @@ def test_finished_rows_track_unread_until_marked_seen(tmp_path, monkeypatch):
     # The wire rows carry the flag for every surface.
     state = build_content_state([], "idle_ready", recent_finished=list(daemon._recent_finished.values()))
     assert state["agents"][0]["unread"] is False
+
+
+def _make_seen_endpoint_daemon(tmp_path, monkeypatch, *, unread=True, finished_at=100.25):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    row = {
+        "id": "codex:session:s1",
+        "name": "SidePulse: Test completion reads; completed",
+        "mode": "completed",
+        "provider": "codex",
+        "finishedAt": finished_at,
+        "unread": unread,
+    }
+    daemon._recent_finished = {row["id"]: row}
+    daemon._save_recent_finished()
+    daemon._latest = build_content_state([], "idle_ready", [row])
+    return daemon
+
+
+def _post_seen(daemon, payload):
+    return _post_json(daemon, "/seen", payload)
+
+
+def test_seen_endpoint_marks_exact_generation_and_refreshes_snapshot(
+    tmp_path, monkeypatch
+):
+    daemon = _make_seen_endpoint_daemon(tmp_path, monkeypatch)
+    previous_snapshot = daemon._latest
+
+    status, body = _post_seen(
+        daemon,
+        {"id": "codex:session:s1", "finishedAt": 100.25},
+    )
+
+    assert status == 200
+    assert body == {"ok": True, "marked": True}
+    assert daemon._recent_finished["codex:session:s1"]["unread"] is False
+    assert daemon._latest is not previous_snapshot
+    assert daemon._latest["agents"][0]["unread"] is False
+
+
+def test_seen_endpoint_is_idempotent_for_exact_read_generation(tmp_path, monkeypatch):
+    daemon = _make_seen_endpoint_daemon(tmp_path, monkeypatch, unread=False)
+
+    status, body = _post_seen(
+        daemon,
+        {"id": "codex:session:s1", "finishedAt": 100.25},
+    )
+
+    assert status == 200
+    assert body == {"ok": True, "marked": False}
+    assert daemon._recent_finished["codex:session:s1"]["unread"] is False
+
+
+def test_seen_endpoint_rejects_a_stale_completion_generation(tmp_path, monkeypatch):
+    daemon = _make_seen_endpoint_daemon(tmp_path, monkeypatch, finished_at=200.5)
+    previous_snapshot = daemon._latest
+
+    status, body = _post_seen(
+        daemon,
+        {"id": "codex:session:s1", "finishedAt": 100.25},
+    )
+
+    assert status == 409
+    assert body == {"ok": False, "error": "stale_completion"}
+    assert daemon._recent_finished["codex:session:s1"]["unread"] is True
+    assert daemon._latest is previous_snapshot
+
+
+def test_seen_endpoint_keeps_legacy_id_only_requests_compatible(tmp_path, monkeypatch):
+    daemon = _make_seen_endpoint_daemon(tmp_path, monkeypatch)
+
+    status, body = _post_seen(daemon, {"id": "codex:session:s1"})
+
+    assert status == 200
+    assert body == {"ok": True, "marked": True}
+    assert daemon._recent_finished["codex:session:s1"]["unread"] is False
+
+
+def test_tick_cannot_resurrect_unread_after_completion_is_seen(
+    tmp_path, monkeypatch
+):
+    import threading
+    import types
+
+    import sidepulse.live_activity as live_activity
+
+    daemon = _make_seen_endpoint_daemon(tmp_path, monkeypatch)
+    daemon.monitor = types.SimpleNamespace(
+        snapshot=lambda include_stale=False: types.SimpleNamespace(
+            statuses=[], aggregate=types.SimpleNamespace(mode=AgentMode.IDLE_READY)
+        )
+    )
+    real_build = live_activity.build_content_state
+    build_started = threading.Event()
+    release_build = threading.Event()
+
+    def blocked_build(*args, **kwargs):
+        state = real_build(*args, **kwargs)
+        build_started.set()
+        if not release_build.wait(timeout=5):
+            raise TimeoutError("test did not release content-state build")
+        return state
+
+    monkeypatch.setattr(live_activity, "build_content_state", blocked_build)
+    errors = []
+
+    def tick():
+        try:
+            daemon._tick()
+        except BaseException as exc:
+            errors.append(exc)
+
+    tick_thread = threading.Thread(target=tick)
+    tick_thread.start()
+    assert build_started.wait(timeout=2)
+
+    # Before the fix the tick released this lock after copying unread=true,
+    # allowing /seen to publish unread=false before the stale tick overwrote it.
+    acquired_between_copy_and_publish = daemon._recent_finished_lock.acquire(
+        blocking=False
+    )
+    if acquired_between_copy_and_publish:
+        try:
+            assert daemon.mark_finished_seen(
+                "codex:session:s1", 100.25
+            ) is True
+        finally:
+            daemon._recent_finished_lock.release()
+
+    release_build.set()
+    tick_thread.join(timeout=2)
+    assert not tick_thread.is_alive()
+    assert errors == []
+    if not acquired_between_copy_and_publish:
+        assert daemon.mark_finished_seen("codex:session:s1", 100.25) is True
+
+    assert daemon._recent_finished["codex:session:s1"]["unread"] is False
+    assert daemon._latest["agents"][0]["unread"] is False
 
 
 def test_publish_summary_writes_hook_records(tmp_path, monkeypatch):

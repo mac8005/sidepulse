@@ -5,12 +5,18 @@ import UIKit
 /// network / Tailscale while the app is in the foreground. The stream is
 /// owned by `DotStatusMirror`, which drives a plugged-in Dot from it.
 struct AgentsLiveView: View {
+    private struct SeenAcknowledgement: Decodable {
+        let ok: Bool
+        let marked: Bool
+    }
+
     @ObservedObject var model: AppModel
     @ObservedObject private var stream = DotStatusMirror.shared.stream
     /// Completions tapped this app session, keyed by the row's finish time
     /// so the dimming applies only to the completion the user actually
     /// opened — a session that finishes another turn re-arms as unread.
     @State private var locallySeen: [String: Double] = [:]
+    @State private var dotSettingsExpanded = false
 
     var body: some View {
         List {
@@ -37,8 +43,10 @@ struct AgentsLiveView: View {
                 }
             }
 
-            Section("SidePulse Dot") {
-                DotBehaviorControls(model: model)
+            Section {
+                DisclosureGroup("Dot settings", isExpanded: $dotSettingsExpanded) {
+                    DotBehaviorControls(model: model)
+                }
             }
         }
         .navigationTitle("Mac Agents")
@@ -59,23 +67,44 @@ struct AgentsLiveView: View {
     private func markSeen(_ agent: AgentSnapshot.Agent) {
         guard isUnread(agent), let finishedAt = agent.finishedAt else { return }
         locallySeen[agent.id] = finishedAt
-        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("seen") else {
+        guard
+            let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("seen"),
+            let body = try? JSONSerialization.data(
+                withJSONObject: ["id": agent.id, "finishedAt": finishedAt]
+            )
+        else {
+            rollBackSeen(id: agent.id, finishedAt: finishedAt)
             return
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": agent.id])
+        request.httpBody = body
         request.timeoutInterval = 10
         Task {
             // The daemon owns this state. If it never heard the tap, drop the
             // local override rather than showing "read" over a row every
             // other surface still reports as unread.
-            let ok = (try? await URLSession.shared.data(for: request))
-                .map { ($0.1 as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false }
-                ?? false
-            if !ok { locallySeen[agent.id] = nil }
+            var acknowledged = false
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse,
+                   (200..<300).contains(httpResponse.statusCode),
+                   let receipt = try? JSONDecoder().decode(SeenAcknowledgement.self, from: data) {
+                    acknowledged = receipt.ok
+                    _ = receipt.marked // false is the valid idempotent response.
+                }
+            } catch {}
+
+            if !acknowledged {
+                rollBackSeen(id: agent.id, finishedAt: finishedAt)
+            }
         }
+    }
+
+    private func rollBackSeen(id: String, finishedAt: Double) {
+        guard locallySeen[id] == finishedAt else { return }
+        locallySeen[id] = nil
     }
 
     @ViewBuilder

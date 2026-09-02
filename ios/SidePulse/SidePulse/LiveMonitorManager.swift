@@ -1,8 +1,39 @@
 import Foundation
+import Combine
 import UserNotifications
 #if canImport(ActivityKit)
 import ActivityKit
 #endif
+
+private struct DotAvailabilityReportSignature: Equatable {
+    let serverURL: String
+    let token: String
+    let availability: DotAvailability
+}
+
+private struct DotAvailabilityReport {
+    let signature: DotAvailabilityReportSignature
+    let reportedAt: TimeInterval
+}
+
+private struct QueuedDotAvailabilityReport {
+    let report: DotAvailabilityReport
+    let force: Bool
+}
+
+private enum DotAvailabilitySubmitResult {
+    case accepted
+    case notOwner
+    case failed
+}
+
+private struct DotDeviceRegistrationRequest {
+    let key: String
+    let serverURL: String
+    let token: Data
+    let tokenHex: String
+    let model: AppModel
+}
 
 /// Bridges ActivityKit tokens to the `sidepulse live-activity` daemon.
 ///
@@ -21,6 +52,14 @@ final class LiveMonitorManager: ObservableObject {
     private var observedActivityIDs: Set<String> = []
     private var selectedActivityID: String?
     private var intentionallyEndedActivityIDs: Set<String> = []
+    private var registeredDotDeviceKey: String?
+    private var pendingDotDeviceRegistration: DotDeviceRegistrationRequest?
+    private var dotDeviceRegistrationRunning = false
+    private var dotRegistrationCancellable: AnyCancellable?
+    private var latestDotAvailabilityReport: DotAvailabilityReport?
+    private var pendingDotAvailabilityReport: QueuedDotAvailabilityReport?
+    private var lastSubmittedDotAvailability: DotAvailabilityReportSignature?
+    private var dotAvailabilityReporterRunning = false
 
     var isSupported: Bool {
         if #available(iOS 17.2, *) { return true }
@@ -83,13 +122,100 @@ final class LiveMonitorManager: ObservableObject {
     /// On a fresh install the APNs token arrives after `start`; the daemon
     /// needs it for the Dot mirror's silent pushes.
     func registerDeviceToken(_ token: Data, model: AppModel) {
+        if model.hasFolderAccess {
+            ensureDotDeviceRegistration(token: token, model: model)
+        }
         guard model.liveMonitorEnabled else { return }
         Task {
-            if model.hasFolderAccess {
-                await register(kind: "dot_device", token: token, model: model)
-            }
             await register(kind: "device", token: token, model: model)
         }
+    }
+
+    func observeDotDeviceRegistration(model: AppModel) {
+        guard dotRegistrationCancellable == nil else { return }
+        dotRegistrationCancellable = model.$hasFolderAccess
+            .removeDuplicates()
+            .sink { [weak self] hasFolder in
+                guard hasFolder else { return }
+                MainActor.assumeIsolated {
+                    self?.ensureDotDeviceRegistration(model: model)
+                }
+            }
+    }
+
+    /// Selecting the Dot folder can happen long after APNs supplied its
+    /// token. Register that saved token at the moment the folder becomes
+    /// usable, independently of the Live Activity setting.
+    func ensureDotDeviceRegistration(model: AppModel) {
+        guard model.hasFolderAccess,
+              !model.pushToken.isEmpty,
+              let token = Data(hexString: model.pushToken)
+        else { return }
+        ensureDotDeviceRegistration(token: token, model: model)
+    }
+
+    private func ensureDotDeviceRegistration(token: Data, model: AppModel) {
+        let tokenHex = token.map { String(format: "%02x", $0) }.joined()
+        let serverURL = model.liveMonitorServerURL
+        let key = dotDeviceKey(serverURL: serverURL, token: tokenHex)
+        guard registeredDotDeviceKey != key else { return }
+        if pendingDotDeviceRegistration?.key != key {
+            pendingDotDeviceRegistration = DotDeviceRegistrationRequest(
+                key: key,
+                serverURL: serverURL,
+                token: token,
+                tokenHex: tokenHex,
+                model: model
+            )
+        }
+        guard !dotDeviceRegistrationRunning else { return }
+        dotDeviceRegistrationRunning = true
+        Task { await drainDotDeviceRegistrations() }
+    }
+
+    private func drainDotDeviceRegistrations() async {
+        while let registration = pendingDotDeviceRegistration {
+            pendingDotDeviceRegistration = nil
+            guard isCurrent(registration) else { continue }
+            let registered = await register(
+                kind: "dot_device",
+                token: registration.token,
+                model: registration.model,
+                serverURL: registration.serverURL,
+                isStillCurrent: { self.isCurrent(registration) },
+                updatesStatus: false
+            )
+            // APNs can replace a persisted token while the old registration
+            // is in flight. Since registrations are serialized, a queued
+            // current token always runs last and remains the elected owner.
+            guard registered, isCurrent(registration) else { continue }
+            registeredDotDeviceKey = registration.key
+
+            // Availability and registration use separate HTTP requests. A
+            // forced current report after registration closes either
+            // response-ordering race; it is serialized with other reports.
+            if let latestDotAvailabilityReport,
+               dotDeviceKey(
+                   serverURL: latestDotAvailabilityReport.signature.serverURL,
+                   token: latestDotAvailabilityReport.signature.token
+               ) == registration.key
+            {
+                enqueueDotAvailability(
+                    DotAvailabilityReport(
+                        signature: latestDotAvailabilityReport.signature,
+                        reportedAt: Date().timeIntervalSince1970
+                    ),
+                    force: true
+                )
+            }
+        }
+        dotDeviceRegistrationRunning = false
+    }
+
+    private func isCurrent(_ registration: DotDeviceRegistrationRequest) -> Bool {
+        registration.model.hasFolderAccess
+            && registration.model.pushToken == registration.tokenHex
+            && registration.model.liveMonitorServerURL == registration.serverURL
     }
 
     /// Keep exactly one activity: the freshest. Older ones are orphans whose
@@ -234,7 +360,12 @@ final class LiveMonitorManager: ObservableObject {
     /// Confirms the daemon's current Dot command only after the app applied
     /// it. If this request is lost, the daemon's bounded retry delivers the
     /// same command again and the app acknowledges it idempotently.
-    func acknowledgeDot(commandID: String, status: String, model: AppModel) async {
+    func acknowledgeDot(
+        commandID: String,
+        status: String,
+        availability: DotAvailability,
+        model: AppModel
+    ) async {
         guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("dot-ack") else {
             EventLog.append("Dot ACK failed: invalid server URL")
             model.refreshEventLog()
@@ -243,10 +374,16 @@ final class LiveMonitorManager: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+        var payload: [String: Any] = [
             "commandID": commandID,
             "status": status,
-        ])
+        ]
+        addDotAvailability(
+            availability,
+            reportedAt: Date().timeIntervalSince1970,
+            to: &payload
+        )
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = 8
 
         for attempt in 1...2 {
@@ -269,6 +406,120 @@ final class LiveMonitorManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         model.refreshEventLog()
+    }
+
+    /// Reports foreground Dot write results without extending an unchanged
+    /// suppression lease every time the 15-second mirror timer fires.
+    func reportDotAvailability(_ availability: DotAvailability, model: AppModel) {
+        let token = model.pushToken
+        guard !token.isEmpty,
+              URL(string: model.liveMonitorServerURL) != nil
+        else { return }
+
+        if model.hasFolderAccess {
+            ensureDotDeviceRegistration(model: model)
+        }
+        let report = DotAvailabilityReport(
+            signature: DotAvailabilityReportSignature(
+                serverURL: model.liveMonitorServerURL,
+                token: token,
+                availability: availability
+            ),
+            reportedAt: Date().timeIntervalSince1970
+        )
+        latestDotAvailabilityReport = report
+        enqueueDotAvailability(report)
+    }
+
+    private func enqueueDotAvailability(_ report: DotAvailabilityReport, force: Bool = false) {
+        // A forced post-registration submission belongs to the newest state,
+        // even if that state changes while another report is in flight.
+        let shouldForce = force || pendingDotAvailabilityReport?.force == true
+        if !dotAvailabilityReporterRunning,
+           !shouldForce,
+           report.signature == lastSubmittedDotAvailability {
+            return
+        }
+        pendingDotAvailabilityReport = QueuedDotAvailabilityReport(
+            report: report,
+            force: shouldForce
+        )
+        guard !dotAvailabilityReporterRunning else { return }
+        dotAvailabilityReporterRunning = true
+        Task { await drainDotAvailabilityReports() }
+    }
+
+    private func drainDotAvailabilityReports() async {
+        while let queued = pendingDotAvailabilityReport {
+            pendingDotAvailabilityReport = nil
+            let report = queued.report
+            if !queued.force, report.signature == lastSubmittedDotAvailability {
+                continue
+            }
+            let result = await submitDotAvailability(report)
+            switch result {
+            case .accepted, .notOwner:
+                lastSubmittedDotAvailability = report.signature
+            case .failed:
+                break
+            }
+        }
+        dotAvailabilityReporterRunning = false
+    }
+
+    private func submitDotAvailability(_ report: DotAvailabilityReport) async -> DotAvailabilitySubmitResult {
+        guard let url = URL(string: report.signature.serverURL)?.appendingPathComponent("dot-availability") else {
+            return .failed
+        }
+        var payload: [String: Any] = ["token": report.signature.token]
+        addDotAvailability(
+            report.signature.availability,
+            reportedAt: report.reportedAt,
+            to: &payload
+        )
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        request.timeoutInterval = 8
+
+        for attempt in 1...2 {
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(code) {
+                    return .accepted
+                }
+                if code == 409 {
+                    return .notOwner
+                }
+            } catch {
+                // A second bounded attempt covers a transient Tailscale or
+                // network wake without creating a long-running background job.
+            }
+            guard attempt == 1 else { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return .failed
+    }
+
+    private func addDotAvailability(
+        _ availability: DotAvailability,
+        reportedAt: TimeInterval,
+        to payload: inout [String: Any]
+    ) {
+        payload["available"] = availability.available
+        payload["reportedAt"] = reportedAt
+        if availability.available {
+            return
+        }
+        payload["reason"] = availability.reason
+        payload["retryAfterSeconds"] = availability.retryAfterSeconds
+    }
+
+    private func dotDeviceKey(serverURL: String, token: String) -> String {
+        "\(serverURL)|\(token)"
     }
 
     @available(iOS 17.2, *)
@@ -330,18 +581,26 @@ final class LiveMonitorManager: ObservableObject {
         }
     }
 
+    @discardableResult
     private func register(
         kind: String,
         token: Data,
         model: AppModel,
         activityID: String? = nil,
-        activityObservedAt: TimeInterval? = nil
-    ) async {
-        if kind == "update", selectedActivityID != activityID { return }
+        activityObservedAt: TimeInterval? = nil,
+        serverURL: String? = nil,
+        isStillCurrent: (() -> Bool)? = nil,
+        updatesStatus: Bool = true
+    ) async -> Bool {
+        if kind == "update", selectedActivityID != activityID { return false }
+        if let isStillCurrent, !isStillCurrent() { return false }
         let tokenHex = token.map { String(format: "%02x", $0) }.joined()
-        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("register") else {
-            statusMessage = "Invalid server URL"
-            return
+        let targetServerURL = serverURL ?? model.liveMonitorServerURL
+        guard let url = URL(string: targetServerURL)?.appendingPathComponent("register") else {
+            if updatesStatus {
+                statusMessage = "Invalid server URL"
+            }
+            return false
         }
         var payload: [String: Any] = [
             "kind": kind,
@@ -362,24 +621,32 @@ final class LiveMonitorManager: ObservableObject {
         // retries with backoff before giving up.
         var delay: UInt64 = 2
         for attempt in 1...5 {
-            if kind == "update", selectedActivityID != activityID { return }
+            if kind == "update", selectedActivityID != activityID { return false }
+            if let isStillCurrent, !isStillCurrent() { return false }
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (200..<300).contains(code) {
-                    statusMessage = kind == "push_to_start"
-                        ? "Registered — the Mac can now start the Live Activity"
-                        : "Live Activity connected"
-                    return
+                    if updatesStatus {
+                        statusMessage = kind == "push_to_start"
+                            ? "Registered — the Mac can now start the Live Activity"
+                            : "Live Activity connected"
+                    }
+                    return true
                 }
-                statusMessage = "Server error \(code) registering \(kind) token"
+                if updatesStatus {
+                    statusMessage = "Server error \(code) registering \(kind) token"
+                }
             } catch {
-                statusMessage = "Cannot reach server: \(error.localizedDescription)"
+                if updatesStatus {
+                    statusMessage = "Cannot reach server: \(error.localizedDescription)"
+                }
             }
-            guard attempt < 5 else { return }
+            guard attempt < 5 else { return false }
             try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
             delay *= 2
         }
+        return false
     }
 
     private func deviceName() async -> String {

@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // a push-to-start launches the app in the background with no scene,
         // and the update token must still be captured and uploaded.
         Task { @MainActor in
+            LiveMonitorManager.shared.observeDotDeviceRegistration(model: AppModel.shared)
             LiveMonitorManager.shared.startIfEnabled(model: AppModel.shared)
             WatchRelay.shared.activate()
         }
@@ -176,7 +177,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
 
         let fetchResult: UIBackgroundFetchResult
-        switch result {
+        switch result.result {
         case .written:
             fetchResult = .newData
         case .alreadyCurrent:
@@ -195,6 +196,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             await LiveMonitorManager.shared.acknowledgeDot(
                 commandID: commandID,
                 status: result.acknowledgementStatus,
+                availability: result.availability,
                 model: AppModel.shared
             )
             completion(fetchResult)

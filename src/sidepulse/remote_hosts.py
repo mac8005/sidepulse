@@ -12,6 +12,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, TextIO
+from urllib.parse import urlparse
 
 from .hook import write_hook_line
 from .ipc import send_hook_event
@@ -25,11 +26,38 @@ REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _REMOTE_DEEP_LINKS = None
 
 
+def normalize_monitor_url(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("Monitor URL must be an HTTP or HTTPS URL.")
+    parsed = urlparse(value)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Monitor URL has an invalid port.") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Monitor URL must be an HTTP or HTTPS server URL without a path, query, or login."
+        )
+    return value.rstrip("/")
+
+
 @dataclass(frozen=True)
 class RemoteHost:
     name: str
     ssh_target: str
     providers: tuple[str, ...] = DEFAULT_REMOTE_PROVIDERS
+    monitor_url: str | None = None
 
     def __post_init__(self) -> None:
         if not REMOTE_NAME_PATTERN.fullmatch(self.name):
@@ -49,13 +77,17 @@ class RemoteHost:
         invalid = tuple(provider for provider in self.providers if provider not in HOOK_PROVIDERS)
         if invalid:
             raise ValueError(f"Unsupported remote provider: {invalid[0]}")
+        object.__setattr__(self, "monitor_url", normalize_monitor_url(self.monitor_url))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "name": self.name,
             "ssh_target": self.ssh_target,
             "providers": list(self.providers),
         }
+        if self.monitor_url:
+            result["monitor_url"] = self.monitor_url
+        return result
 
 
 def default_remote_config_path(home: Path | None = None) -> Path:
@@ -82,11 +114,15 @@ def load_remote_hosts(path: Path | None = None) -> tuple[RemoteHost, ...]:
         providers = item.get("providers", DEFAULT_REMOTE_PROVIDERS)
         if not isinstance(providers, list) or not all(isinstance(value, str) for value in providers):
             continue
+        monitor_url = item.get("monitor_url")
+        if monitor_url is not None and not isinstance(monitor_url, str):
+            continue
         try:
             host = RemoteHost(
                 name=str(item.get("name") or ""),
                 ssh_target=str(item.get("ssh_target") or ""),
                 providers=tuple(dict.fromkeys(providers)),
+                monitor_url=monitor_url,
             )
         except ValueError:
             continue
