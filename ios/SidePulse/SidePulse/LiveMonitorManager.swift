@@ -76,6 +76,13 @@ final class LiveMonitorManager: ObservableObject {
         }
     }
 
+    /// On a fresh install the APNs token arrives after `start`; the daemon
+    /// needs it for the Dot mirror's silent pushes.
+    func registerDeviceToken(_ token: Data, model: AppModel) {
+        guard model.liveMonitorEnabled else { return }
+        Task { await register(kind: "device", token: token, model: model) }
+    }
+
     /// Keep exactly one activity: the freshest. Older ones are orphans whose
     /// tokens the daemon no longer has, so only the app can end them. With
     /// none left, tell the daemon so it can start a fresh one.

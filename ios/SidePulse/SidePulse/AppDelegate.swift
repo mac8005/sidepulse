@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     ) {
         Task { @MainActor in
             AppModel.shared.setPushToken(from: deviceToken)
+            LiveMonitorManager.shared.registerDeviceToken(deviceToken, model: AppModel.shared)
         }
     }
 
@@ -50,6 +51,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        // The daemon's Dot mirror push: rewrite LEDS.LED and go back to sleep.
+        if let mode = (userInfo["dot"] as? [String: Any])?["aggregateMode"] as? String {
+            let written = MainActor.assumeIsolated {
+                DotStatusMirror.shared.applyPush(aggregateMode: mode, model: AppModel.shared)
+            }
+            completionHandler(written ? .newData : .noData)
+            return
+        }
         let didHandle = processNotification(userInfo, source: "Background push")
         completionHandler(didHandle ? .newData : .failed)
     }
@@ -85,6 +94,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     @discardableResult
     private func processNotification(_ userInfo: [AnyHashable: Any], source: String) -> Bool {
+        // A Dot push that launched the app is delivered to
+        // didReceiveRemoteNotification as well; it is not inbox material.
+        if userInfo["dot"] != nil {
+            return true
+        }
         let keys = userInfo.keys.map { String(describing: $0) }.sorted().joined(separator: ",")
         EventLog.append("\(source) received; keys=[\(keys)]")
 

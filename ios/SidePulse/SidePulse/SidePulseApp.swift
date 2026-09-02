@@ -13,13 +13,13 @@ struct SidePulseApp: App {
                 }
         }
         .onChange(of: scenePhase) { phase in
-            // The Dot mirror runs while the app is in front and, if enabled,
-            // keeps the process alive in the background (see DotKeepalive).
+            // The Dot mirror streams while the app is in front; in the
+            // background the Mac's silent pushes drive it (DotStatusMirror).
             switch phase {
             case .active:
                 DotStatusMirror.shared.start(model: AppModel.shared)
             case .background:
-                DotStatusMirror.shared.background()
+                DotStatusMirror.shared.suspend()
             default:
                 break
             }

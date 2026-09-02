@@ -1,4 +1,3 @@
-import AVFoundation
 import Combine
 import Foundation
 import Intents
@@ -128,11 +127,11 @@ enum DndSchedule {
 /// working → rolling cyan (or the KITT scanner), done → green, needs input →
 /// amber pulse, DND → off. Optionally an active iOS Focus counts as DND too.
 ///
-/// iOS only lets the app write to the drive while the process is running.
-/// By default `DotKeepalive` holds the process open after the user switches
-/// away so the Dot keeps following the agents like the Live Activity does;
-/// with that option off the mirror stops on scene-background and turns the
-/// Dot off on the way out rather than leaving a stale state glowing.
+/// In the foreground the daemon's SSE stream feeds it. iOS only lets the app
+/// write to the drive while the process runs, so once the user switches away
+/// the daemon sends a silent push whenever the display state changes; iOS
+/// wakes the app for a few seconds and `applyPush` writes the Dot, the way
+/// the Live Activity is kept current.
 @MainActor
 final class DotStatusMirror: ObservableObject {
     static let shared = DotStatusMirror()
@@ -153,9 +152,6 @@ final class DotStatusMirror: ObservableObject {
     /// (and by the 15 s timer).
     private var focusActive = false
     private var focusAuthorizationRequested = false
-    /// True between scene-background and the next scene-active while the
-    /// keepalive is holding the process open.
-    private var inBackground = false
     /// Matches `AgentLedController.error_retry_seconds` on the Mac.
     private let errorRetrySeconds: TimeInterval = 10
     /// Matches `STATUS_BAR_REFRESH_SECONDS`, which is how often the Mac
@@ -163,7 +159,6 @@ final class DotStatusMirror: ObservableObject {
     private let scheduleCheckSeconds: TimeInterval = 15
 
     func start(model: AppModel) {
-        inBackground = false
         guard self.model == nil else { return }
         self.model = model
         model.applyDueDndSchedule()
@@ -177,7 +172,6 @@ final class DotStatusMirror: ObservableObject {
             model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$focusDndEnabled.map { _ in () }.eraseToAnyPublisher(),
-            model.$dotBackgroundEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$hasFolderAccess.map { _ in () }.eraseToAnyPublisher(),
         ]
         Publishers.MergeMany(triggers)
@@ -197,39 +191,47 @@ final class DotStatusMirror: ObservableObject {
         sync()
     }
 
-    /// Scene-background: keep going if the keepalive is holding the process
-    /// open, otherwise stop and turn the Dot off.
-    func background() {
-        guard DotKeepalive.shared.isRunning else {
-            suspend()
-            return
-        }
-        inBackground = true
-    }
-
+    /// Scene-background: drop the stream and timer. The Dot keeps its last
+    /// state; from here on the Mac's pushes update it.
     func suspend() {
-        DotKeepalive.shared.stop()
-        inBackground = false
         guard model != nil else { return }
         cancellables.removeAll()
         scheduleTimer?.invalidate()
         scheduleTimer = nil
         stream.stop()
-        if let lastProgram, lastProgram != DotPrograms.off {
-            try? DriveWriter.shared.write(DotPrograms.off)
-        }
-        lastProgram = nil
         lastError = nil
         focusActive = false
         model = nil
-        statusText = "Off"
+    }
+
+    /// Silent push from the daemon (`dot` payload). The app may have been
+    /// launched for it with no scene, so everything needed is read here.
+    /// Returns false when the Dot could not be written.
+    @discardableResult
+    func applyPush(aggregateMode: String, model: AppModel) -> Bool {
+        // In front the stream is authoritative.
+        guard self.model == nil else { return true }
+        guard model.hasFolderAccess else { return false }
+        model.applyDueDndSchedule()
+        // No prompting from the background: an unanswered request reads as
+        // "no Focus" until the app is opened again.
+        refreshFocusStatus(model: model, allowPrompt: false)
+        let resolved = resolve(mode: aggregateMode, unreachable: false, model: model)
+        let written = write(
+            DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled),
+            label: resolved.label
+        )
+        if !written, let lastError {
+            EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError)")
+        }
+        return written
     }
 
     /// Focus status needs the user's one-time consent (system prompt) and, per
     /// Focus, "Share Focus Status" enabled in iOS Settings; anything else
     /// reads as "no Focus".
-    private func refreshFocusStatus() {
-        guard let model, model.focusDndEnabled else {
+    private func refreshFocusStatus(model: AppModel, allowPrompt: Bool) {
+        guard model.focusDndEnabled else {
             focusActive = false
             return
         }
@@ -239,7 +241,7 @@ final class DotStatusMirror: ObservableObject {
             focusActive = center.focusStatus.isFocused ?? false
         case .notDetermined:
             focusActive = false
-            guard !focusAuthorizationRequested else { return }
+            guard allowPrompt, !focusAuthorizationRequested else { return }
             focusAuthorizationRequested = true
             center.requestAuthorization { [weak self] _ in
                 DispatchQueue.main.async {
@@ -265,50 +267,48 @@ final class DotStatusMirror: ObservableObject {
         guard let model else { return }
         // Before the folder check so switching the option on asks for Focus
         // access right away.
-        refreshFocusStatus()
+        refreshFocusStatus(model: model, allowPrompt: true)
         guard model.hasFolderAccess else {
-            DotKeepalive.shared.stop()
             lastProgram = nil
             statusText = "No SidePulse Dot folder selected"
             return
         }
-        // Armed while the app is still in front so it is already running when
-        // the scene goes to the background.
-        if !inBackground {
-            if model.dotBackgroundEnabled {
-                DotKeepalive.shared.start()
-            } else {
-                DotKeepalive.shared.stop()
-            }
-        }
 
-        let state: LedDisplayState
-        var label: String
-        if model.dndEnabled {
-            state = .idle
-            label = "DND on — Dot off"
-        } else if focusActive {
-            state = .idle
-            label = "iOS Focus on — Dot off"
-        } else if case .failed = stream.state {
-            state = .idle
-            label = "Mac unreachable — Dot off"
-        } else {
-            state = stream.snapshot.map { LedDisplayState.forMode($0.aggregateMode) } ?? .idle
-            label = state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label
-        }
+        var unreachable = false
+        if case .failed = stream.state { unreachable = true }
+        let resolved = resolve(mode: stream.snapshot?.aggregateMode, unreachable: unreachable, model: model)
+        var label = resolved.label
         if let focusAccessHint {
             label += focusAccessHint
         }
-        let program = DotPrograms.program(for: state, kittMode: model.kittModeEnabled)
+        write(DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled), label: label)
+    }
 
+    private func resolve(mode: String?, unreachable: Bool, model: AppModel) -> (state: LedDisplayState, label: String) {
+        if model.dndEnabled {
+            return (.idle, "DND on — Dot off")
+        }
+        if focusActive {
+            return (.idle, "iOS Focus on — Dot off")
+        }
+        if unreachable {
+            return (.idle, "Mac unreachable — Dot off")
+        }
+        let state = mode.map(LedDisplayState.forMode) ?? .idle
+        return (state, state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label)
+    }
+
+    /// Writes only when the program changes, or when retrying a failed write
+    /// after the back-off. Returns true when the Dot shows `program`.
+    @discardableResult
+    private func write(_ program: String, label: String) -> Bool {
         if program == lastProgram {
             if lastError == nil {
                 statusText = label
-                return
+                return true
             }
             if Date().timeIntervalSince(lastAttempt) < errorRetrySeconds {
-                return
+                return false
             }
         }
 
@@ -318,92 +318,11 @@ final class DotStatusMirror: ObservableObject {
             try DriveWriter.shared.write(program)
             lastError = nil
             statusText = label
+            return true
         } catch {
             lastError = error.localizedDescription
             statusText = "Dot write failed: \(error.localizedDescription)"
-            if inBackground {
-                // Almost certainly the Dot was unplugged; don't hold the
-                // process open for nothing.
-                EventLog.append("Dot write failed in background, stopping mirror: \(error.localizedDescription)")
-                suspend()
-            }
+            return false
         }
     }
-}
-
-/// Loops a silent track so iOS keeps the app running after the user
-/// switches away — the one route a plain app has to keep writing to a USB
-/// drive from the background. Mixes with other audio and puts nothing in
-/// Now Playing.
-@MainActor
-final class DotKeepalive {
-    static let shared = DotKeepalive()
-
-    private var player: AVAudioPlayer?
-    private var interruptionObserver: NSObjectProtocol?
-
-    var isRunning: Bool { player != nil }
-
-    func start() {
-        guard player == nil else { return }
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try session.setActive(true)
-            let player = try AVAudioPlayer(data: Self.silence, fileTypeHint: AVFileType.wav.rawValue)
-            player.numberOfLoops = -1
-            player.play()
-            self.player = player
-        } catch {
-            EventLog.append("Dot keepalive failed: \(error.localizedDescription)")
-            return
-        }
-        // A phone call or Siri pauses the player; pick it up again afterwards.
-        interruptionObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
-        ) { [weak self] note in
-            let rawType = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            guard rawType.flatMap(AVAudioSession.InterruptionType.init) == .ended else { return }
-            MainActor.assumeIsolated {
-                try? AVAudioSession.sharedInstance().setActive(true)
-                self?.player?.play()
-            }
-        }
-    }
-
-    func stop() {
-        guard let player else { return }
-        player.stop()
-        self.player = nil
-        if let interruptionObserver {
-            NotificationCenter.default.removeObserver(interruptionObserver)
-            self.interruptionObserver = nil
-        }
-        try? AVAudioSession.sharedInstance().setActive(false)
-    }
-
-    /// One second of 8 kHz 16-bit mono PCM silence as a WAV file.
-    private static let silence: Data = {
-        let sampleRate: UInt32 = 8000
-        let dataSize = sampleRate * 2
-        var wav = Data()
-        func append<T: FixedWidthInteger>(_ value: T) {
-            withUnsafeBytes(of: value.littleEndian) { wav.append(contentsOf: $0) }
-        }
-        wav.append(contentsOf: "RIFF".utf8)
-        append(UInt32(36 + dataSize))
-        wav.append(contentsOf: "WAVE".utf8)
-        wav.append(contentsOf: "fmt ".utf8)
-        append(UInt32(16))          // PCM header length
-        append(UInt16(1))           // PCM
-        append(UInt16(1))           // mono
-        append(sampleRate)
-        append(sampleRate * 2)      // byte rate
-        append(UInt16(2))           // block align
-        append(UInt16(16))          // bits per sample
-        wav.append(contentsOf: "data".utf8)
-        append(dataSize)
-        wav.append(Data(count: Int(dataSize)))
-        return wav
-    }()
 }

@@ -71,12 +71,6 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(focusDndEnabled, forKey: Defaults.focusDndEnabled) }
     }
 
-    /// Keep driving the Dot after the app leaves the foreground (see
-    /// `DotKeepalive`). On by default so the Dot behaves like the Live Activity.
-    @Published var dotBackgroundEnabled: Bool {
-        didSet { UserDefaults.standard.set(dotBackgroundEnabled, forKey: Defaults.dotBackgroundEnabled) }
-    }
-
     @Published var lastMessage: String = "Ready"
     @Published var eventLog: [String] = []
     @Published var receivedPushes: [ReceivedPush] {
@@ -98,7 +92,6 @@ final class AppModel: ObservableObject {
         static let dndEndTime = "dndEndTime"
         static let dndLastScheduleTransition = "dndLastScheduleTransition"
         static let focusDndEnabled = "focusDndEnabled"
-        static let dotBackgroundEnabled = "dotBackgroundEnabled"
     }
 
     private init() {
@@ -120,7 +113,6 @@ final class AppModel: ObservableObject {
         self.dndEndTime = UserDefaults.standard.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
         self.dndLastScheduleTransition = UserDefaults.standard.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
         self.focusDndEnabled = UserDefaults.standard.bool(forKey: Defaults.focusDndEnabled)
-        self.dotBackgroundEnabled = UserDefaults.standard.object(forKey: Defaults.dotBackgroundEnabled) as? Bool ?? true
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
         refreshFolderStatus()

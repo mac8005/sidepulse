@@ -37,6 +37,7 @@ from uuid import UUID
 from .collector import AgentMonitor
 from .ipc import HookEventServer
 from .hook import write_hook_line
+from .led_status import display_state_for_mode
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
 from .providers import default_state_dir
@@ -89,6 +90,9 @@ MAX_UNANSWERED_START_PUSHES = 3
 ACTIVITY_MAX_AGE_SECONDS = 7.5 * 3600
 SSE_HEARTBEAT_SECONDS = 10.0
 ATTRIBUTES_TYPE = "AgentActivityAttributes"
+# A Dot plugged into the phone shows one of four states. iOS rations silent
+# background pushes, so the app is only woken when that state changes.
+DOT_PUSH_MIN_INTERVAL_SECONDS = 5.0
 
 # Modes worth interrupting the user for, and their notification titles.
 ALERT_MODES = {
@@ -982,6 +986,8 @@ class LiveActivityDaemon:
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
         self._pushes_this_activity = 0
+        self._last_dot_state: str | None = None
+        self._last_dot_push_at = 0.0
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -1113,6 +1119,17 @@ class LiveActivityDaemon:
                 # Silent keep-alive against the stale-date, and the only
                 # liveness probe there is; low priority.
                 self._push_update(content_state, now, important=False)
+
+        # The Dot plugged into the phone (DotStatusMirror in the iOS app):
+        # while the app is in the background only a push can wake it to
+        # rewrite LEDS.LED, so send one whenever the display state changes.
+        dot_state = display_state_for_mode(snapshot.aggregate.mode).value
+        if (
+            dot_state != self._last_dot_state
+            and self.tokens.tokens("device")
+            and now - self._last_dot_push_at >= DOT_PUSH_MIN_INTERVAL_SECONDS
+        ):
+            self._push_dot(dot_state, content_state, now)
 
         if active:
             self._idle_since = None
@@ -1386,10 +1403,19 @@ class LiveActivityDaemon:
 
     # -- APNs ----------------------------------------------------------
 
-    def _apns_fanout(self, kind: str, payload: dict[str, Any], priority: int = 10) -> None:
+    def _apns_fanout(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        priority: int = 10,
+        push_type: str = "liveactivity",
+        topic: str | None = None,
+    ) -> None:
         payload = shrink_payload(payload)
         for token in self.tokens.tokens(kind):
-            status, body = self.apns.send(token, payload, priority=priority)
+            status, body = self.apns.send(
+                token, payload, priority=priority, push_type=push_type, topic=topic
+            )
             if kind == "update" and status == 200:
                 self._pushes_this_activity += 1
             if status == 410 or (status == 400 and "BadDeviceToken" in body):
@@ -1575,6 +1601,26 @@ class LiveActivityDaemon:
         self._last_pushed_signature = _structure_signature(content_state)
         self._last_pushed_state = content_state
 
+    def _push_dot(self, dot_state: str, content_state: dict[str, Any], now: float) -> None:
+        """Silent push to the app's device token: no alert, priority 5 as
+        APNs requires for background pushes. The phone applies its own DND /
+        Focus / KITT settings to the mode before writing the Dot."""
+        self._last_dot_push_at = now
+        self._last_dot_state = dot_state
+        payload = {
+            "aps": {"content-available": 1},
+            "dot": {
+                "aggregateMode": content_state["aggregateMode"],
+                "activeCount": content_state["activeCount"],
+                "host": self.config.host_label,
+                "updatedAt": content_state["updatedAt"],
+            },
+        }
+        _log(f"dot -> {dot_state}")
+        self._apns_fanout(
+            "device", payload, priority=5, push_type="background", topic=self.config.bundle_id
+        )
+
     def _end_stale_activity(self, reason: str) -> None:
         with self._condition:
             latest = self._latest
@@ -1656,6 +1702,7 @@ class LiveActivityDaemon:
                                 else None
                             ),
                             "pushesThisActivity": daemon._pushes_this_activity,
+                            "dotState": daemon._last_dot_state,
                             # The app needs this to label an activity it
                             # starts itself; attributes are fixed at creation.
                             "hostLabel": daemon.config.host_label,
