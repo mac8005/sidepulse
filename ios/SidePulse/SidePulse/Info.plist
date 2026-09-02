@@ -37,6 +37,10 @@
     <string>SidePulse keeps the Dot off while a Focus such as Sleep or Do Not Disturb is on.</string>
     <key>NSSiriUsageDescription</key>
     <string>SidePulse receives Focus status changes so it can keep the SidePulse Dot off.</string>
+    <key>NSUserActivityTypes</key>
+    <array>
+        <string>INSendMessageIntent</string>
+    </array>
     <key>NSSupportsLiveActivities</key>
     <true/>
     <key>NSSupportsLiveActivitiesFrequentUpdates</key>
