@@ -622,7 +622,7 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
         command.extend(args)
         return SimpleNamespace(
             returncode=0,
-            stdout="Kleido: deploying TestFlight build IPA\n",
+            stdout="Kleido: Deploy TestFlight build; upload running\n",
             stderr="",
         )
 
@@ -636,14 +636,71 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
     assert summarizer._generate(
         "Upload to TestFlight: success.",
         "repository observed for this session: live-translator",
+        style="task",
     ) == (
-        "deploying TestFlight build IPA"
+        "Deploy TestFlight build; upload running"
     )
     tools_index = command.index("--tools")
     assert command[tools_index + 1] == ""
     prompt = command[command.index("-p") + 1].lower()
     assert "kleido" not in prompt
     assert "sidepulse:" not in prompt
+    assert "task; latest state" in prompt
+    assert "never replace the task" in prompt
+    assert "low-level command" in prompt
+
+
+def test_summarizer_never_returns_a_cached_result_for_changed_content():
+    import hashlib
+    import queue
+    import threading
+
+    from sidepulse.live_activity import (
+        SUMMARY_PROMPT_VERSION,
+        SessionSummarizer,
+        _summary_cache_key,
+    )
+
+    summarizer = object.__new__(SessionSummarizer)
+    key = _summary_cache_key("s1", "task")
+    old_hash = hashlib.sha256(
+        f"{SUMMARY_PROMPT_VERSION}\0\0old source".encode()
+    ).hexdigest()[:16]
+    summarizer._results = {key: (old_hash, "Old task; old state")}
+    summarizer._pending = set()
+    summarizer._lock = threading.Lock()
+    summarizer._queue = queue.Queue()
+
+    assert summarizer.summary_for("s1", "new source", style="task") is None
+    assert summarizer.summary_for("s1", None, style="task") is None
+    queued = summarizer._queue.get_nowait()
+    assert queued[2] == "new source"
+
+
+def test_summarizer_rejects_a_title_without_task_and_state(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from sidepulse.live_activity import SessionSummarizer
+
+    summarizer = object.__new__(SessionSummarizer)
+    summarizer.model = "claude-haiku-test"
+    summarizer.claude = "/usr/local/bin/claude"
+    summarizer.workdir = tmp_path
+    summarizer.moonside_dir = tmp_path / "moonside"
+    monkeypatch.setattr(
+        "sidepulse.live_activity.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="SidePulse: Improving session titles\n",
+            stderr="",
+        ),
+    )
+
+    assert summarizer._generate(
+        "Current request:\nImprove titles\n\nSession state:\nWorking",
+        "repository observed for this session: SidePulse",
+        style="task",
+    ) is None
 
 
 def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
@@ -683,6 +740,87 @@ def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
     assert "TestFlight build with summary chip" in tracker.prompt_for("s1")
 
 
+def test_prompt_tracker_resolves_scoped_project_and_ignores_subagent_actions(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    records = [
+        {
+            "event": {
+                "session_id": "s1",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/Users/x/Git",
+                "prompt": (
+                    "Improve the session titles in Side Pulse. It should name "
+                    "the product, e.g. Kleido or Side Pulse."
+                ),
+            }
+        },
+        {
+            "event": {
+                "session_id": "s1",
+                "hook_event_name": "PreToolUse",
+                "cwd": "/Users/x/Git",
+                "tool_input": {"command": "pytest tests/test_live_activity.py"},
+            }
+        },
+        {
+            "event": {
+                "session_id": "s1",
+                "agent_id": "subagent-1",
+                "hook_event_name": "PreToolUse",
+                "cwd": "/Users/x/Git/wardrobe-app",
+                "tool_input": {"command": "deploy unrelated project"},
+            }
+        },
+    ]
+    (tmp_path / "codex.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+
+    tracker = PromptTracker()
+    tracker.poll()
+
+    assert tracker.project_for("s1", "/Users/x/Git") == "SidePulse"
+    assert tracker.actions_for("s1") == ["pytest tests/test_live_activity.py"]
+
+
+def test_prompt_tracker_resolves_any_repo_from_a_generic_workspace(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    workspace = tmp_path / "Git"
+    (workspace / "aura" / ".git").mkdir(parents=True)
+    (tmp_path / "codex.jsonl").write_text(
+        json.dumps(
+            {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": str(workspace),
+                    "prompt": "Improve the calendar in Aura and deploy it.",
+                }
+            }
+        )
+        + "\n"
+    )
+
+    tracker = PromptTracker()
+    tracker.poll()
+
+    assert tracker.project_for("s1", str(workspace)) == "aura"
+
+
+def test_project_display_name_maps_wardrobe_repo_to_kleido():
+    from sidepulse.live_activity import _project_name_from_cwd
+
+    assert _project_name_from_cwd("/Users/x/Git/wardrobe-app") == "Kleido"
+
+
 def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 
@@ -709,7 +847,7 @@ def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypat
     class FakeSummarizer:
         def summary_for(self, session_id, message, context="", style="outcome"):
             calls.append((message, context, style))
-            return "TestFlight build uploaded"
+            return "Improve live translator; TestFlight build uploaded"
 
     daemon.summarizer = FakeSummarizer()
     done = make_status(
@@ -729,8 +867,121 @@ def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypat
 
     result = daemon._apply_summary(done)
 
-    assert result.display_name == "live-translator: TestFlight build uploaded"
+    assert result.display_name == (
+        "live-translator: Improve live translator; TestFlight build uploaded"
+    )
     assert all("Kleido" not in context for _, context, _ in calls)
+    assert "Current request:" in calls[0][0]
+    assert "Latest result or blocker:" in calls[0][0]
+    assert "Uploaded. Waiting on processing." in calls[0][0]
+
+
+def test_blocked_session_title_keeps_task_and_concrete_state(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "codex.jsonl").write_text(
+        json.dumps(
+            {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": "/Users/x/Git",
+                    "prompt": "Fix session titles in SidePulse.",
+                }
+            }
+        )
+        + "\n"
+    )
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker.poll()
+    calls = []
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            calls.append((message, style))
+            return "Fix session titles; blocked by failing tests"
+
+    daemon.summarizer = FakeSummarizer()
+    blocked = make_status(
+        "codex:session:s1", AgentMode.BLOCKED_ERROR, name="old", session_id="s1"
+    )
+    blocked = type(blocked)(
+        **{
+            **blocked.__dict__,
+            "event_name": "PostToolUseFailure",
+            "message": "Three title tests failed.",
+            "cwd": "/Users/x/Git",
+        }
+    )
+
+    result = daemon._apply_summary(blocked)
+
+    assert result.display_name == (
+        "SidePulse: Fix session titles; blocked by failing tests"
+    )
+    assert calls[0][1] == "outcome"
+    assert "Three title tests failed." in calls[0][0]
+
+
+def test_new_prompt_invalidates_the_active_summary_source(tmp_path, monkeypatch):
+    import time
+
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker._prompts["s1"] = "Deploy the new session titles."
+    daemon._prompt_tracker._projects["s1"] = "SidePulse"
+    daemon._task_sources["s1"] = (
+        "old-prompt-hash",
+        "Current request:\nOld task",
+        time.time(),
+    )
+    calls = []
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            calls.append((message, style))
+            return "Deploy session titles; running verification"
+
+    daemon.summarizer = FakeSummarizer()
+    busy = make_status(
+        "codex:session:s1", AgentMode.WORKING, name="old", session_id="s1"
+    )
+    result = daemon._apply_summary(busy)
+
+    assert result.display_name == (
+        "SidePulse: Deploy session titles; running verification"
+    )
+    assert "Deploy the new session titles." in calls[0][0]
+    assert "Old task" not in calls[0][0]
+
+
+def test_title_truncation_preserves_latest_state(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    title = daemon._summary_title(
+        "s1",
+        "Improve a deliberately very long session title that would otherwise hide the state; "
+        "blocked by failing tests",
+        "/Users/x/Git/long-project-name",
+    )
+
+    assert len(title) <= 90
+    assert title.endswith("; blocked by failing tests")
 
 
 def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
@@ -740,7 +991,9 @@ def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
 
     monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
     fake = tmp_path / "claude"
-    fake.write_text("#!/bin/sh\necho 'sidepulse: TestFlight build deployed'\n")
+    fake.write_text(
+        "#!/bin/sh\necho 'sidepulse: Deploy TestFlight build; build deployed'\n"
+    )
     fake.chmod(0o755)
 
     config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
@@ -755,14 +1008,96 @@ def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
     daemon._apply_summary(done)
     for _ in range(50):
         result = daemon._apply_summary(done)
-        if result.display_name != "old prompt":
+        if result.display_name == "SidePulse: Deploy TestFlight build; build deployed":
             break
         _time.sleep(0.1)
-    assert result.display_name == "sidepulse: TestFlight build deployed"
+    assert result.display_name == "SidePulse: Deploy TestFlight build; build deployed"
 
     # Working sessions keep their prompt-based name.
     busy = make_status("claude:session:s2", AgentMode.WORKING, name="prompt", session_id="s2")
-    assert daemon._apply_summary(busy).display_name == "prompt"
+    assert daemon._apply_summary(busy).display_name == "No project: Prompt; working"
+
+
+def test_finished_row_refreshes_when_async_outcome_arrives(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "claude.jsonl").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/Users/x/Git/sidepulse",
+                "prompt": "Improve session titles.",
+            }
+        )
+        + "\n"
+    )
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker.poll()
+
+    class DeferredSummarizer:
+        ready = False
+
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            return (
+                "Improve session titles; deployed and verified"
+                if self.ready
+                else None
+            )
+
+    deferred = DeferredSummarizer()
+    daemon.summarizer = deferred
+    done = make_status(
+        "claude:session:s1", AgentMode.COMPLETED, name="old", session_id="s1"
+    )
+    done = type(done)(
+        **{
+            **done.__dict__,
+            "event_name": "Stop",
+            "message": "Deployment finished on all Macs.",
+            "cwd": "/Users/x/Git/sidepulse",
+        }
+    )
+
+    summarized = daemon._apply_summary(done)
+    daemon._remember_finished([summarized], now=100.0)
+    assert daemon._recent_finished[done.agent_id]["name"].endswith("; completed")
+
+    deferred.ready = True
+    daemon._refresh_finished_summaries()
+    assert daemon._recent_finished[done.agent_id]["name"] == (
+        "SidePulse: Improve session titles; deployed and verified"
+    )
+
+
+def test_vanished_session_replaces_working_state_with_completed(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    agent_id = "codex:session:s1"
+    daemon._agent_modes[agent_id] = "working"
+    daemon._last_rows[agent_id] = {
+        "id": agent_id,
+        "name": "SidePulse: Improve session titles; testing implementation",
+        "mode": "working",
+        "detail": "Bash",
+        "provider": "codex",
+        "cwd": "Git",
+    }
+
+    daemon._remember_finished([], now=100.0)
+
+    assert daemon._recent_finished[agent_id]["name"] == (
+        "SidePulse: Improve session titles; completed"
+    )
 
 
 def test_recent_finished_keeps_newest_three_beyond_window(tmp_path, monkeypatch):

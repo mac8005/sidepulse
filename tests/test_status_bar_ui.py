@@ -494,6 +494,41 @@ class IconTests(StatusBarTestCase):
 class PureUiLogicTests(unittest.TestCase):
     """Label and formatting helpers -- no AppKit objects, fast and exhaustive."""
 
+    def test_summary_project_beats_generic_git_cwd(self):
+        status = make_status(
+            provider="codex",
+            display_name="SidePulse: Improving session titles",
+            cwd="/Users/massimo/Git",
+        )
+
+        self.assertEqual(
+            sb.menu_title_for_status(status, datetime.now(timezone.utc)),
+            "Working  Improving session titles\nSidePulse",
+        )
+
+    def test_summary_project_beats_generic_workspace_cwd(self):
+        status = make_status(
+            provider="codex",
+            display_name="SidePulse: Improving session titles",
+            cwd="/Users/massimo/workspace",
+        )
+
+        self.assertEqual(
+            sb.menu_title_for_status(status, datetime.now(timezone.utc)),
+            "Working  Improving session titles\nSidePulse",
+        )
+
+    def test_wardrobe_app_project_displays_as_kleido(self):
+        status = make_status(
+            display_name="wardrobe-app: Managing subscription pricing",
+            cwd="/Users/massimo/Git/wardrobe-app",
+        )
+
+        self.assertEqual(
+            sb.menu_title_for_status(status, datetime.now(timezone.utc)),
+            "Working  Managing subscription pricing\nKleido",
+        )
+
     def test_format_byte_count_is_monotonic_and_labelled(self):
         for size in (0, 1, 1023, 1024, 1024**2, 1024**3, 1024**4):
             with self.subTest(size=size):

@@ -349,6 +349,24 @@ TERMINAL_APP_LABELS = {
     TERMINAL_APP_ALACRITTY: "Alacritty",
     TERMINAL_APP_CUSTOM: "Custom",
 }
+GENERIC_SESSION_PROJECT_NAMES = frozenset(
+    {
+        "android",
+        "app",
+        "apps",
+        "git",
+        "ios",
+        "project",
+        "projects",
+        "src",
+        "tmp",
+        "workspace",
+        "workspaces",
+    }
+)
+SESSION_PROJECT_DISPLAY_LABELS = {
+    "wardrobe app": "Kleido",
+}
 TERMINAL_APP_SPECS = (
     TerminalAppSpec(
         TERMINAL_APP_TERMINAL,
@@ -5026,9 +5044,14 @@ def session_title_parts(status: AgentStatus) -> tuple[str, str | None]:
         title = title[len(project) + 2 :]
     elif ": " in title:
         maybe_project, maybe_title = title.split(": ", 1)
-        if not project:
+        if (
+            not project
+            or is_generic_session_project(project)
+            or session_project_labels_match(project, maybe_project)
+        ):
             project = maybe_project
         title = maybe_title
+    project = session_project_display_label(project)
     if project and normalized_menu_part(project) == normalized_menu_part(title):
         project = None
     return title or status.display_name, project
@@ -5036,6 +5059,22 @@ def session_title_parts(status: AgentStatus) -> tuple[str, str | None]:
 
 def normalized_menu_part(text: str) -> str:
     return " ".join(text.replace("_", " ").replace("-", " ").split()).casefold()
+
+
+def is_generic_session_project(project: str) -> bool:
+    return normalized_menu_part(project) in GENERIC_SESSION_PROJECT_NAMES
+
+
+def session_project_display_label(project: str | None) -> str | None:
+    if not project:
+        return None
+    return SESSION_PROJECT_DISPLAY_LABELS.get(normalized_menu_part(project), project)
+
+
+def session_project_labels_match(left: str, right: str) -> bool:
+    left_label = session_project_display_label(left) or left
+    right_label = session_project_display_label(right) or right
+    return normalized_menu_part(left_label) == normalized_menu_part(right_label)
 
 
 def strip_session_short_id(display_name: str, session_id: str | None) -> str:

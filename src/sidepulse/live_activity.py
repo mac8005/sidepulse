@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import sqlite3
@@ -698,7 +699,8 @@ class APNsLiveActivityClient:
 
 
 SUMMARY_MAX_CHARS = 90
-SUMMARY_PROMPT_VERSION = 2
+SUMMARY_PROMPT_VERSION = 3
+SUMMARY_PROGRESS_REFRESH_SECONDS = 45.0
 GENERIC_WORKDIR_NAMES = {
     "android",
     "app",
@@ -712,6 +714,38 @@ GENERIC_WORKDIR_NAMES = {
     "workspace",
     "workspaces",
 }
+PROJECT_DISPLAY_NAMES = {
+    "kleido": "Kleido",
+    "side pulse": "SidePulse",
+    "sidepulse": "SidePulse",
+    "sidepulse feature": "SidePulse",
+    "wardrobe app": "Kleido",
+}
+PROJECT_PROMPT_ALIASES = dict(PROJECT_DISPLAY_NAMES)
+PROJECT_SCOPE_BEFORE_PATTERN = re.compile(
+    r"\b(?:go\s+to|open|use|fix|deploy|update|in|inside|within|from|for)\s+"
+    r"(?:the\s+)?$",
+    re.IGNORECASE,
+)
+PROJECT_SCOPE_AFTER_PATTERN = re.compile(
+    r"^\s+(?:repo|repository|project|app)\b",
+    re.IGNORECASE,
+)
+PROJECT_NEGATION_PATTERN = re.compile(
+    r"\b(?:not|isn't|is\s+not|nothing\s+to\s+do\s+with)\b[^.!?]{0,32}$",
+    re.IGNORECASE,
+)
+
+
+def _normalized_project_name(name: str) -> str:
+    return " ".join(
+        name.strip().replace("_", " ").replace("-", " ").split()
+    ).casefold()
+
+
+def _project_display_name(name: str) -> str:
+    normalized = _normalized_project_name(name)
+    return PROJECT_DISPLAY_NAMES.get(normalized, name.strip())
 
 
 def _project_name_from_cwd(cwd: str | None) -> str | None:
@@ -723,17 +757,74 @@ def _project_name_from_cwd(cwd: str | None) -> str | None:
         if part.casefold() == "git":
             candidate = parts[index + 1]
             if candidate.casefold() not in GENERIC_WORKDIR_NAMES:
-                return candidate
+                return _project_display_name(candidate)
     candidate = Path(cwd).name
     if candidate and candidate.casefold() not in GENERIC_WORKDIR_NAMES:
-        return candidate
+        return _project_display_name(candidate)
     return None
 
 
+def _project_name_from_prompt(
+    prompt: str,
+    *,
+    scoped_only: bool = False,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Resolve a known repository/product from unambiguous user-authored text.
+
+    A scoped mention (``in SidePulse``, ``go to SidePulse repo``) beats
+    incidental examples elsewhere in the request. If no scoped mention
+    exists, a single non-negated alias is still safe; competing aliases are
+    deliberately refused rather than guessed.
+    """
+    project_aliases = dict(PROJECT_PROMPT_ALIASES)
+    if aliases:
+        project_aliases.update(aliases)
+    alias_patterns = [
+        re.escape(alias).replace(r"\ ", r"[\s_-]+")
+        for alias in sorted(project_aliases, key=len, reverse=True)
+        if alias
+    ]
+    if not alias_patterns:
+        return None
+    alias_pattern = re.compile(
+        r"(?<!\w)(?:" + "|".join(alias_patterns) + r")(?!\w)",
+        re.IGNORECASE,
+    )
+
+    text = " ".join(prompt.split())
+    scoped: set[str] = set()
+    mentioned: set[str] = set()
+    for match in alias_pattern.finditer(text):
+        before = text[max(0, match.start() - 48):match.start()]
+        if PROJECT_NEGATION_PATTERN.search(before):
+            continue
+        project = project_aliases[_normalized_project_name(match.group(0))]
+        mentioned.add(project)
+        after = text[match.end():match.end() + 24]
+        if (
+            PROJECT_SCOPE_BEFORE_PATTERN.search(before)
+            or PROJECT_SCOPE_AFTER_PATTERN.search(after)
+        ):
+            scoped.add(project)
+    if len(scoped) == 1:
+        return next(iter(scoped))
+    if scoped_only or len(scoped) > 1:
+        return None
+    return next(iter(mentioned)) if len(mentioned) == 1 else None
+
+
 def _summary_cache_key(session_id: str, style: str) -> str:
-    # Prompt semantics changed in v2: cached model-chosen project names must
-    # never leak back into titles produced under the trusted-repository rule.
+    # Versioned because title semantics are user-visible and an old cached
+    # phrase can otherwise survive a daemon upgrade indefinitely.
     return f"{session_id}|{style}|v{SUMMARY_PROMPT_VERSION}"
+
+
+def _title_with_state(title: str, state: str) -> str:
+    """Replace a title's state without truncating the new state away."""
+    task = title.rsplit("; ", 1)[0].strip()
+    suffix = f"; {state}"
+    return _truncate(task, max(12, SUMMARY_MAX_CHARS - len(suffix))) + suffix
 
 
 class PromptTracker:
@@ -748,6 +839,7 @@ class PromptTracker:
         self._prompts: dict[str, str] = {}
         self._actions: dict[str, list[str]] = {}
         self._projects: dict[str, str] = {}
+        self._workspace_aliases: dict[str, dict[str, str]] = {}
         self._offsets: dict[str, int] = {}
 
     def prompt_for(self, session_id: str) -> str | None:
@@ -757,12 +849,41 @@ class PromptTracker:
         return self._actions.get(session_id, [])
 
     def project_for(self, session_id: str, cwd: str | None = None) -> str | None:
-        return self._projects.get(session_id) or _project_name_from_cwd(cwd)
+        return _project_name_from_cwd(cwd) or self._projects.get(session_id)
 
     def trusted_context_for(self, session_id: str, cwd: str | None = None) -> str:
         if project := self.project_for(session_id, cwd):
             return f"repository observed for this session: {project}"
         return ""
+
+    def _aliases_for_cwd(self, cwd: str | None) -> dict[str, str]:
+        aliases = dict(PROJECT_PROMPT_ALIASES)
+        if not cwd:
+            return aliases
+        root = Path(cwd)
+        if root.name.casefold() not in GENERIC_WORKDIR_NAMES:
+            return aliases
+        cache_key = str(root)
+        discovered = self._workspace_aliases.get(cache_key)
+        if discovered is None:
+            discovered = {}
+            try:
+                children = tuple(root.iterdir())
+            except OSError:
+                children = ()
+            for child in children:
+                try:
+                    is_repo = child.is_dir() and (child / ".git").exists()
+                except OSError:
+                    is_repo = False
+                if not is_repo or child.name.startswith("."):
+                    continue
+                discovered[_normalized_project_name(child.name)] = (
+                    _project_display_name(child.name)
+                )
+            self._workspace_aliases[cache_key] = discovered
+        aliases.update(discovered)
+        return aliases
 
     def poll(self) -> None:
         for name in ("claude.jsonl", "codex.jsonl"):
@@ -794,6 +915,11 @@ class PromptTracker:
                 session_id = event.get("session_id")
                 if not isinstance(session_id, str):
                     continue
+                # Codex subagents share the parent session id. Their commands
+                # are separate work streams and must not race to retitle the
+                # parent session or change its project identity.
+                if event.get("agent_id"):
+                    continue
                 project = _project_name_from_cwd(event.get("cwd"))
                 if project:
                     self._projects[session_id] = project
@@ -804,6 +930,19 @@ class PromptTracker:
                         prompt = prompt.strip()
                         self._prompts[session_id] = prompt
                         self._actions[session_id] = []  # new turn, new actions
+                        scoped_project = _project_name_from_prompt(
+                            prompt,
+                            scoped_only=True,
+                            aliases=self._aliases_for_cwd(event.get("cwd")),
+                        )
+                        inferred_project = scoped_project
+                        if inferred_project is None and session_id not in self._projects:
+                            inferred_project = _project_name_from_prompt(
+                                prompt,
+                                aliases=self._aliases_for_cwd(event.get("cwd")),
+                            )
+                        if inferred_project is not None and project is None:
+                            self._projects[session_id] = inferred_project
                 elif hook == "PreToolUse":
                     tool_input = event.get("tool_input")
                     description = None
@@ -858,7 +997,8 @@ class SessionSummarizer:
         if not message:
             with self._lock:
                 cached = self._results.get(key)
-            return cached[1] if cached else None
+                pending = key in self._pending
+            return cached[1] if cached and not pending else None
         source_hash = hashlib.sha256(
             f"{SUMMARY_PROMPT_VERSION}\0{context}\0{message}".encode()
         ).hexdigest()[:16]
@@ -869,7 +1009,10 @@ class SessionSummarizer:
             if key not in self._pending:
                 self._pending.add(key)
                 self._queue.put((key, source_hash, message, context, style))
-            return cached[1] if cached else None
+            # A cached phrase for different source text is stale. Showing it
+            # as the new state is worse than the deterministic fallback used
+            # by the daemon while this request is in flight.
+            return None
 
     def _load_cache(self) -> None:
         try:
@@ -904,22 +1047,26 @@ class SessionSummarizer:
     def _generate(self, message: str, context: str, style: str = "outcome") -> str | None:
         if style == "task":
             instruction = (
-                "A coding session is working on a request; its most "
-                "recent actions may be listed. In at most six words, present "
-                "progressive, say what is being done RIGHT NOW. Prefer the "
-                "latest action over the request "
-                "when they differ. The text may contain heavy typos; read "
-                "through them. Never invent work not mentioned. "
+                "Write a compact session title body with two clauses. The first "
+                "clause must preserve the overall task from Current request. The "
+                "second must state the latest meaningful phase from Latest "
+                "progress and Session state. Never replace the task with a "
+                "low-level command. "
             )
         else:
             instruction = (
-                "Summarize the state or outcome described in at most six words. "
+                "Write a compact session title body with two clauses. The first "
+                "clause must identify the task from Current request. The second "
+                "must state the latest outcome, blocker, or requested input from "
+                "Latest result or blocker and Session state. "
             )
         prompt = (
             instruction
-            + "Return only the action or outcome. Do not include or guess a "
-            "project, product, or topic name; Sidepulse adds a trusted repository "
-            "label separately. No quotes, respond with only the phrase.\n\n"
+            + "Use the exact format `Task; latest state`, sentence case, at most "
+            "twelve words total. Read through typos. Never invent work. Do not "
+            "include or guess a project or product name; the caller adds a "
+            "trusted label separately. No quotes or final period. Return only "
+            "the title body.\n\n"
             f"Trusted session context: {context[:800]}\n\n"
             f"Content:\n{message[:3000]}"
         )
@@ -959,11 +1106,22 @@ class SessionSummarizer:
         # Models sometimes add a trailing period or stray spaces; row text
         # must be clean — it renders as a one-line title.
         text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
-        # Defensive boundary for a model that still emits "Project: action"
-        # despite the action-only instruction. Project identity is supplied
-        # deterministically by the daemon, never by model output.
-        if ":" in text:
-            text = text.split(":", 1)[1].strip()
+        # Defensive boundary for a model that still emits a project prefix.
+        # Project identity is supplied deterministically by the daemon.
+        semicolon_at = text.find("; ")
+        colon_at = text.find(": ")
+        if colon_at >= 0 and (semicolon_at < 0 or colon_at < semicolon_at):
+            text = text[colon_at + 2:].strip()
+        else:
+            trusted_project = (
+                context.rsplit(": ", 1)[-1].strip() if ": " in context else ""
+            )
+            prefix = f"{trusted_project} — "
+            if trusted_project and text.casefold().startswith(prefix.casefold()):
+                text = text[len(prefix):].strip()
+        if "; " not in text:
+            _log("summary rejected: missing task/state separator")
+            return None
         if text:
             _log(f"summary -> {text[:70]}")
             return _truncate(text, SUMMARY_MAX_CHARS)
@@ -1005,7 +1163,8 @@ class LiveActivityDaemon:
         global _DEEP_LINKS
         _DEEP_LINKS = DeepLinkResolver()
         self._deferred_alerts: list[dict[str, Any]] = []
-        self._task_sources: dict[str, tuple[str, float]] = {}
+        self._task_sources: dict[str, tuple[str, str, float]] = {}
+        self._settled_statuses: dict[str, AgentStatus] = {}
         self._published_summaries: dict[str, str] = {}
 
     # -- snapshot loop -------------------------------------------------
@@ -1069,6 +1228,7 @@ class LiveActivityDaemon:
             self._prompt_tracker.poll()
             statuses = [self._apply_summary(status) for status in statuses]
         self._remember_finished(statuses, now_ts)
+        self._refresh_finished_summaries()
         content_state = build_content_state(
             statuses,
             snapshot.aggregate.mode.value,
@@ -1202,64 +1362,141 @@ class LiveActivityDaemon:
             tmp.unlink(missing_ok=True)
 
     def _apply_summary(self, status: AgentStatus) -> AgentStatus:
-        """Once a turn has ended, the display name's prompt text is stale;
-        show what actually happened instead."""
+        """Show the stable task and its latest meaningful state."""
         from dataclasses import replace as dataclass_replace
 
         if status.provider not in {"claude", "codex"} or not status.session_id:
             return status
-        settled = status.event_name in {"Stop", "SubagentStop", "SessionEnd"} and status.mode.value in {
-            "completed",
-            "waiting_for_input",
-            "long_task_progress",
-        }
+        prompt = self._prompt_tracker.prompt_for(status.session_id)
+        settled = (
+            status.mode.value in {"completed", "waiting_for_input", "blocked_error"}
+            or (
+                status.event_name in {"Stop", "SubagentStop", "SessionEnd"}
+                and status.mode.value == "long_task_progress"
+            )
+        )
         trusted_context = self._prompt_tracker.trusted_context_for(
             status.session_id, status.cwd
         )
         if settled:
+            self._settled_statuses[status.session_id] = status
+            result = status.message or status.tool_name or status.mode_label
+            source = (
+                f"Current request:\n{prompt or '(request unavailable)'}\n\n"
+                f"Latest result or blocker:\n{result}\n\n"
+                f"Session state:\n{status.mode_label}"
+            )
             summary = self.summarizer.summary_for(
-                status.session_id, status.message, trusted_context
+                status.session_id, source, trusted_context
             )
         elif status.mode.value in {"working", "tool_running", "long_task_progress"}:
+            self._settled_statuses.pop(status.session_id, None)
             # While working, summarize the CURRENT prompt (tracked from the
             # hook logs — the display name only ever carries the first one).
-            # Without a tracked prompt, fall back to the last outcome rather
-            # than a confidently wrong stale task.
-            prompt = self._prompt_tracker.prompt_for(status.session_id)
+            # Without a tracked prompt, use the deterministic title fallback.
             if prompt:
                 # Refresh the progress source at most every 45s so the
                 # summary follows the work without hammering the API.
                 import time as _time
 
                 cached_source = self._task_sources.get(status.session_id)
-                if cached_source and _time.time() - cached_source[1] < 45:
-                    source = cached_source[0]
+                prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+                if (
+                    cached_source
+                    and cached_source[0] == prompt_hash
+                    and _time.time() - cached_source[2]
+                    < SUMMARY_PROGRESS_REFRESH_SECONDS
+                ):
+                    source = cached_source[1]
                 else:
                     actions = self._prompt_tracker.actions_for(status.session_id)
-                    source = prompt[:1500]
+                    source = f"Current request:\n{prompt[:1500]}"
                     if actions:
-                        source += "\n\nMost recent actions (latest last):\n- " + "\n- ".join(actions)
-                    self._task_sources[status.session_id] = (source, _time.time())
+                        source += (
+                            "\n\nLatest progress (latest last):\n- "
+                            + "\n- ".join(actions)
+                        )
+                    source += f"\n\nSession state:\n{status.mode_label}"
+                    self._task_sources[status.session_id] = (
+                        prompt_hash,
+                        source,
+                        _time.time(),
+                    )
                 summary = self.summarizer.summary_for(
                     status.session_id, source, trusted_context, style="task"
                 )
             else:
-                summary = self.summarizer.summary_for(status.session_id, None, style="outcome")
+                summary = None
         else:
             return status
-        if not summary:
-            return status
+        if not summary or "; " not in summary:
+            summary = self._fallback_summary(prompt, status)
         summary = self._summary_title(status.session_id, summary, status.cwd)
         self._publish_summary(status, summary)
         return dataclass_replace(status, display_name=summary)
 
+    @staticmethod
+    def _fallback_summary(prompt: str | None, status: AgentStatus) -> str:
+        text = " ".join((prompt or "").split())
+        if text:
+            ends = [
+                index
+                for marker in (". ", "? ", "! ")
+                if (index := text.find(marker)) >= 0
+            ]
+            if ends:
+                text = text[:min(ends)]
+        else:
+            text = status.display_name.split(";", 1)[0].strip()
+            if ": " in text:
+                text = text.split(": ", 1)[1]
+        task = _truncate(text.rstrip(".?!") or "Current task", 56)
+        if task:
+            task = task[0].upper() + task[1:]
+
+        detail = " ".join((status.message or status.tool_name or "").split())
+        if status.mode.value == "blocked_error":
+            state = f"blocked by {_truncate(detail, 24)}" if detail else "blocked"
+        elif status.mode.value == "waiting_for_input":
+            state = f"waiting for {_truncate(detail, 24)}" if detail else "waiting for input"
+        elif status.mode.value == "completed":
+            state = "completed"
+        elif status.mode.value == "long_task_progress":
+            state = "background work running"
+        else:
+            state = "working"
+        return f"{task}; {state}"
+
     def _summary_title(
         self, session_id: str, action: str, cwd: str | None = None
     ) -> str:
-        project = self._prompt_tracker.project_for(session_id, cwd)
-        if not project:
-            return action
-        return _truncate(f"{project}: {action}", SUMMARY_MAX_CHARS)
+        project = self._prompt_tracker.project_for(session_id, cwd) or "No project"
+        prefix = f"{project}: "
+        if "; " not in action:
+            return _truncate(prefix + action, SUMMARY_MAX_CHARS)
+        task, state = action.rsplit("; ", 1)
+        state = _truncate(state, max(12, SUMMARY_MAX_CHARS // 3))
+        task_limit = max(12, SUMMARY_MAX_CHARS - len(prefix) - len(state) - 2)
+        return _truncate(
+            f"{prefix}{_truncate(task, task_limit)}; {state}",
+            SUMMARY_MAX_CHARS,
+        )
+
+    def _refresh_finished_summaries(self) -> None:
+        """Refresh rows that outlived the status used to queue their result."""
+        changed = False
+        for session_id, status in tuple(self._settled_statuses.items()):
+            row = self._recent_finished.get(status.agent_id)
+            if row is None:
+                self._settled_statuses.pop(session_id, None)
+                continue
+            summarized = self._apply_summary(status)
+            if summarized.display_name == row.get("name"):
+                continue
+            row["name"] = summarized.display_name
+            changed = True
+        if changed:
+            self._save_recent_finished()
 
     def _publish_summary(self, status: AgentStatus, summary: str) -> None:
         """Write the summary into the provider's hook log so every consumer
@@ -1305,6 +1542,7 @@ class LiveActivityDaemon:
             if row:
                 self._recent_finished[agent_id] = {
                     **row,
+                    "name": _title_with_state(str(row.get("name") or "Current task"), "completed"),
                     "mode": "completed",
                     "detail": None,
                     "finishedAt": now,
