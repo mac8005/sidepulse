@@ -206,12 +206,21 @@ final class DotStatusMirror: ObservableObject {
 
     /// Silent push from the daemon (`dot` payload). The app may have been
     /// launched for it with no scene, so everything needed is read here.
-    /// Returns false when the Dot could not be written.
+    /// Every push leaves a line in the diagnostics log, since a background
+    /// wake is otherwise invisible. Returns false when the Dot could not be
+    /// written.
     @discardableResult
     func applyPush(aggregateMode: String, model: AppModel) -> Bool {
+        defer { model.refreshEventLog() }
         // In front the stream is authoritative.
-        guard self.model == nil else { return true }
-        guard model.hasFolderAccess else { return false }
+        guard self.model == nil else {
+            EventLog.append("Dot push (\(aggregateMode)): app in front, stream in charge")
+            return true
+        }
+        guard model.hasFolderAccess else {
+            EventLog.append("Dot push (\(aggregateMode)): no Dot folder selected")
+            return false
+        }
         model.applyDueDndSchedule()
         // No prompting from the background: an unanswered request reads as
         // "no Focus" until the app is opened again.
@@ -221,8 +230,10 @@ final class DotStatusMirror: ObservableObject {
             DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled),
             label: resolved.label
         )
-        if !written, let lastError {
-            EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError)")
+        if written {
+            EventLog.append("Dot push (\(aggregateMode)): \(resolved.label)")
+        } else {
+            EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError ?? "unknown error")")
         }
         return written
     }
