@@ -339,7 +339,11 @@ def test_rate_limited_structural_change_still_pushes(tmp_path, monkeypatch):
     daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
     daemon.tokens.register("update", "upd", {"device": "phone", "activity_id": "a"})
     pushes = []
-    monkeypatch.setattr(daemon, "_apns_fanout", lambda kind, payload, priority=10: pushes.append(priority))
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: (pushes.append(priority) or True),
+    )
 
     def state(unread: bool, name: str = "done Y") -> dict:
         return {
@@ -711,7 +715,7 @@ def test_changed_dot_owner_forces_a_new_command_id(tmp_path, monkeypatch):
     assert daemon._pending_dot is not None
 
 
-def test_structure_signature_ignores_text_churn():
+def test_structure_signature_coalesces_busy_churn_and_row_reordering():
     from sidepulse.live_activity import _structure_signature
 
     base = {
@@ -731,8 +735,262 @@ def test_structure_signature_ignores_text_churn():
         base["agents"][0],
         {"id": "b", "mode": "completed", "name": "done Y", "unread": False},
     ]}
+    tool_running_reordered = {
+        **base,
+        "aggregateMode": "tool_running",
+        "agents": [
+            base["agents"][1],
+            {**base["agents"][0], "mode": "tool_running"},
+        ],
+    }
+    waiting = {
+        **base,
+        "aggregateMode": "waiting_for_input",
+        "agents": [
+            {**base["agents"][0], "mode": "waiting_for_input"},
+            base["agents"][1],
+        ],
+    }
     assert _structure_signature(base) == _structure_signature(renamed)
+    assert _structure_signature(base) == _structure_signature(tool_running_reordered)
     assert _structure_signature(base) != _structure_signature(seen)
+    assert _structure_signature(base) != _structure_signature(waiting)
+
+
+def test_new_update_token_forces_current_state_hydration(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    monkeypatch.setattr("sidepulse.live_activity.time.time", lambda: 200.0)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register(
+        "update",
+        "old",
+        {"activity_id": "old-activity", "activity_started_at": 100.0},
+    )
+    daemon._last_pushed_signature = ("active", 1, ())
+    daemon._last_pushed_state = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [],
+        "updatedAt": 150.0,
+    }
+    daemon._last_push_at = 199.0
+    daemon._pushes_this_activity = 50
+
+    assert daemon.register_update_token(
+        "new", {"device": "phone", "activity_id": "new-activity"}
+    ) is True
+
+    assert daemon.tokens.tokens("update") == ["new"]
+    assert daemon._last_pushed_signature is None
+    assert daemon._last_pushed_state is None
+    assert daemon._last_push_at == 0.0
+    assert daemon._pushes_this_activity == 0
+    assert daemon._wake.is_set()
+
+
+def test_update_token_rotation_preserves_activity_age(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    monkeypatch.setattr("sidepulse.live_activity.time.time", lambda: 200.0)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register(
+        "update",
+        "old",
+        {"activity_id": "same-activity", "activity_started_at": 100.0},
+    )
+    daemon._pushes_this_activity = 7
+
+    assert daemon.register_update_token(
+        "rotated", {"device": "phone", "activity_id": "same-activity"}
+    ) is True
+
+    entries = daemon.tokens.entries("update")
+    assert list(entries) == ["rotated"]
+    assert entries["rotated"]["activity_started_at"] == 100.0
+    assert daemon._pushes_this_activity == 7
+
+
+def test_new_push_to_start_token_keeps_current_activity(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("update", "current", {"activity_id": "activity-a"})
+    ended = []
+    monkeypatch.setattr(daemon, "_end_stale_activity", lambda reason: ended.append(reason))
+
+    assert daemon.register_push_to_start_token("new-p2s", {"device": "phone"}) is True
+
+    assert daemon.tokens.tokens("update") == ["current"]
+    assert ended == []
+    assert daemon._start_push_attempts == 0
+
+
+def test_push_to_start_rotation_replaces_only_the_same_device(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    daemon.register_push_to_start_token("phone-old", {"device": "phone"})
+    daemon.register_push_to_start_token("tablet", {"device": "tablet"})
+    daemon.register_push_to_start_token("phone-new", {"device": "phone"})
+
+    assert set(daemon.tokens.tokens("push_to_start")) == {"phone-new", "tablet"}
+
+
+def test_reset_from_stale_activity_keeps_current_token(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("update", "current", {"activity_id": "activity-new"})
+
+    assert daemon.reset_activity("activity-old") is False
+    assert daemon.tokens.tokens("update") == ["current"]
+
+
+def test_ended_activity_cannot_reregister_its_token(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.register_update_token("current", {"activity_id": "activity-a"})
+    monkeypatch.setattr(daemon, "_apns_fanout", lambda *args, **kwargs: True)
+
+    assert daemon.reset_activity("activity-a") is True
+    assert daemon.tokens.tokens("update") == []
+    assert daemon.register_update_token(
+        "late", {"activity_id": "activity-a"}
+    ) is False
+    assert daemon.tokens.tokens("update") == []
+
+
+def test_token_change_during_push_keeps_new_activity_hydration_pending(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.register_update_token(
+        "old", {"activity_id": "activity-old", "activity_observed_at": 1.0}
+    )
+    state = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [],
+        "updatedAt": 2.0,
+    }
+
+    def register_new_during_send(*args, **kwargs):
+        daemon.register_update_token(
+            "new", {"activity_id": "activity-new", "activity_observed_at": 2.0}
+        )
+        return True
+
+    monkeypatch.setattr(daemon, "_apns_fanout", register_new_during_send)
+    daemon._push_update(state, now=3.0)
+
+    assert daemon.tokens.tokens("update") == ["new"]
+    assert daemon._last_pushed_signature is None
+    assert daemon._last_pushed_state is None
+    assert daemon._wake.is_set()
+
+
+def test_retired_activity_retry_cannot_steal_update_token(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    assert daemon.register_update_token(
+        "old", {"activity_id": "activity-old", "activity_observed_at": 1.0}
+    )
+    assert daemon.register_update_token(
+        "new", {"activity_id": "activity-new", "activity_observed_at": 2.0}
+    )
+    assert daemon.register_update_token(
+        "late-old", {"activity_id": "activity-old", "activity_observed_at": 1.0}
+    ) is False
+    assert daemon.tokens.tokens("update") == ["new"]
+
+
+def test_failed_update_does_not_mark_content_as_pushed(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.register_update_token("current", {"activity_id": "activity-a"})
+    monkeypatch.setattr(daemon, "_apns_fanout", lambda *args, **kwargs: False)
+    state = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [],
+        "updatedAt": 2.0,
+    }
+
+    daemon._push_update(state, now=3.0)
+
+    assert daemon._last_pushed_signature is None
+    assert daemon._last_pushed_state is None
 
 
 def test_finished_rows_track_unread_until_marked_seen(tmp_path, monkeypatch):
@@ -1147,7 +1405,7 @@ def test_prompt_tracker_resolves_scoped_project_and_ignores_subagent_actions(
             "event": {
                 "session_id": "s1",
                 "hook_event_name": "UserPromptSubmit",
-                "cwd": "/Users/x/Git",
+                "cwd": "/Users/x/Git/sidepulse",
                 "prompt": (
                     "Improve the session titles in Side Pulse. It should name "
                     "the product, e.g. Kleido or Side Pulse."
@@ -1158,7 +1416,7 @@ def test_prompt_tracker_resolves_scoped_project_and_ignores_subagent_actions(
             "event": {
                 "session_id": "s1",
                 "hook_event_name": "PreToolUse",
-                "cwd": "/Users/x/Git",
+                "cwd": "/Users/x/Git/sidepulse",
                 "tool_input": {"command": "pytest tests/test_live_activity.py"},
             }
         },
@@ -1183,7 +1441,7 @@ def test_prompt_tracker_resolves_scoped_project_and_ignores_subagent_actions(
     assert tracker.actions_for("s1") == ["pytest tests/test_live_activity.py"]
 
 
-def test_prompt_tracker_resolves_any_repo_from_a_generic_workspace(
+def test_prompt_tracker_does_not_guess_a_repo_from_prompt_text(
     tmp_path, monkeypatch
 ):
     from sidepulse.live_activity import PromptTracker
@@ -1208,7 +1466,123 @@ def test_prompt_tracker_resolves_any_repo_from_a_generic_workspace(
     tracker = PromptTracker()
     tracker.poll()
 
-    assert tracker.project_for("s1", str(workspace)) == "aura"
+    assert tracker.project_for("s1", str(workspace)) is None
+
+
+def test_prompt_tracker_uses_structured_codex_tool_workdir(tmp_path, monkeypatch):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    repo = tmp_path / "Git" / "sidepulse"
+    (repo / ".git").mkdir(parents=True)
+    other_repo = tmp_path / "Git" / "wardrobe-app"
+    (other_repo / ".git").mkdir(parents=True)
+    transcript = tmp_path / "rollout.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "content": f"An unrelated example mentions {other_repo}",
+                },
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": (
+                        "const ignored = 'tools.exec_command({workdir: \""
+                        + str(other_repo)
+                        + "\"})';\n"
+                        + "const r = await tools.exec_command({\"cmd\": \"pytest\", "
+                        + f'\"workdir\": \"{repo}\", \"yield_time_ms\": 10000}});'
+                    ),
+                },
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "codex.jsonl").write_text(
+        json.dumps(
+            {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "PreToolUse",
+                    "cwd": "/Users/x/Git/sidepulse",
+                    "transcript_path": str(transcript),
+                    "tool_input": {"command": "pytest"},
+                }
+            }
+        )
+        + "\n"
+    )
+
+    tracker = PromptTracker()
+    tracker.poll()
+
+    assert tracker.project_for("s1", "/Users/x/Git") == "SidePulse"
+
+
+def test_prompt_tracker_reads_first_incremental_transcript_record(tmp_path, monkeypatch):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    repo = tmp_path / "Git" / "sidepulse"
+    (repo / ".git").mkdir(parents=True)
+    transcript = tmp_path / "rollout.jsonl"
+    transcript.write_text(json.dumps({"type": "response_item", "payload": {}}) + "\n")
+    tracker = PromptTracker()
+
+    assert tracker._project_from_codex_transcript(str(transcript)) is None
+    with transcript.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": {"cmd": "pytest", "workdir": str(repo)},
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    assert tracker._project_from_codex_transcript(str(transcript)) == "SidePulse"
+
+
+def test_prompt_tracker_strips_attachment_preamble_from_request(tmp_path, monkeypatch):
+    from sidepulse.live_activity import PromptTracker
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "codex.jsonl").write_text(
+        json.dumps(
+            {
+                "event": {
+                    "session_id": "s1",
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": "/Users/x/Git/sidepulse",
+                    "prompt": (
+                        "# Files mentioned by the user:\n\n"
+                        "## Pasted Image.jpg: /tmp/image.jpg\n\n"
+                        "## My request:\nAlso it shows ‘nonproject’"
+                    ),
+                }
+            }
+        )
+        + "\n"
+    )
+
+    tracker = PromptTracker()
+    tracker.poll()
+
+    assert tracker.prompt_for("s1") == "Also it shows ‘nonproject’"
 
 
 def test_project_display_name_maps_wardrobe_repo_to_kleido():
@@ -1257,7 +1631,7 @@ def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypat
             **done.__dict__,
             "event_name": "Stop",
             "message": "Uploaded. Waiting on processing.",
-            "cwd": "/Users/x/Git",
+            "cwd": "/Users/x/Git/live-translator",
         }
     )
 
@@ -1282,7 +1656,7 @@ def test_blocked_session_title_keeps_task_and_concrete_state(tmp_path, monkeypat
                 "event": {
                     "session_id": "s1",
                     "hook_event_name": "UserPromptSubmit",
-                    "cwd": "/Users/x/Git",
+                    "cwd": "/Users/x/Git/sidepulse",
                     "prompt": "Fix session titles in SidePulse.",
                 }
             }
@@ -1310,7 +1684,7 @@ def test_blocked_session_title_keeps_task_and_concrete_state(tmp_path, monkeypat
             **blocked.__dict__,
             "event_name": "PostToolUseFailure",
             "message": "Three title tests failed.",
-            "cwd": "/Users/x/Git",
+            "cwd": "/Users/x/Git/sidepulse",
         }
     )
 
@@ -1420,7 +1794,7 @@ def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
 
     # Working sessions keep their prompt-based name.
     busy = make_status("claude:session:s2", AgentMode.WORKING, name="prompt", session_id="s2")
-    assert daemon._apply_summary(busy).display_name == "No project: Prompt; working"
+    assert daemon._apply_summary(busy).display_name == "Prompt; working"
 
 
 def test_finished_row_refreshes_when_async_outcome_arrives(tmp_path, monkeypatch):
@@ -1703,7 +2077,7 @@ def test_an_idle_activity_is_probed_so_a_silent_death_is_noticed(tmp_path, monke
     monkeypatch.setattr(
         daemon,
         "_apns_fanout",
-        lambda kind, payload, priority=10: sent.append(priority),
+        lambda kind, payload, priority=10: (sent.append(priority) or True),
     )
 
     daemon._tick()

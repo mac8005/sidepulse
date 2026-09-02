@@ -53,15 +53,12 @@ PUSH_MIN_INTERVAL_SECONDS = 1.0
 # Cosmetic content (summary/detail text) coalesces into low-priority pushes
 # on this cadence, so the iOS update budget stays available for the
 # structural changes people actually watch for.
-COSMETIC_PUSH_INTERVAL_SECONDS = 20.0
-# A live daemon refreshes within PUSH_HEARTBEAT; past this window iOS dims
-# the activity, so the phone never shows confident stale data.
-STALE_AFTER_SECONDS = 360.0
-# Half the stale window, so a single lost or slow push cannot let an
-# activity go stale while work is live. At 300s against a 360s window the
-# margin was 60 seconds, and a stale activity keeps its Lock Screen card
-# while losing the Dynamic Island — exactly the reported symptom.
-PUSH_HEARTBEAT_SECONDS = STALE_AFTER_SECONDS / 2
+COSMETIC_PUSH_INTERVAL_SECONDS = 60.0
+# Leave enough margin for APNs to defer a low-priority heartbeat without
+# expiring the Dynamic Island. The previous six-minute deadline was reached
+# during one short burst of throttling even though the daemon stayed healthy.
+STALE_AFTER_SECONDS = 15 * 60.0
+PUSH_HEARTBEAT_SECONDS = 5 * 60.0
 # Once everything is finished the content stops changing, so nothing gets
 # pushed — and an activity that died on the phone meanwhile stays "live" in
 # the daemon's belief, because only a push can come back 410. Probe slowly
@@ -217,6 +214,22 @@ class TokenStore:
             self._data[kind] = {token: meta}
             self._save()
             return changed
+
+    def replace_for_device(self, kind: str, token: str, meta: dict[str, Any]) -> bool:
+        """Keep one token per device while preserving other registered phones."""
+        with self._lock:
+            device = str(meta.get("device", ""))
+            previous = set(self._data[kind])
+            self._data[kind] = {
+                old_token: old_meta
+                for old_token, old_meta in self._data[kind].items()
+                if old_token == token or str(old_meta.get("device", "")) != device
+            }
+            stored_meta = dict(meta)
+            stored_meta["registered_at"] = datetime.now(timezone.utc).isoformat()
+            self._data[kind][token] = stored_meta
+            self._save()
+            return set(self._data[kind]) != previous
 
     def tokens(self, kind: str) -> list[str]:
         with self._lock:
@@ -507,19 +520,32 @@ def shrink_payload(payload: dict[str, Any], limit: int = APNS_PAYLOAD_LIMIT_BYTE
     return trimmed
 
 
-def _structure_signature(content_state: dict[str, Any]) -> tuple:
-    """What people watch for: modes, row identity/order, unread, counts.
+def _attention_mode(mode: Any) -> Any:
+    """Collapse busy sub-states that render as the same overall activity."""
+    if mode in {"working", "tool_running", "long_task_progress"}:
+        return "active"
+    return mode
 
-    Name and detail text churn constantly while agents work; pushing those
-    at noticeable priority burns the system's update budget and delays the
-    changes that matter."""
+
+def _structure_signature(content_state: dict[str, Any]) -> tuple:
+    """Changes that deserve an immediate, high-priority APNs update.
+
+    Codex emits a PreToolUse/PostToolUse pair for almost every tool call. The
+    resulting working/tool-running flip, row reordering, names, and details
+    can wait for the coalesced cosmetic update. Session membership, active
+    count, unread completion, and attention states still push immediately.
+    """
     return (
-        content_state.get("aggregateMode"),
+        _attention_mode(content_state.get("aggregateMode")),
         content_state.get("activeCount"),
-        tuple(
-            (row.get("id"), row.get("mode"), row.get("unread"))
+        tuple(sorted(
+            (
+                str(row.get("id", "")),
+                _attention_mode(row.get("mode")),
+                bool(row.get("unread")),
+            )
             for row in content_state.get("agents", [])
-        ),
+        )),
     )
 
 
@@ -765,20 +791,13 @@ IOS_COMPACT_PROJECT_LABELS = {
     "cspennyscaler": "Trading",
     "cspennyscalpingtrader": "Trading",
 }
-PROJECT_PROMPT_ALIASES = dict(PROJECT_DISPLAY_NAMES)
-PROJECT_SCOPE_BEFORE_PATTERN = re.compile(
-    r"\b(?:go\s+to|open|use|fix|deploy|update|in|inside|within|from|for)\s+"
-    r"(?:the\s+)?$",
-    re.IGNORECASE,
+REQUEST_SECTION_PATTERN = re.compile(
+    r"^\s*#{1,6}\s*My request(?:\s+for\s+[^:\n]+)?\s*:\s*(?:\r?\n|$)",
+    re.IGNORECASE | re.MULTILINE,
 )
-PROJECT_SCOPE_AFTER_PATTERN = re.compile(
-    r"^\s+(?:repo|repository|project|app)\b",
-    re.IGNORECASE,
-)
-PROJECT_NEGATION_PATTERN = re.compile(
-    r"\b(?:not|isn't|is\s+not|nothing\s+to\s+do\s+with)\b[^.!?]{0,32}$",
-    re.IGNORECASE,
-)
+CODEX_TRANSCRIPT_RECOVERY_BYTES = 2 * 1024 * 1024
+CODEX_TRANSCRIPT_RECOVERY_LINES = 500
+CODEX_EXEC_COMMAND = "tools.exec_command"
 
 
 def _normalized_project_name(name: str) -> str:
@@ -822,54 +841,169 @@ def _project_name_from_cwd(cwd: str | None) -> str | None:
     return None
 
 
-def _project_name_from_prompt(
-    prompt: str,
-    *,
-    scoped_only: bool = False,
-    aliases: dict[str, str] | None = None,
-) -> str | None:
-    """Resolve a known repository/product from unambiguous user-authored text.
-
-    A scoped mention (``in SidePulse``, ``go to SidePulse repo``) beats
-    incidental examples elsewhere in the request. If no scoped mention
-    exists, a single non-negated alias is still safe; competing aliases are
-    deliberately refused rather than guessed.
-    """
-    project_aliases = dict(PROJECT_PROMPT_ALIASES)
-    if aliases:
-        project_aliases.update(aliases)
-    alias_patterns = [
-        re.escape(alias).replace(r"\ ", r"[\s_-]+")
-        for alias in sorted(project_aliases, key=len, reverse=True)
-        if alias
-    ]
-    if not alias_patterns:
+def _project_name_from_repo_workdir(workdir: Any) -> str | None:
+    """Derive identity only from an existing repository working directory."""
+    if not isinstance(workdir, str):
         return None
-    alias_pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(alias_patterns) + r")(?!\w)",
-        re.IGNORECASE,
-    )
+    path = Path(workdir)
+    if not path.is_absolute():
+        return None
+    try:
+        path = path.resolve()
+        if not path.is_dir():
+            return None
+    except OSError:
+        return None
+    for candidate in (path, *path.parents):
+        try:
+            if (candidate / ".git").exists():
+                return _project_display_name(candidate.name)
+        except OSError:
+            return None
+    return None
 
-    text = " ".join(prompt.split())
-    scoped: set[str] = set()
-    mentioned: set[str] = set()
-    for match in alias_pattern.finditer(text):
-        before = text[max(0, match.start() - 48):match.start()]
-        if PROJECT_NEGATION_PATTERN.search(before):
+
+def _request_text(prompt: str) -> str:
+    """Drop Codex's attachment preamble while retaining the user's request."""
+    markers = tuple(REQUEST_SECTION_PATTERN.finditer(prompt))
+    if markers:
+        prompt = prompt[markers[-1].end():]
+    return prompt.strip()
+
+
+def _js_string(source: str, start: int) -> tuple[str, int] | None:
+    """Read one JavaScript string literal and return its value and end."""
+    if start >= len(source) or source[start] not in {"'", '"', "`"}:
+        return None
+    quote = source[start]
+    value: list[str] = []
+    cursor = start + 1
+    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f"}
+    while cursor < len(source):
+        char = source[cursor]
+        if char == quote:
+            return "".join(value), cursor + 1
+        if char == "\\" and cursor + 1 < len(source):
+            cursor += 1
+            escaped = source[cursor]
+            if escaped == "u" and cursor + 4 < len(source):
+                digits = source[cursor + 1:cursor + 5]
+                try:
+                    value.append(chr(int(digits, 16)))
+                    cursor += 5
+                    continue
+                except ValueError:
+                    pass
+            value.append(escapes.get(escaped, escaped))
+        else:
+            value.append(char)
+        cursor += 1
+    return None
+
+
+def _skip_js_space_and_comments(source: str, start: int) -> int:
+    cursor = start
+    while cursor < len(source):
+        if source[cursor].isspace():
+            cursor += 1
+        elif source.startswith("//", cursor):
+            newline = source.find("\n", cursor + 2)
+            cursor = len(source) if newline < 0 else newline + 1
+        elif source.startswith("/*", cursor):
+            end = source.find("*/", cursor + 2)
+            cursor = len(source) if end < 0 else end + 2
+        else:
+            break
+    return cursor
+
+
+def _top_level_workdir(source: str, start: int) -> tuple[str | None, int]:
+    """Read the literal workdir property of one JavaScript object."""
+    if start >= len(source) or source[start] != "{":
+        return None, start
+    depth = 1
+    cursor = start + 1
+    property_start = True
+    while cursor < len(source) and depth:
+        advanced = _skip_js_space_and_comments(source, cursor)
+        if advanced != cursor:
+            cursor = advanced
             continue
-        project = project_aliases[_normalized_project_name(match.group(0))]
-        mentioned.add(project)
-        after = text[match.end():match.end() + 24]
-        if (
-            PROJECT_SCOPE_BEFORE_PATTERN.search(before)
-            or PROJECT_SCOPE_AFTER_PATTERN.search(after)
-        ):
-            scoped.add(project)
-    if len(scoped) == 1:
-        return next(iter(scoped))
-    if scoped_only or len(scoped) > 1:
-        return None
-    return next(iter(mentioned)) if len(mentioned) == 1 else None
+        if cursor >= len(source):
+            break
+        char = source[cursor]
+        key: str | None = None
+        key_end = cursor
+        if depth == 1 and property_start and char in {"'", '"'}:
+            parsed = _js_string(source, cursor)
+            if parsed is None:
+                break
+            key, key_end = parsed
+        elif depth == 1 and property_start and (char.isalpha() or char in {"_", "$"}):
+            key_end += 1
+            while key_end < len(source) and (
+                source[key_end].isalnum() or source[key_end] in {"_", "$"}
+            ):
+                key_end += 1
+            key = source[cursor:key_end]
+        if key is not None:
+            colon = _skip_js_space_and_comments(source, key_end)
+            if colon < len(source) and source[colon] == ":":
+                value_start = _skip_js_space_and_comments(source, colon + 1)
+                if key == "workdir" and value_start < len(source) and source[value_start] in {"'", '"'}:
+                    parsed_value = _js_string(source, value_start)
+                    if parsed_value is not None:
+                        return parsed_value[0], parsed_value[1]
+                property_start = False
+                cursor = colon + 1
+                continue
+        if char in {"'", '"', "`"}:
+            parsed = _js_string(source, cursor)
+            cursor = parsed[1] if parsed is not None else len(source)
+            continue
+        if char in "{[(":
+            depth += 1
+        elif char in "}])":
+            depth -= 1
+        elif char == "," and depth == 1:
+            property_start = True
+        elif depth == 1 and not char.isspace():
+            property_start = False
+        cursor += 1
+    return None, cursor
+
+
+def _exec_command_workdirs(source: str) -> list[str]:
+    """Extract only literal workdirs from actual tools.exec_command calls."""
+    workdirs: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        advanced = _skip_js_space_and_comments(source, cursor)
+        if advanced != cursor:
+            cursor = advanced
+            continue
+        if cursor >= len(source):
+            break
+        if source[cursor] in {"'", '"', "`"}:
+            parsed = _js_string(source, cursor)
+            cursor = parsed[1] if parsed is not None else len(source)
+            continue
+        if source.startswith(CODEX_EXEC_COMMAND, cursor):
+            before_ok = cursor == 0 or not (
+                source[cursor - 1].isalnum() or source[cursor - 1] in {"_", "$"}
+            )
+            call_start = _skip_js_space_and_comments(
+                source, cursor + len(CODEX_EXEC_COMMAND)
+            )
+            if before_ok and call_start < len(source) and source[call_start] == "(":
+                object_start = _skip_js_space_and_comments(source, call_start + 1)
+                workdir, end = _top_level_workdir(source, object_start)
+                if workdir is not None:
+                    workdirs.append(workdir)
+                cursor = max(cursor + 1, end)
+                continue
+        cursor += 1
+    return workdirs
 
 
 def _summary_cache_key(session_id: str, style: str) -> str:
@@ -900,8 +1034,8 @@ class PromptTracker:
         self._prompts: dict[str, str] = {}
         self._actions: dict[str, list[str]] = {}
         self._projects: dict[str, str] = {}
-        self._workspace_aliases: dict[str, dict[str, str]] = {}
         self._offsets: dict[str, int] = {}
+        self._transcript_offsets: dict[str, int] = {}
 
     def prompt_for(self, session_id: str) -> str | None:
         return self._prompts.get(session_id)
@@ -917,34 +1051,78 @@ class PromptTracker:
             return f"repository observed for this session: {project}"
         return ""
 
-    def _aliases_for_cwd(self, cwd: str | None) -> dict[str, str]:
-        aliases = dict(PROJECT_PROMPT_ALIASES)
-        if not cwd:
-            return aliases
-        root = Path(cwd)
-        if root.name.casefold() not in GENERIC_WORKDIR_NAMES:
-            return aliases
-        cache_key = str(root)
-        discovered = self._workspace_aliases.get(cache_key)
-        if discovered is None:
-            discovered = {}
+    def _project_from_codex_transcript(self, transcript_path: Any) -> str | None:
+        """Read only structured tool working directories from a Codex rollout.
+
+        Desktop Codex hooks report the session's original cwd, which may be a
+        generic workspace, while the actual exec call records its explicit
+        ``workdir`` in the rollout. Messages, generated titles, command text,
+        and tool output are deliberately ignored as identity sources.
+        """
+        if not isinstance(transcript_path, str) or not transcript_path:
+            return None
+        path = Path(transcript_path)
+        key = str(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        first_read = key not in self._transcript_offsets
+        offset = self._transcript_offsets.get(
+            key, max(0, size - CODEX_TRANSCRIPT_RECOVERY_BYTES)
+        )
+        if size < offset:
+            first_read = True
+            offset = 0
+        if size == offset:
+            return None
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(size - offset)
+        except OSError:
+            return None
+        self._transcript_offsets[key] = size
+        lines = chunk.splitlines()
+        if first_read and offset and lines:
+            lines = lines[1:]
+        lines = lines[-CODEX_TRANSCRIPT_RECOVERY_LINES:]
+
+        latest: str | None = None
+        for raw_line in lines:
             try:
-                children = tuple(root.iterdir())
-            except OSError:
-                children = ()
-            for child in children:
-                try:
-                    is_repo = child.is_dir() and (child / ".git").exists()
-                except OSError:
-                    is_repo = False
-                if not is_repo or child.name.startswith("."):
-                    continue
-                discovered[_normalized_project_name(child.name)] = (
-                    _project_display_name(child.name)
-                )
-            self._workspace_aliases[cache_key] = discovered
-        aliases.update(discovered)
-        return aliases
+                record = json.loads(raw_line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("type") != "response_item":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            workdirs: list[str] = []
+            if payload.get("type") == "custom_tool_call" and payload.get("name") == "exec":
+                source = payload.get("input")
+                if isinstance(source, str):
+                    workdirs.extend(_exec_command_workdirs(source))
+            elif payload.get("type") == "function_call" and payload.get("name") == "exec_command":
+                arguments = payload.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = {}
+                if isinstance(arguments, dict) and isinstance(arguments.get("workdir"), str):
+                    workdirs.append(arguments["workdir"])
+            projects = {
+                project
+                for workdir in workdirs
+                if (project := _project_name_from_repo_workdir(workdir)) is not None
+            }
+            if len(projects) == 1:
+                latest = next(iter(projects))
+        return latest
 
     def poll(self) -> None:
         for name in ("claude.jsonl", "codex.jsonl"):
@@ -984,26 +1162,18 @@ class PromptTracker:
                 project = _project_name_from_cwd(event.get("cwd"))
                 if project:
                     self._projects[session_id] = project
+                elif name == "codex.jsonl":
+                    tool_project = self._project_from_codex_transcript(
+                        event.get("transcript_path")
+                    )
+                    if tool_project:
+                        self._projects[session_id] = tool_project
                 hook = event.get("hook_event_name")
                 if hook == "UserPromptSubmit":
                     prompt = event.get("prompt")
                     if isinstance(prompt, str) and prompt.strip():
-                        prompt = prompt.strip()
-                        self._prompts[session_id] = prompt
+                        self._prompts[session_id] = _request_text(prompt)
                         self._actions[session_id] = []  # new turn, new actions
-                        scoped_project = _project_name_from_prompt(
-                            prompt,
-                            scoped_only=True,
-                            aliases=self._aliases_for_cwd(event.get("cwd")),
-                        )
-                        inferred_project = scoped_project
-                        if inferred_project is None and session_id not in self._projects:
-                            inferred_project = _project_name_from_prompt(
-                                prompt,
-                                aliases=self._aliases_for_cwd(event.get("cwd")),
-                            )
-                        if inferred_project is not None and project is None:
-                            self._projects[session_id] = inferred_project
                 elif hook == "PreToolUse":
                     tool_input = event.get("tool_input")
                     description = None
@@ -1240,6 +1410,9 @@ class LiveActivityDaemon:
         self._last_pushed_signature: tuple | None = None
         self._last_pushed_state: dict[str, Any] | None = None
         self._last_push_at = 0.0
+        self._push_state_lock = threading.RLock()
+        self._update_token_generation = 0
+        self._retired_activity_ids: set[str] = set()
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
         self._pushes_this_activity = 0
@@ -1573,8 +1746,8 @@ class LiveActivityDaemon:
     def _summary_title(
         self, session_id: str, action: str, cwd: str | None = None
     ) -> str:
-        project = self._prompt_tracker.project_for(session_id, cwd) or "No project"
-        prefix = f"{project}: "
+        project = self._prompt_tracker.project_for(session_id, cwd)
+        prefix = f"{project}: " if project else ""
         if "; " not in action:
             return _truncate(prefix + action, SUMMARY_MAX_CHARS)
         if len(prefix) + len(action) <= SUMMARY_MAX_CHARS:
@@ -1591,6 +1764,14 @@ class LiveActivityDaemon:
     def _refresh_finished_summaries(self) -> None:
         """Refresh rows that outlived the status used to queue their result."""
         changed = False
+        for agent_id, row in self._recent_finished.items():
+            name = row.get("name")
+            if not isinstance(name, str) or not name.startswith("No project: "):
+                continue
+            session_id = agent_id.rsplit(":", 1)[-1]
+            project = self._prompt_tracker.project_for(session_id)
+            row["name"] = f"{project}: {name[12:]}" if project else name[12:]
+            changed = True
         for session_id, status in tuple(self._settled_statuses.items()):
             row = self._recent_finished.get(status.agent_id)
             if row is None:
@@ -1878,6 +2059,93 @@ class LiveActivityDaemon:
         stamps = [stamp for stamp in stamps if isinstance(stamp, (int, float))]
         return now - min(stamps) if stamps else None
 
+    def register_update_token(self, token: str, meta: dict[str, Any]) -> bool:
+        """Elect the current activity token and hydrate it on its next tick.
+
+        A locally created activity begins with fallback content. Reusing the
+        previous activity's pushed signature made the daemon believe that
+        fallback was already current, so the phone could remain on
+        ``All quiet`` until an unrelated change. Token rotations also leave
+        only one valid update destination.
+        """
+        with self._push_state_lock:
+            activity_id = str(meta.get("activity_id", ""))
+            previous = self.tokens.entries("update")
+            current_meta = next(iter(previous.values()), {})
+            current_activity_id = str(current_meta.get("activity_id", ""))
+            incoming_observed_at = meta.get("activity_observed_at")
+            current_observed_at = current_meta.get("activity_observed_at")
+            if activity_id in self._retired_activity_ids or (
+                activity_id
+                and current_activity_id
+                and activity_id != current_activity_id
+                and (
+                        isinstance(incoming_observed_at, (int, float))
+                        and isinstance(current_observed_at, (int, float))
+                        and incoming_observed_at < current_observed_at
+                )
+            ):
+                _log(f"ignoring retired activity token {activity_id[:8]}")
+                return False
+            started = self._activity_started_at(activity_id)
+            registered_meta = {
+                **meta,
+                "activity_started_at": started if started is not None else time.time(),
+            }
+            owner_changed = self.tokens.replace("update", token, registered_meta)
+            if owner_changed:
+                if current_activity_id and current_activity_id != activity_id:
+                    self._retired_activity_ids.add(current_activity_id)
+                    while len(self._retired_activity_ids) > 32:
+                        self._retired_activity_ids.pop()
+                previous_activity_ids = {
+                    str(entry.get("activity_id", "")) for entry in previous.values()
+                }
+                if not previous or activity_id not in previous_activity_ids:
+                    self._pushes_this_activity = 0
+                self._update_token_generation += 1
+                self._last_pushed_signature = None
+                self._last_pushed_state = None
+                self._last_push_at = 0.0
+                self._wake.set()
+            self._activity_live = True
+            self._start_push_attempts = 0
+        return owner_changed
+
+    def register_push_to_start_token(self, token: str, meta: dict[str, Any]) -> bool:
+        """Register future-start authority without touching a live activity."""
+        changed = self.tokens.replace_for_device("push_to_start", token, meta)
+        self._start_push_attempts = 0
+        self._wake.set()
+        return changed
+
+    def reset_activity(self, activity_id: str = "") -> bool:
+        """Reset only the activity that reported its own dismissal."""
+        with self._push_state_lock:
+            current_ids = {
+                str(meta.get("activity_id", ""))
+                for meta in self.tokens.entries("update").values()
+            }
+            if activity_id and activity_id not in current_ids:
+                _log(f"ignoring reset from non-current activity {activity_id[:8]}")
+                return False
+            self._end_stale_activity("app reports no activity")
+            return True
+
+    def _retire_update_tokens(self) -> None:
+        """Prevent ended activity observers from reclaiming token ownership."""
+        entries = self.tokens.entries("update")
+        for meta in entries.values():
+            activity_id = str(meta.get("activity_id", ""))
+            if activity_id:
+                self._retired_activity_ids.add(activity_id)
+        while len(self._retired_activity_ids) > 32:
+            self._retired_activity_ids.pop()
+        self.tokens.clear("update")
+        self._update_token_generation += 1
+        self._last_pushed_signature = None
+        self._last_pushed_state = None
+
     def _maybe_push_to_start(self, content_state: dict[str, Any], now: float) -> None:
         if not self.tokens.tokens("push_to_start"):
             return
@@ -1929,7 +2197,9 @@ class LiveActivityDaemon:
         alert: dict[str, str] | None = None,
         important: bool = True,
     ) -> None:
-        self._last_push_at = now
+        with self._push_state_lock:
+            token_generation = self._update_token_generation
+            self._last_push_at = now
         aps: dict[str, Any] = {
             "timestamp": int(now),
             "event": "update",
@@ -1955,10 +2225,21 @@ class LiveActivityDaemon:
                 "body": alert["body"],
                 "sound": "default",
             }
-        self._apns_fanout("update", {"aps": aps}, priority=priority)
-        self._activity_live = True
-        self._last_pushed_signature = _structure_signature(content_state)
-        self._last_pushed_state = content_state
+        accepted = self._apns_fanout("update", {"aps": aps}, priority=priority)
+        with self._push_state_lock:
+            if token_generation != self._update_token_generation:
+                # A new activity registered while the old token's push was in
+                # flight. Keep its hydration pending for the immediately
+                # awakened next tick.
+                self._wake.set()
+                return
+            if not accepted:
+                # The signature remains pending, so the next eligible tick
+                # retries instead of waiting for the heartbeat.
+                return
+            self._activity_live = True
+            self._last_pushed_signature = _structure_signature(content_state)
+            self._last_pushed_state = content_state
 
     def _queue_dot_state(
         self,
@@ -2149,44 +2430,46 @@ class LiveActivityDaemon:
             }
 
     def _end_stale_activity(self, reason: str) -> None:
-        with self._condition:
-            latest = self._latest
-        if self.tokens.tokens("update"):
-            _log(f"{reason}; ending stale activity")
-            payload = {
-                "aps": {
-                    "timestamp": int(time.time()),
-                    "event": "end",
-                    "dismissal-date": int(time.time()),
-                    "content-state": latest or {
-                        "aggregateMode": "idle_ready",
-                        "activeCount": 0,
-                        "agents": [],
-                        "updatedAt": round(time.time(), 1),
-                    },
+        with self._push_state_lock:
+            with self._condition:
+                latest = self._latest
+            if self.tokens.tokens("update"):
+                _log(f"{reason}; ending stale activity")
+                payload = {
+                    "aps": {
+                        "timestamp": int(time.time()),
+                        "event": "end",
+                        "dismissal-date": int(time.time()),
+                        "content-state": latest or {
+                            "aggregateMode": "idle_ready",
+                            "activeCount": 0,
+                            "agents": [],
+                            "updatedAt": round(time.time(), 1),
+                        },
+                    }
                 }
-            }
-            self._apns_fanout("update", payload)
-        else:
-            _log(f"{reason}; will restart")
-        self.tokens.clear("update")
-        self._activity_live = False
-        self._start_push_attempts = 0
+                self._apns_fanout("update", payload)
+            else:
+                _log(f"{reason}; will restart")
+            self._retire_update_tokens()
+            self._activity_live = False
+            self._start_push_attempts = 0
 
     def _push_end(self, content_state: dict[str, Any], now: float) -> None:
-        payload = {
-            "aps": {
-                "timestamp": int(now),
-                "event": "end",
-                "content-state": content_state,
-                "dismissal-date": int(now),
+        with self._push_state_lock:
+            payload = {
+                "aps": {
+                    "timestamp": int(now),
+                    "event": "end",
+                    "content-state": content_state,
+                    "dismissal-date": int(now),
+                }
             }
-        }
-        _log("ending activity (idle)")
-        self._apns_fanout("update", payload)
-        self.tokens.clear("update")
-        self._activity_live = False
-        self._last_push_state = None
+            _log("ending activity (idle)")
+            self._apns_fanout("update", payload)
+            self._retire_update_tokens()
+            self._activity_live = False
+            self._last_push_state = None
 
     # -- HTTP ----------------------------------------------------------
 
@@ -2305,13 +2588,15 @@ class LiveActivityDaemon:
                 kind = body.get("kind")
                 token = body.get("token", "")
                 if kind == "reset":
-                    # The app launched and found no live activity on the
-                    # phone — whatever update tokens we hold are dead.
-                    if daemon._is_reset_echo(time.time()):
+                    activity_id = str(body.get("activity_id", ""))
+                    # Legacy unqualified resets can still echo a start push;
+                    # current clients identify the dismissed activity, so a
+                    # stale duplicate cannot clear the selected winner.
+                    if not activity_id and daemon._is_reset_echo(time.time()):
                         _log("ignoring reset echo just after a start push")
                         self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                         return
-                    daemon._end_stale_activity("app reports no activity")
+                    daemon.reset_activity(activity_id)
                     self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                     return
                 if (
@@ -2324,38 +2609,26 @@ class LiveActivityDaemon:
                 meta = {
                     "device": str(body.get("device", "")),
                     "activity_id": str(body.get("activity_id", "")),
+                    "activity_observed_at": body.get("activity_observed_at"),
                 }
-                if kind == "update":
-                    # The app re-registers constantly, so the clock has to
-                    # start with the ACTIVITY, not with the latest
-                    # registration, or the rotation never comes due.
-                    started = daemon._activity_started_at(meta["activity_id"])
-                    meta["activity_started_at"] = (
-                        started if started is not None else time.time()
-                    )
-                is_new = not daemon.tokens.contains(kind, token)
                 dot_owner_changed = False
-                if kind == "dot_device":
+                if kind == "update":
+                    daemon.register_update_token(token, meta)
+                elif kind == "push_to_start":
+                    daemon.register_push_to_start_token(token, meta)
+                elif kind == "dot_device":
                     # Alert pushes may target several phones, but only the
                     # most recently registered Dot owner receives LED writes.
                     dot_owner_changed = daemon.tokens.replace(kind, token, meta)
-                else:
+                elif kind == "device":
                     daemon.tokens.register(kind, token, meta)
-                if kind == "update":
-                    daemon._activity_live = True
+                if kind == "push_to_start":
+                    # This token controls only future starts. Its rotation
+                    # says nothing about an existing activity's update token,
+                    # and ending that activity here races a local app start.
+                    # Registration does prove the app is reachable, so reopen
+                    # any start-push cap without touching the current owner.
                     daemon._start_push_attempts = 0
-                elif kind == "push_to_start":
-                    if is_new:
-                        self._pushes_this_activity = 0
-                        # Fresh install or token rotation: any previously
-                        # known activity is stale. End it, forget its tokens,
-                        # and allow an immediate restart on the next tick.
-                        daemon._end_stale_activity("new push-to-start token")
-                    else:
-                        # The app is running and reachable again, so earlier
-                        # unanswered start pushes (iOS drops them while an app
-                        # stays force-quit) should not keep the cap closed.
-                        daemon._start_push_attempts = 0
                 elif kind in ("device", "dot_device"):
                     if daemon.request_dot_resync(force=dot_owner_changed):
                         daemon._wake.set()

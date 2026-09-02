@@ -17,6 +17,10 @@ final class LiveMonitorManager: ObservableObject {
     @Published var statusMessage: String = "Off"
 
     private var observersStarted = false
+    private var localActivityStartInProgress = false
+    private var observedActivityIDs: Set<String> = []
+    private var selectedActivityID: String?
+    private var intentionallyEndedActivityIDs: Set<String> = []
 
     var isSupported: Bool {
         if #available(iOS 17.2, *) { return true }
@@ -55,8 +59,8 @@ final class LiveMonitorManager: ObservableObject {
         }
 
         Task {
-            for await activity in Activity<AgentActivityAttributes>.activityUpdates {
-                self.observe(activity: activity, model: model)
+            for await _ in Activity<AgentActivityAttributes>.activityUpdates {
+                self.reconcileActivities(model: model)
             }
         }
         if #available(iOS 17.2, *) {
@@ -90,23 +94,30 @@ final class LiveMonitorManager: ObservableObject {
 
     /// Keep exactly one activity: the freshest. Older ones are orphans whose
     /// tokens the daemon no longer has, so only the app can end them. With
-    /// none left, tell the daemon so it can start a fresh one.
+    /// none left, start one locally so the app and daemon cannot race to
+    /// create competing activities.
     @available(iOS 17.2, *)
     private func reconcileActivities(model: AppModel) {
-        var existing = Activity<AgentActivityAttributes>.activities
-        if existing.count > 1 {
-            existing.sort { $0.content.state.updatedAt > $1.content.state.updatedAt }
-            for stale in existing.dropFirst() {
+        let existing = Activity<AgentActivityAttributes>.activities
+        let selected = selectedActivityID.flatMap { selectedID in
+            existing.first { $0.id == selectedID }
+        } ?? existing.max { lhs, rhs in
+            if lhs.content.state.activeCount != rhs.content.state.activeCount {
+                return lhs.content.state.activeCount < rhs.content.state.activeCount
+            }
+            return lhs.content.state.updatedAt < rhs.content.state.updatedAt
+        }
+
+        if let selected {
+            selectedActivityID = selected.id
+            for stale in existing where stale.id != selected.id {
                 let activity = stale
+                intentionallyEndedActivityIDs.insert(activity.id)
                 Task { await activity.end(nil, dismissalPolicy: .immediate) }
             }
-            existing = [existing[0]]
-        }
-        for activity in existing {
-            observe(activity: activity, model: model)
-        }
-        if existing.isEmpty {
-            Task { await self.sendReset(model: model) }
+            observe(activity: selected, model: model)
+        } else {
+            selectedActivityID = nil
             // iOS refuses push-to-start while an app stays force-quit (and
             // after an app update), so waiting for the Mac can leave the
             // Live Activity gone for good. The app can always start one
@@ -117,30 +128,80 @@ final class LiveMonitorManager: ObservableObject {
 
     @available(iOS 17.2, *)
     private func startActivityLocally(model: AppModel) {
+        guard !localActivityStartInProgress else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             statusMessage = "Live Activities are turned off in Settings"
             return
         }
+        localActivityStartInProgress = true
         Task {
             let label = await hostLabel(model: model)
-            let state = AgentActivityAttributes.ContentState(
-                aggregateMode: "idle_ready",
-                activeCount: 0,
-                agents: [],
-                updatedAt: Date().timeIntervalSince1970
-            )
+            let state = await initialContentState(model: model)
+
+            // A push-to-start may have landed while the snapshot requests
+            // were in flight. Let that activity win instead of creating a
+            // second one.
+            guard Activity<AgentActivityAttributes>.activities.isEmpty else {
+                localActivityStartInProgress = false
+                reconcileActivities(model: model)
+                return
+            }
             do {
                 let activity = try Activity.request(
                     attributes: AgentActivityAttributes(hostLabel: label),
                     content: ActivityContent(state: state, staleDate: nil),
                     pushType: .token
                 )
+                localActivityStartInProgress = false
+                selectedActivityID = activity.id
                 observe(activity: activity, model: model)
+                reconcileActivities(model: model)
                 statusMessage = "Live Activity started"
             } catch {
+                localActivityStartInProgress = false
                 statusMessage = "Could not start Live Activity: \(error.localizedDescription)"
+                // Local creation is the primary path. Only after it fails do
+                // we clear the daemon's stale token and let push-to-start try.
+                if Activity<AgentActivityAttributes>.activities.isEmpty {
+                    await sendReset(model: model)
+                } else {
+                    reconcileActivities(model: model)
+                }
             }
         }
+    }
+
+    private func initialContentState(model: AppModel) async -> AgentActivityAttributes.ContentState {
+        let fallback = AgentActivityAttributes.ContentState(
+            aggregateMode: "idle_ready",
+            activeCount: 0,
+            agents: [],
+            updatedAt: Date().timeIntervalSince1970
+        )
+        guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("snapshot"),
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode),
+              let snapshot = try? JSONDecoder().decode(AgentSnapshot.self, from: data)
+        else { return fallback }
+
+        return AgentActivityAttributes.ContentState(
+            aggregateMode: snapshot.aggregateMode,
+            activeCount: snapshot.activeCount,
+            agents: snapshot.agents.map {
+                AgentActivityAttributes.AgentRow(
+                    id: $0.id,
+                    name: $0.name,
+                    mode: $0.mode,
+                    detail: $0.detail,
+                    provider: $0.provider,
+                    cwd: $0.cwd,
+                    finishedAt: $0.finishedAt,
+                    unread: $0.unread
+                )
+            },
+            updatedAt: snapshot.updatedAt
+        )
     }
 
     /// The daemon's own label for the host; activity attributes are fixed at
@@ -156,14 +217,16 @@ final class LiveMonitorManager: ObservableObject {
         return label
     }
 
-    private func sendReset(model: AppModel) async {
+    private func sendReset(model: AppModel, activityID: String? = nil) async {
         guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("register") else {
             return
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["kind": "reset"])
+        var payload = ["kind": "reset"]
+        if let activityID { payload["activity_id"] = activityID }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = 10
         _ = try? await URLSession.shared.data(for: request)
     }
@@ -210,36 +273,71 @@ final class LiveMonitorManager: ObservableObject {
 
     @available(iOS 17.2, *)
     private func observe(activity: Activity<AgentActivityAttributes>, model: AppModel) {
-        // iOS happily stacks a second Live Activity when the daemon restarts
-        // one — the newest activity wins, everything else ends immediately.
-        Task {
-            for other in Activity<AgentActivityAttributes>.activities where other.id != activity.id {
-                await other.end(nil, dismissalPolicy: .immediate)
-            }
-        }
+        guard observedActivityIDs.insert(activity.id).inserted else { return }
+        let observedAt = Date().timeIntervalSince1970
         // Push the current token right away (an activity observed at launch
         // may not re-emit it), then follow rotations.
         if let current = activity.pushToken {
-            Task { await self.register(kind: "update", token: current, model: model, activityID: activity.id) }
+            Task {
+                await self.register(
+                    kind: "update",
+                    token: current,
+                    model: model,
+                    activityID: activity.id,
+                    activityObservedAt: observedAt
+                )
+            }
         }
         Task {
             for await tokenData in activity.pushTokenUpdates {
-                await self.register(kind: "update", token: tokenData, model: model, activityID: activity.id)
+                await self.register(
+                    kind: "update",
+                    token: tokenData,
+                    model: model,
+                    activityID: activity.id,
+                    activityObservedAt: observedAt
+                )
             }
         }
         // A swiped-away (or 8-hour-expired) activity reports .dismissed;
         // tell the daemon so it can start a fresh one while agents are
         // active. Programmatic ends (.ended) stay silent — those are the
         // daemon's own idle-end and the dedup cleanup.
-        Task {
-            for await state in activity.activityStateUpdates where state == .dismissed {
-                await self.sendReset(model: model)
-                break
+        Task { [weak self] in
+            for await state in activity.activityStateUpdates {
+                if state == .dismissed {
+                    let intentional = self?.intentionallyEndedActivityIDs.remove(activity.id) != nil
+                    if !intentional {
+                        if self?.selectedActivityID == activity.id {
+                            self?.selectedActivityID = nil
+                        }
+                        await self?.sendReset(model: model, activityID: activity.id)
+                    }
+                    break
+                }
+                if state == .ended {
+                    self?.intentionallyEndedActivityIDs.remove(activity.id)
+                    if self?.selectedActivityID == activity.id {
+                        self?.selectedActivityID = nil
+                    }
+                    break
+                }
+            }
+            self?.observedActivityIDs.remove(activity.id)
+            if self?.selectedActivityID == activity.id {
+                self?.selectedActivityID = nil
             }
         }
     }
 
-    private func register(kind: String, token: Data, model: AppModel, activityID: String? = nil) async {
+    private func register(
+        kind: String,
+        token: Data,
+        model: AppModel,
+        activityID: String? = nil,
+        activityObservedAt: TimeInterval? = nil
+    ) async {
+        if kind == "update", selectedActivityID != activityID { return }
         let tokenHex = token.map { String(format: "%02x", $0) }.joined()
         guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("register") else {
             statusMessage = "Invalid server URL"
@@ -251,6 +349,7 @@ final class LiveMonitorManager: ObservableObject {
             "device": await deviceName(),
         ]
         if let activityID { payload["activity_id"] = activityID }
+        if let activityObservedAt { payload["activity_observed_at"] = activityObservedAt }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -263,6 +362,7 @@ final class LiveMonitorManager: ObservableObject {
         // retries with backoff before giving up.
         var delay: UInt64 = 2
         for attempt in 1...5 {
+            if kind == "update", selectedActivityID != activityID { return }
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
