@@ -71,6 +71,82 @@ def test_finished_rows_dedupe_by_name_for_reconnected_sessions():
     assert [row["id"] for row in state["agents"]] == ["codex:session:new"]
 
 
+def test_content_state_compacts_mobile_project_labels_without_mutating_statuses():
+    statuses = [
+        make_status(
+            "trader",
+            AgentMode.WORKING,
+            name="CSPennyScalpingTrader: Tune entry rules; working",
+        ),
+        make_status(
+            "scaler",
+            AgentMode.WORKING,
+            name="CSPennyScaler: Review fills; working",
+        ),
+        make_status(
+            "other",
+            AgentMode.WORKING,
+            name="SidePulse: Improve titles; working",
+        ),
+    ]
+    canonical_rows = {status.agent_id: status_row(status) for status in statuses}
+
+    state = build_content_state(statuses, aggregate_mode="working")
+    mobile_rows = {row["id"]: row for row in state["agents"]}
+
+    assert mobile_rows["trader"]["name"] == "Trading: Tune entry rules; working"
+    assert mobile_rows["scaler"]["name"] == "Trading: Review fills; working"
+    assert mobile_rows["other"]["name"] == "SidePulse: Improve titles; working"
+    assert statuses[0].display_name == (
+        "CSPennyScalpingTrader: Tune entry rules; working"
+    )
+    assert canonical_rows["trader"]["name"] == statuses[0].display_name
+    assert status_row(statuses[1])["name"] == statuses[1].display_name
+
+
+def test_content_state_compacts_recent_rows_before_dedupe_without_mutating_inputs():
+    running = make_status(
+        "current",
+        AgentMode.WORKING,
+        name="CSPennyScalpingTrader: Review fills",
+    )
+    finished = [
+        {
+            "id": "duplicate",
+            "name": "CSPennyScaler: Review fills",
+            "mode": "completed",
+            "finishedAt": 3.0,
+        },
+        {
+            "id": "finished-trading",
+            "name": "CSPennyScaler: Reconcile positions; completed",
+            "mode": "completed",
+            "finishedAt": 2.0,
+        },
+        {
+            "id": "finished-other",
+            "name": "Aura: Calendar repaired; completed",
+            "mode": "completed",
+            "finishedAt": 1.0,
+        },
+    ]
+    canonical_finished = json.loads(json.dumps(finished))
+
+    state = build_content_state(
+        [running], aggregate_mode="working", recent_finished=finished
+    )
+    mobile_rows = {row["id"]: row for row in state["agents"]}
+
+    assert "duplicate" not in mobile_rows
+    assert mobile_rows["finished-trading"]["name"] == (
+        "Trading: Reconcile positions; completed"
+    )
+    assert mobile_rows["finished-other"]["name"] == (
+        "Aura: Calendar repaired; completed"
+    )
+    assert finished == canonical_finished
+
+
 def test_content_state_truncates_long_fields_and_serializes():
     status = make_status("a", AgentMode.TOOL_RUNNING, name="x" * 200, tool="y" * 200)
     state = build_content_state([status], aggregate_mode="tool_running")

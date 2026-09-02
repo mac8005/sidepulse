@@ -523,7 +523,7 @@ def build_content_state(
         key=lambda status: (MODE_PRIORITY.get(status.mode, 99), -status.updated_at.timestamp()),
     )
     active_rows = [
-        status_row(status)
+        _ios_content_row(status_row(status))
         for status in ordered
         if status.mode.value not in TERMINAL_MODES
     ][:MAX_AGENT_ROWS]
@@ -531,7 +531,8 @@ def build_content_state(
     seen_ids = {row["id"] for row in active_rows}
     seen_names = {row["name"] for row in active_rows}
     finished_rows = []
-    for row in sorted(recent_finished or [], key=lambda r: -r.get("finishedAt", 0.0)):
+    for saved_row in sorted(recent_finished or [], key=lambda r: -r.get("finishedAt", 0.0)):
+        row = _ios_content_row(saved_row)
         if row["id"] in seen_ids or row["name"] in seen_names:
             continue
         seen_ids.add(row["id"])
@@ -721,6 +722,10 @@ PROJECT_DISPLAY_NAMES = {
     "sidepulse feature": "SidePulse",
     "wardrobe app": "Kleido",
 }
+IOS_COMPACT_PROJECT_LABELS = {
+    "cspennyscaler": "Trading",
+    "cspennyscalpingtrader": "Trading",
+}
 PROJECT_PROMPT_ALIASES = dict(PROJECT_DISPLAY_NAMES)
 PROJECT_SCOPE_BEFORE_PATTERN = re.compile(
     r"\b(?:go\s+to|open|use|fix|deploy|update|in|inside|within|from|for)\s+"
@@ -746,6 +751,20 @@ def _normalized_project_name(name: str) -> str:
 def _project_display_name(name: str) -> str:
     normalized = _normalized_project_name(name)
     return PROJECT_DISPLAY_NAMES.get(normalized, name.strip())
+
+
+def _ios_content_row(row: dict[str, Any]) -> dict[str, Any]:
+    mobile_row = dict(row)
+    name = mobile_row.get("name")
+    if not isinstance(name, str):
+        return mobile_row
+    project, separator, task = name.partition(": ")
+    compact_project = IOS_COMPACT_PROJECT_LABELS.get(
+        _normalized_project_name(project)
+    )
+    if separator and compact_project:
+        mobile_row["name"] = f"{compact_project}: {task}"
+    return mobile_row
 
 
 def _project_name_from_cwd(cwd: str | None) -> str | None:
