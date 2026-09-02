@@ -141,6 +141,7 @@ class LiveActivityConfig:
 class PendingDotPush:
     command_id: str
     state: str
+    has_unread_finished: bool
     content_state: dict[str, Any]
     created_at: float
     issued_at: float
@@ -608,6 +609,19 @@ def build_content_state(
         "agents": active_rows + finished_rows,
         "updatedAt": round(time.time(), 1),
     }
+
+
+def _has_unread_finished(content_state: dict[str, Any]) -> bool:
+    """Whether the visible rows contain a finished item not yet opened."""
+    rows = content_state.get("agents")
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(row, dict)
+        and row.get("mode") == "completed"
+        and row.get("unread") is True
+        for row in rows
+    )
 
 
 def compute_alerts(
@@ -1417,10 +1431,11 @@ class LiveActivityDaemon:
         self._last_start_push_at = 0.0
         self._pushes_this_activity = 0
         self._last_dot_state: str | None = None
+        self._last_dot_has_unread_finished: bool | None = None
         self._last_dot_issued_at = 0.0
         self._current_dot_state: str | None = None
         self._current_dot_content_state: dict[str, Any] | None = None
-        self._dot_candidate_state: str | None = None
+        self._dot_candidate_signature: tuple[str, bool] | None = None
         self._dot_candidate_since = 0.0
         self._pending_dot: PendingDotPush | None = None
         self._dot_lock = threading.Lock()
@@ -2250,13 +2265,21 @@ class LiveActivityDaemon:
         force: bool = False,
     ) -> bool:
         """Create one current Dot command; a newer state supersedes it."""
+        has_unread_finished = _has_unread_finished(content_state)
+        signature = (dot_state, has_unread_finished)
         with self._dot_lock:
             self._current_dot_state = dot_state
             self._current_dot_content_state = dict(content_state)
             if not force:
-                if self._pending_dot is not None and self._pending_dot.state == dot_state:
+                if self._pending_dot is not None and (
+                    self._pending_dot.state,
+                    self._pending_dot.has_unread_finished,
+                ) == signature:
                     return False
-                if self._last_dot_state == dot_state:
+                if (
+                    self._last_dot_state,
+                    self._last_dot_has_unread_finished,
+                ) == signature:
                     self._pending_dot = None
                     return False
             issued_at = max(now, self._last_dot_issued_at + 0.001)
@@ -2264,6 +2287,7 @@ class LiveActivityDaemon:
             self._pending_dot = PendingDotPush(
                 command_id=str(uuid4()),
                 state=dot_state,
+                has_unread_finished=has_unread_finished,
                 content_state=dict(content_state),
                 created_at=now,
                 issued_at=issued_at,
@@ -2275,13 +2299,17 @@ class LiveActivityDaemon:
         self, dot_state: str, content_state: dict[str, Any], now: float
     ) -> bool:
         """Coalesce brief state flaps before consuming a silent-push slot."""
+        signature = (dot_state, _has_unread_finished(content_state))
         with self._dot_lock:
             self._current_dot_state = dot_state
             self._current_dot_content_state = dict(content_state)
-            if self._dot_candidate_state != dot_state:
-                self._dot_candidate_state = dot_state
+            if self._dot_candidate_signature != signature:
+                self._dot_candidate_signature = signature
                 self._dot_candidate_since = now
-                if self._pending_dot is not None and self._pending_dot.state != dot_state:
+                if self._pending_dot is not None and (
+                    self._pending_dot.state,
+                    self._pending_dot.has_unread_finished,
+                ) != signature:
                     self._pending_dot = None
             settled = now - self._dot_candidate_since >= DOT_STATE_SETTLE_SECONDS
         if not settled:
@@ -2301,6 +2329,10 @@ class LiveActivityDaemon:
                 else None
             )
             pending = self._pending_dot
+            signature = (
+                dot_state,
+                _has_unread_finished(content_state) if content_state is not None else False,
+            )
             if (
                 not force
                 and moment - self._last_dot_resync_at < DOT_RESYNC_COOLDOWN_SECONDS
@@ -2310,7 +2342,7 @@ class LiveActivityDaemon:
             if (
                 not force
                 and pending is not None
-                and pending.state == dot_state
+                and (pending.state, pending.has_unread_finished) == signature
                 and pending.accepted_attempts < len(DOT_PUSH_RETRY_OFFSETS_SECONDS)
                 and moment < pending.created_at + DOT_PUSH_EXPIRY_SECONDS
             ):
@@ -2329,6 +2361,7 @@ class LiveActivityDaemon:
                 state = pending.state
             else:
                 self._last_dot_state = pending.state
+                self._last_dot_has_unread_finished = pending.has_unread_finished
                 self._pending_dot = None
                 state = pending.state
         if status in DOT_ACK_SUCCESS_STATUSES:
@@ -2356,6 +2389,7 @@ class LiveActivityDaemon:
                 "dot": {
                     "aggregateMode": pending.content_state["aggregateMode"],
                     "activeCount": pending.content_state["activeCount"],
+                    "hasUnreadFinished": pending.has_unread_finished,
                     "host": self.config.host_label,
                     "updatedAt": pending.content_state["updatedAt"],
                     "commandID": pending.command_id,

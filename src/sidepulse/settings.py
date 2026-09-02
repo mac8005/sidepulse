@@ -158,6 +158,7 @@ class AgentMonitorSettings:
     recent_session_retention_seconds: float = DEFAULT_RECENT_SESSION_RETENTION_SECONDS
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     kitt_mode_enabled: bool = False
+    show_finished_enabled: bool = False
     dnd_enabled: bool = False
     dnd_schedule_enabled: bool = False
     dnd_start_time: str = DEFAULT_DND_START_TIME
@@ -459,6 +460,9 @@ class AgentMonitorSettings:
     def with_kitt_mode(self, enabled: bool) -> "AgentMonitorSettings":
         return replace(self, kitt_mode_enabled=bool(enabled))
 
+    def with_show_finished(self, enabled: bool) -> "AgentMonitorSettings":
+        return replace(self, show_finished_enabled=bool(enabled))
+
     def with_dnd(
         self,
         *,
@@ -535,6 +539,7 @@ class AgentMonitorSettings:
                 "idle_timeout_seconds": self.idle_timeout_seconds,
             },
             "kitt_mode_enabled": self.kitt_mode_enabled,
+            "show_finished_enabled": self.show_finished_enabled,
             "do_not_disturb": {
                 "enabled": self.dnd_enabled,
                 "schedule_enabled": self.dnd_schedule_enabled,
@@ -668,6 +673,7 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             DEFAULT_IDLE_TIMEOUT_SECONDS,
         ),
         kitt_mode_enabled=_bool_setting(data.get("kitt_mode_enabled"), False),
+        show_finished_enabled=_bool_setting(data.get("show_finished_enabled"), False),
         dnd_enabled=_bool_setting(
             dnd.get("enabled"),
             _bool_setting(dnd.get("manual_enabled"), False),

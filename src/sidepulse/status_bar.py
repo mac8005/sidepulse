@@ -460,6 +460,9 @@ class StatusBarController(NSObject):
         self.setup_fields = {}
         self.setup_buttons = {}
         self.last_snapshot = None
+        self.finished_tracking_initialized = False
+        self.observed_agent_modes = {}
+        self.unread_finished_agent_ids = set()
         self.last_battery_snapshot = None
         self.last_battery_error = None
         self.last_power_connected = None
@@ -585,6 +588,7 @@ class StatusBarController(NSObject):
             return
 
         self.last_snapshot = snapshot
+        self.observe_finished_sessions(snapshot)
         battery_snapshot = self.read_battery_snapshot()
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
@@ -846,6 +850,14 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def setKittModeFromCheckbox_(self, sender):
         self.set_kitt_mode(sender.state() == NSOnState)
+
+    @objc.IBAction
+    def toggleShowFinished_(self, _sender):
+        self.set_show_finished(not self.settings.show_finished_enabled)
+
+    @objc.IBAction
+    def setShowFinishedFromCheckbox_(self, sender):
+        self.set_show_finished(sender.state() == NSOnState)
 
     @objc.IBAction
     def toggleDnd_(self, _sender):
@@ -1195,6 +1207,10 @@ class StatusBarController(NSObject):
         set_checkbox_state(
             self.settings_buttons.get("kitt_mode"),
             self.settings.kitt_mode_enabled,
+        )
+        set_checkbox_state(
+            self.settings_buttons.get("show_finished"),
+            self.settings.show_finished_enabled,
         )
         set_checkbox_state(
             self.settings_buttons.get("dnd_enabled"),
@@ -1851,6 +1867,14 @@ class StatusBarController(NSObject):
                 self.set_settings_message(f"Could not save open preference: {exc}")
                 self.settings = load_settings()
 
+        if (
+            status.mode == AgentMode.COMPLETED
+            and status.agent_id in self.unread_finished_agent_ids
+        ):
+            self.unread_finished_agent_ids.discard(status.agent_id)
+            self.reset_led_controllers_for_display_change()
+            self.refresh_(None)
+
     def close_status_menu(self) -> None:
         try:
             menu = self.status_item.menu()
@@ -1903,6 +1927,23 @@ class StatusBarController(NSObject):
         self.reset_led_controllers_for_display_change()
         self.set_settings_message(
             f"KITT scanner {'enabled' if enabled else 'disabled'} for active agents."
+        )
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def set_show_finished(self, enabled: bool) -> None:
+        try:
+            self.settings = self.settings.with_show_finished(enabled)
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save Show finished setting: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.reset_led_controllers_for_display_change()
+        self.set_settings_message(
+            f"Show Finished {'enabled' if enabled else 'disabled'} for unread sessions."
         )
         self.refresh_settings_window()
         self.refresh_(None)
@@ -2080,6 +2121,50 @@ class StatusBarController(NSObject):
         if snapshot is not None and time.monotonic() < self.battery_preview_until:
             return LED_DISPLAY_BATTERY
         return LED_DISPLAY_AGENT
+
+    def observe_finished_sessions(self, snapshot) -> None:
+        active_subagent_groups = {
+            (status.provider.lower(), status.session_id)
+            for status in snapshot.statuses
+            if ":agent:" in status.agent_id
+            and status.session_id
+            and status.mode not in {AgentMode.COMPLETED, AgentMode.IDLE_READY}
+        }
+        current_modes = {}
+        for status in menu_statuses(snapshot, self.settings):
+            mode = status.mode
+            if (
+                mode == AgentMode.COMPLETED
+                and (status.provider.lower(), status.session_id)
+                in active_subagent_groups
+            ):
+                mode = AgentMode.WORKING
+            current_modes[status.agent_id] = mode
+        completed_ids = {
+            agent_id
+            for agent_id, mode in current_modes.items()
+            if mode == AgentMode.COMPLETED
+        }
+        if self.finished_tracking_initialized:
+            for agent_id in completed_ids:
+                if self.observed_agent_modes.get(agent_id) != AgentMode.COMPLETED:
+                    self.unread_finished_agent_ids.add(agent_id)
+            self.unread_finished_agent_ids.intersection_update(completed_ids)
+        else:
+            self.finished_tracking_initialized = True
+        self.observed_agent_modes = current_modes
+
+    def should_show_finished_on_leds(self, mode: AgentMode) -> bool:
+        return (
+            self.settings.show_finished_enabled
+            and bool(self.unread_finished_agent_ids)
+            and mode
+            in {
+                AgentMode.WORKING,
+                AgentMode.TOOL_RUNNING,
+                AgentMode.LONG_TASK_PROGRESS,
+            }
+        )
 
     def reset_led_controllers_for_display_change(self) -> None:
         self.led_controller.reset()
@@ -2264,7 +2349,8 @@ class StatusBarController(NSObject):
             self.sync_dnd_leds()
             return
 
-        self.sync_virtual_status_device(mode, battery_snapshot)
+        show_finished = self.should_show_finished_on_leds(mode)
+        self.sync_virtual_status_device(mode, battery_snapshot, show_finished)
 
         if time.monotonic() < self.led_animation_until_monotonic:
             return
@@ -2274,7 +2360,7 @@ class StatusBarController(NSObject):
         self.led_sync_in_flight = True
         thread = threading.Thread(
             target=self.sync_leds_worker,
-            args=(mode, battery_snapshot, display_kind),
+            args=(mode, battery_snapshot, display_kind, show_finished),
             daemon=True,
         )
         thread.start()
@@ -2323,6 +2409,7 @@ class StatusBarController(NSObject):
         self,
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
+        show_finished: bool = False,
     ) -> None:
         if not SCREEN_BAR_FEATURE_ENABLED:
             self.virtual_status_device.hide()
@@ -2357,6 +2444,7 @@ class StatusBarController(NSObject):
                     led_count=8,
                     brightness=device.brightness,
                     kitt_mode=self.settings.kitt_mode_enabled,
+                    show_finished=show_finished,
                 )
             )
 
@@ -2365,9 +2453,10 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        show_finished: bool = False,
     ) -> None:
         try:
-            self.sync_leds_now(mode, battery_snapshot, display_kind)
+            self.sync_leds_now(mode, battery_snapshot, display_kind, show_finished)
         finally:
             self.led_sync_in_flight = False
 
@@ -2376,6 +2465,7 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
         display_kind: str,
+        show_finished: bool = False,
     ) -> None:
         if dnd_is_active(self.settings):
             self.sync_dnd_leds_now()
@@ -2419,6 +2509,7 @@ class StatusBarController(NSObject):
                 result = self.agent_controller_for_device(device).sync_mode(
                     mode,
                     kitt_mode=self.settings.kitt_mode_enabled,
+                    show_finished=show_finished,
                 )
                 label = f"{device.name} {result.label}"
 
@@ -2823,6 +2914,15 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     kitt_mode.setTarget_(target)
     kitt_mode.setState_(1 if target.settings.kitt_mode_enabled else 0)
     menu.addItem_(kitt_mode)
+
+    show_finished = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Show finished",
+        "toggleShowFinished:",
+        "",
+    )
+    show_finished.setTarget_(target)
+    show_finished.setState_(1 if target.settings.show_finished_enabled else 0)
+    menu.addItem_(show_finished)
 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Do Not Disturb"))
@@ -3856,6 +3956,16 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         target,
         "setKittModeFromCheckbox:",
     )
+    show_finished = add_checkbox(
+        devices_tab,
+        "Show finished",
+        344,
+        318,
+        280,
+        24,
+        target,
+        "setShowFinishedFromCheckbox:",
+    )
     add_separator(devices_tab, 24, 282, tab_width - 48)
     add_label(devices_tab, "Do Not Disturb", 24, 248, 240, 24)
     dnd_enabled = add_checkbox(
@@ -4051,6 +4161,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "battery_leds": battery_leds,
         "battery_power_preview": battery_power_preview,
         "kitt_mode": kitt_mode,
+        "show_finished": show_finished,
         "dnd_enabled": dnd_enabled,
         "dnd_schedule": dnd_schedule,
     }

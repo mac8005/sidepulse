@@ -162,9 +162,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let issuedAt = (dot["issuedAt"] as? NSNumber)?.doubleValue
         let sourceUpdatedAt = (dot["updatedAt"] as? NSNumber)?.doubleValue
         let host = dot["host"] as? String
+        let hasUnreadFinished = dot["hasUnreadFinished"] as? Bool ?? false
         let result = MainActor.assumeIsolated {
             DotStatusMirror.shared.applyPush(
                 aggregateMode: mode,
+                hasUnreadFinished: hasUnreadFinished,
                 commandID: commandID,
                 issuedAt: issuedAt,
                 sourceUpdatedAt: sourceUpdatedAt,

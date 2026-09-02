@@ -71,6 +71,7 @@ def program_for_display_state(
     led_count: int = 8,
     brightness: int | float = 255,
     kitt_mode: bool = False,
+    show_finished: bool = False,
 ) -> str:
     if state == LedDisplayState.IDLE:
         return "off"
@@ -88,11 +89,18 @@ def program_for_display_state(
     if state == LedDisplayState.DONE:
         return apply_brightness(DONE_GREEN, brightness)
     if state == LedDisplayState.WORKING:
-        program = (
-            kitt_scanner_program(WORKING_CYAN, led_count=led_count)
-            if kitt_mode
-            else rolling_program(WORKING_CYAN, led_count=led_count)
-        )
+        if show_finished:
+            program = working_with_finished_program(
+                WORKING_CYAN,
+                led_count=led_count,
+                kitt_mode=kitt_mode,
+            )
+        else:
+            program = (
+                kitt_scanner_program(WORKING_CYAN, led_count=led_count)
+                if kitt_mode
+                else rolling_program(WORKING_CYAN, led_count=led_count)
+            )
         return apply_brightness(program, brightness)
     raise ValueError(f"Unknown LED display state: {state}")
 
@@ -136,6 +144,59 @@ def kitt_scanner_program(color: str, *, led_count: int = 8) -> str:
     )
 
 
+def working_with_finished_program(
+    color: str,
+    *,
+    led_count: int = 8,
+    kitt_mode: bool = False,
+) -> str:
+    """Keep one half green while active work moves across the other half."""
+    count = max(2, min(8, int(led_count)))
+    finished_count = count // 2
+    moving_indexes = list(range(finished_count, count))
+    reset_ms = 80 if kitt_mode else 160
+    reset = "; ".join(
+        [
+            *(
+                f"{index}:{DONE_GREEN} {reset_ms}ms cosine"
+                for index in range(finished_count)
+            ),
+            *(
+                f"{index}:off {reset_ms}ms cosine"
+                for index in moving_indexes
+            ),
+        ]
+    )
+
+    base_delay_ms = (240 if count == 2 else 85) if kitt_mode else (
+        260 if count == 2 else 95
+    )
+    delay_ms = 0
+    if len(moving_indexes) > 1:
+        delay_ms = round(base_delay_ms * (count - 1) / (len(moving_indexes) - 1))
+    duration_ms = 320 if kitt_mode else 760
+
+    if kitt_mode:
+        directions = [moving_indexes, moving_indexes[-2::-1]]
+        motion = [
+            "; ".join(
+                f"{index}:{color} {duration_ms}ms pulse {step * delay_ms}ms"
+                for step, index in enumerate(indexes)
+            )
+            for indexes in directions
+            if indexes
+        ]
+    else:
+        motion = [
+            "; ".join(
+                f"{index}:{color} {duration_ms}ms pulse {step * delay_ms}ms"
+                for step, index in enumerate(moving_indexes)
+            )
+        ]
+
+    return "\n".join([reset, *motion, "repeat"])
+
+
 def write_mode_to_leds(
     mode: AgentMode,
     *,
@@ -144,6 +205,7 @@ def write_mode_to_leds(
     dry_run: bool = False,
     brightness: int | float = 255,
     kitt_mode: bool = False,
+    show_finished: bool = False,
 ) -> LedStatusWrite:
     target = resolve_target_path(device_path=device_path, file_name=file_name)
     state = display_state_for_mode(mode)
@@ -152,6 +214,7 @@ def write_mode_to_leds(
         led_count=led_count_for_target(target),
         brightness=brightness,
         kitt_mode=kitt_mode,
+        show_finished=show_finished,
     )
     written_target = write_led_program(
         program,
@@ -214,6 +277,7 @@ class AgentLedController:
         self.last_state: LedDisplayState | None = None
         self.last_brightness: int | None = None
         self.last_kitt_mode: bool | None = None
+        self.last_show_finished: bool | None = None
         self.last_error: str | None = None
         self.last_target: Path | None = None
         self.last_attempt_monotonic = 0.0
@@ -222,19 +286,28 @@ class AgentLedController:
         self.last_state = None
         self.last_brightness = None
         self.last_kitt_mode = None
+        self.last_show_finished = None
         self.last_error = None
         self.last_target = None
         self.last_attempt_monotonic = 0.0
 
-    def sync_mode(self, mode: AgentMode, *, kitt_mode: bool = False) -> LedStatusWrite:
+    def sync_mode(
+        self,
+        mode: AgentMode,
+        *,
+        kitt_mode: bool = False,
+        show_finished: bool = False,
+    ) -> LedStatusWrite:
         state = display_state_for_mode(mode)
         brightness = normalize_brightness(self.brightness)
         kitt_mode = bool(kitt_mode)
+        show_finished = state == LedDisplayState.WORKING and bool(show_finished)
         now = time.monotonic()
         if (
             state == self.last_state
             and brightness == self.last_brightness
             and kitt_mode == self.last_kitt_mode
+            and show_finished == self.last_show_finished
             and self.last_error is None
         ):
             return LedStatusWrite(
@@ -247,6 +320,7 @@ class AgentLedController:
             state == self.last_state
             and brightness == self.last_brightness
             and kitt_mode == self.last_kitt_mode
+            and show_finished == self.last_show_finished
             and self.last_error is not None
             and now - self.last_attempt_monotonic < self.error_retry_seconds
         ):
@@ -267,11 +341,13 @@ class AgentLedController:
                 dry_run=self.dry_run,
                 brightness=brightness,
                 kitt_mode=kitt_mode,
+                show_finished=show_finished,
             )
         except (DeviceWriteError, OSError) as exc:
             self.last_state = state
             self.last_brightness = brightness
             self.last_kitt_mode = kitt_mode
+            self.last_show_finished = show_finished
             self.last_error = str(exc)
             return LedStatusWrite(
                 state=state,
@@ -284,6 +360,7 @@ class AgentLedController:
         self.last_state = state
         self.last_brightness = brightness
         self.last_kitt_mode = kitt_mode
+        self.last_show_finished = show_finished
         self.last_error = None
         self.last_target = result.target
         return result

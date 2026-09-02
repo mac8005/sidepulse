@@ -61,7 +61,8 @@ enum DotPrograms {
     static func program(
         for state: LedDisplayState,
         kittMode: Bool,
-        finiteWorking: Bool = false
+        finiteWorking: Bool = false,
+        showFinished: Bool = false
     ) -> String {
         switch state {
         case .idle:
@@ -71,6 +72,9 @@ enum DotPrograms {
         case .done:
             return doneGreen
         case .working:
+            if showFinished {
+                return workingWithFinished(kittMode: kittMode, finite: finiteWorking)
+            }
             return kittMode
                 ? kittScanner(workingCyan, finite: finiteWorking)
                 : rolling(workingCyan, finite: finiteWorking)
@@ -87,6 +91,19 @@ enum DotPrograms {
     static func kittScanner(_ color: String, finite: Bool = false) -> String {
         let ending = finite ? "repeat 125\n\(workingHoldCyan)" : "repeat"
         return "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\n\(ending)"
+    }
+
+    /// Keep LED 0 solid green while LED 1 continues the selected working
+    /// animation. A finite background program preserves the green indicator
+    /// and lets only the working LED settle to dim cyan.
+    static func workingWithFinished(kittMode: Bool, finite: Bool = false) -> String {
+        let resetDuration = kittMode ? "80ms" : "160ms"
+        let pulseDuration = kittMode ? "320ms" : "760ms"
+        let repeatCount = kittMode ? 125 : 100
+        let ending = finite
+            ? "repeat \(repeatCount)\n0:\(doneGreen); 1:\(workingHoldCyan)"
+            : "repeat"
+        return "0:\(doneGreen); 1:#000000 \(resetDuration) cosine\n1:\(workingCyan) \(pulseDuration) pulse 0ms\n\(ending)"
     }
 }
 
@@ -212,6 +229,7 @@ final class DotStatusMirror: ObservableObject {
                 .map { _ in () }
                 .eraseToAnyPublisher(),
             model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$showFinishedEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$focusDndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$hasFolderAccess.map { _ in () }.eraseToAnyPublisher(),
@@ -255,7 +273,8 @@ final class DotStatusMirror: ObservableObject {
                 DotPrograms.program(
                     for: resolved.state,
                     kittMode: model.kittModeEnabled,
-                    finiteWorking: resolved.state == .working
+                    finiteWorking: resolved.state == .working,
+                    showFinished: shouldShowFinished(snapshot, model: model)
                 ),
                 label: resolved.label
             )
@@ -281,6 +300,7 @@ final class DotStatusMirror: ObservableObject {
     @discardableResult
     func applyPush(
         aggregateMode: String,
+        hasUnreadFinished: Bool = false,
         commandID: String? = nil,
         issuedAt: TimeInterval? = nil,
         sourceUpdatedAt: TimeInterval? = nil,
@@ -319,7 +339,8 @@ final class DotStatusMirror: ObservableObject {
         let program = DotPrograms.program(
             for: resolved.state,
             kittMode: model.kittModeEnabled,
-            finiteWorking: resolved.state == .working
+            finiteWorking: resolved.state == .working,
+            showFinished: model.showFinishedEnabled && hasUnreadFinished
         )
         let signature = DotWriteSignature(
             program: program,
@@ -392,6 +413,7 @@ final class DotStatusMirror: ObservableObject {
 
         let mode: String?
         let unreachable: Bool
+        var hasUnreadFinished = false
         var streamUpdatedAt: TimeInterval?
         switch stream.state {
         case .live:
@@ -401,6 +423,9 @@ final class DotStatusMirror: ObservableObject {
                 return
             }
             mode = snapshot.aggregateMode
+            hasUnreadFinished = snapshot.agents.contains {
+                $0.mode == "completed" && $0.unread == true
+            }
             streamUpdatedAt = snapshot.updatedAt
             unreachable = false
         case .failed:
@@ -416,7 +441,11 @@ final class DotStatusMirror: ObservableObject {
             label += focusAccessHint
         }
         let written = write(
-            DotPrograms.program(for: resolved.state, kittMode: model.kittModeEnabled),
+            DotPrograms.program(
+                for: resolved.state,
+                kittMode: model.kittModeEnabled,
+                showFinished: model.showFinishedEnabled && hasUnreadFinished
+            ),
             label: label
         )
         if written, let streamUpdatedAt {
@@ -460,6 +489,12 @@ final class DotStatusMirror: ObservableObject {
             defaults.removeObject(forKey: lastStreamUpdatedAtKey)
         }
         streamServerURL = serverURL
+    }
+
+    private func shouldShowFinished(_ snapshot: AgentSnapshot, model: AppModel) -> Bool {
+        model.showFinishedEnabled && snapshot.agents.contains {
+            $0.mode == "completed" && $0.unread == true
+        }
     }
 
     private func resolve(mode: String?, unreachable: Bool, model: AppModel) -> (state: LedDisplayState, label: String) {

@@ -81,6 +81,7 @@ def make_status(
     *,
     provider: str = "claude",
     agent_id: str = "agent-1",
+    session_id: str | None = None,
     display_name: str = "sidepulse",
     mode: AgentMode = AgentMode.WORKING,
     age_seconds: float = 5.0,
@@ -97,7 +98,7 @@ def make_status(
         mode=mode,
         updated_at=now - timedelta(seconds=age_seconds),
         event_name="PostToolUse",
-        session_id=f"session-{agent_id}",
+        session_id=session_id or f"session-{agent_id}",
         cwd=cwd,
         tool_name="Bash",
         message="doing a thing",
@@ -221,7 +222,13 @@ class SelectorWiringTests(StatusBarTestCase):
     def test_scan_finds_the_selectors_we_expect(self):
         """Guard the guard: a regex that matches nothing would pass silently."""
         found = self.selector_literals(REPO_ROOT / "src/sidepulse/status_bar.py")
-        for expected in ("openSettings:", "openSetup:", "quit:", "refresh:"):
+        for expected in (
+            "openSettings:",
+            "openSetup:",
+            "toggleShowFinished:",
+            "quit:",
+            "refresh:",
+        ):
             self.assertIn(expected, found)
 
     def test_controller_implements_application_delegate_hook(self):
@@ -321,7 +328,7 @@ class MenuBuildTests(StatusBarTestCase):
     def test_menu_includes_core_actions(self):
         menu = sb.build_menu(make_snapshot(), sb.STATE_IDLE, self.controller)
         titles = [item.title() for item in walk_menu(menu)]
-        for expected in ("Setup...", "Settings...", "Quit"):
+        for expected in ("Show finished", "Setup...", "Settings...", "Quit"):
             self.assertIn(expected, titles)
 
     def test_recent_statuses_are_capped(self):
@@ -390,6 +397,7 @@ class WindowBuildTests(StatusBarTestCase):
         self.assertIn("dnd_enabled", self.controller.settings_buttons)
         self.assertIn("dnd_schedule", self.controller.settings_buttons)
         self.assertIn("kitt_mode", self.controller.settings_buttons)
+        self.assertIn("show_finished", self.controller.settings_buttons)
         self.assertTrue(self.controller.settings_buttons["dnd_enabled"].isEnabled())
 
     def test_remote_tab_loads_configured_host(self):
@@ -586,6 +594,102 @@ class PureUiLogicTests(unittest.TestCase):
         self.assertEqual(
             sb.normalize_match_text("  Mixed CASE  "),
             sb.normalize_match_text("mixed case"),
+        )
+
+    def test_finished_tracking_arms_only_after_a_visible_completion(self):
+        target = type("FinishedTrackingTarget", (), {})()
+        target.settings = sb.AgentMonitorSettings().with_show_finished(True)
+        target.finished_tracking_initialized = False
+        target.observed_agent_modes = {}
+        target.unread_finished_agent_ids = set()
+
+        active = make_status(agent_id="active")
+        finishing = make_status(agent_id="finishing")
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[active, finishing]),
+        )
+        self.assertEqual(set(), target.unread_finished_agent_ids)
+
+        finished = make_status(agent_id="finishing", mode=AgentMode.COMPLETED)
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[active], stale_statuses=[finished]),
+        )
+        self.assertEqual({"finishing"}, target.unread_finished_agent_ids)
+        self.assertTrue(
+            sb.StatusBarController.should_show_finished_on_leds(
+                target,
+                AgentMode.WORKING,
+            )
+        )
+        self.assertFalse(
+            sb.StatusBarController.should_show_finished_on_leds(
+                target,
+                AgentMode.COMPLETED,
+            )
+        )
+
+        reactivated = make_status(agent_id="finishing", mode=AgentMode.TOOL_RUNNING)
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[active, reactivated]),
+        )
+        self.assertEqual(set(), target.unread_finished_agent_ids)
+
+    def test_finished_tracking_does_not_mark_preexisting_completion_unread(self):
+        target = type("FinishedTrackingTarget", (), {})()
+        target.settings = sb.AgentMonitorSettings().with_show_finished(True)
+        target.finished_tracking_initialized = False
+        target.observed_agent_modes = {}
+        target.unread_finished_agent_ids = set()
+        finished = make_status(agent_id="already-done", mode=AgentMode.COMPLETED)
+
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(stale_statuses=[finished]),
+        )
+
+        self.assertEqual(set(), target.unread_finished_agent_ids)
+
+    def test_finished_tracking_waits_for_session_subagents(self):
+        target = type("FinishedTrackingTarget", (), {})()
+        target.settings = sb.AgentMonitorSettings().with_show_finished(True)
+        target.finished_tracking_initialized = False
+        target.observed_agent_modes = {}
+        target.unread_finished_agent_ids = set()
+        main_working = make_status(
+            agent_id="codex:session:shared",
+            session_id="shared",
+        )
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[main_working]),
+        )
+
+        main_done = make_status(
+            agent_id="codex:session:shared",
+            session_id="shared",
+            mode=AgentMode.COMPLETED,
+        )
+        subagent = make_status(
+            agent_id="codex:agent:child",
+            session_id="shared",
+            mode=AgentMode.TOOL_RUNNING,
+        )
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[main_done, subagent]),
+        )
+        self.assertEqual(set(), target.unread_finished_agent_ids)
+
+        sb.StatusBarController.observe_finished_sessions(
+            target,
+            make_snapshot(statuses=[main_done]),
+        )
+        self.assertEqual(
+            {"codex:session:shared"},
+            target.unread_finished_agent_ids,
         )
 
 

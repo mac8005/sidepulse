@@ -47,6 +47,10 @@ final class AppModel: ObservableObject {
         didSet { UserDefaults.standard.set(kittModeEnabled, forKey: Defaults.kittModeEnabled) }
     }
 
+    @Published var showFinishedEnabled: Bool {
+        didSet { UserDefaults.standard.set(showFinishedEnabled, forKey: Defaults.showFinishedEnabled) }
+    }
+
     @Published var dndEnabled: Bool {
         didSet { UserDefaults.standard.set(dndEnabled, forKey: Defaults.dndEnabled) }
     }
@@ -96,6 +100,7 @@ final class AppModel: ObservableObject {
         static let liveMonitorEnabled = "liveMonitorEnabled"
         static let liveMonitorServerURL = "liveMonitorServerURL"
         static let kittModeEnabled = "kittModeEnabled"
+        static let showFinishedEnabled = "showFinishedEnabled"
         static let dndEnabled = "dndEnabled"
         static let dndScheduleEnabled = "dndScheduleEnabled"
         static let dndStartTime = "dndStartTime"
@@ -118,6 +123,7 @@ final class AppModel: ObservableObject {
             ?? "http://macmini8005:8787"
         self.dotBrightness = DotBrightness.configuredValue
         self.kittModeEnabled = UserDefaults.standard.bool(forKey: Defaults.kittModeEnabled)
+        self.showFinishedEnabled = UserDefaults.standard.bool(forKey: Defaults.showFinishedEnabled)
         self.dndEnabled = UserDefaults.standard.bool(forKey: Defaults.dndEnabled)
         self.dndScheduleEnabled = UserDefaults.standard.bool(forKey: Defaults.dndScheduleEnabled)
         self.dndStartTime = UserDefaults.standard.string(forKey: Defaults.dndStartTime) ?? DndSchedule.defaultStartTime

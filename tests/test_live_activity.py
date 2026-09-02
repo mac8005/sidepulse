@@ -600,6 +600,76 @@ def test_dot_push_prefers_the_elected_dot_device(tmp_path, monkeypatch):
     assert tokens == ["dot-phone"]
 
 
+def test_dot_push_reports_unread_finished_rows_without_changing_public_mode(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    payloads = []
+
+    def send(token, payload, **kwargs):
+        payloads.append(payload)
+        return 200, ""
+
+    monkeypatch.setattr(daemon.apns, "send", send)
+    cases = [
+        ([], False),
+        ([{"mode": "completed", "unread": False}], False),
+        ([{"mode": "working", "unread": True}], False),
+        ([{"mode": "completed", "unread": True}], True),
+    ]
+    for index, (agents, expected) in enumerate(cases):
+        state = {**_dot_state("working", active_count=1), "agents": agents}
+        daemon._queue_dot_state("working", state, now=100.0 + index, force=True)
+        daemon._send_pending_dot_if_due(100.0 + index)
+
+        assert payloads[-1]["dot"]["aggregateMode"] == "working"
+        assert payloads[-1]["dot"]["hasUnreadFinished"] is expected
+
+
+def test_dot_unread_finished_changes_settle_and_queue_activation_and_clear(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import DOT_STATE_SETTLE_SECONDS
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+
+    def state(unread: bool) -> dict:
+        return {
+            **_dot_state("working", active_count=1),
+            "agents": [{"id": "done", "mode": "completed", "unread": unread}],
+        }
+
+    baseline = state(False)
+    daemon._observe_dot_state("working", baseline, now=100.0)
+    daemon._observe_dot_state(
+        "working", baseline, now=100.0 + DOT_STATE_SETTLE_SECONDS
+    )
+    baseline_id = daemon._pending_dot.command_id
+    assert daemon.ack_dot(baseline_id, "written") is True
+
+    activated = state(True)
+    assert daemon._observe_dot_state("working", activated, now=200.0) is False
+    assert daemon._pending_dot is None
+    assert daemon._observe_dot_state(
+        "working", activated, now=200.0 + DOT_STATE_SETTLE_SECONDS
+    ) is True
+    activation_id = daemon._pending_dot.command_id
+    assert activation_id != baseline_id
+    assert daemon._pending_dot.state == "working"
+    assert daemon._pending_dot.has_unread_finished is True
+    assert daemon.ack_dot(activation_id, "written") is True
+
+    cleared = state(False)
+    assert daemon._observe_dot_state("working", cleared, now=300.0) is False
+    assert daemon._pending_dot is None
+    assert daemon._observe_dot_state(
+        "working", cleared, now=300.0 + DOT_STATE_SETTLE_SECONDS
+    ) is True
+    assert daemon._pending_dot.command_id != activation_id
+    assert daemon._pending_dot.state == "working"
+    assert daemon._pending_dot.has_unread_finished is False
+
+
 def test_expired_dot_command_waits_for_registration_before_reissuing(
     tmp_path, monkeypatch
 ):
@@ -686,7 +756,10 @@ def test_dot_state_must_settle_and_same_state_does_not_reset_pending(
 
 def test_device_registration_can_requeue_the_current_dot_state(tmp_path, monkeypatch):
     daemon = _make_dot_daemon(tmp_path, monkeypatch)
-    state = _dot_state()
+    state = {
+        **_dot_state(),
+        "agents": [{"id": "done", "mode": "completed", "unread": True}],
+    }
     daemon._observe_dot_state("done", state, now=100.0)
     daemon._observe_dot_state("done", state, now=200.0)
     command_id = daemon._pending_dot.command_id
@@ -696,6 +769,7 @@ def test_device_registration_can_requeue_the_current_dot_state(tmp_path, monkeyp
     assert daemon.request_dot_resync(now=300.0) is True
     assert daemon._pending_dot is not None
     assert daemon._pending_dot.state == "done"
+    assert daemon._pending_dot.has_unread_finished is True
     assert daemon._pending_dot.command_id != command_id
     resync_id = daemon._pending_dot.command_id
     assert daemon.request_dot_resync(now=302.0) is False
