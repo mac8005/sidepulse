@@ -627,6 +627,20 @@ struct DotBehaviorControls: View {
     @ObservedObject private var mirror = DotStatusMirror.shared
 
     var body: some View {
+        LabeledContent("Brightness", value: brightnessLabel)
+
+        Slider(value: brightnessPercentage, in: 0...100, step: 5) {
+            Text("SidePulse Dot brightness")
+        } minimumValueLabel: {
+            Image(systemName: "sun.min")
+                .accessibilityHidden(true)
+        } maximumValueLabel: {
+            Image(systemName: "sun.max")
+                .accessibilityHidden(true)
+        }
+        .accessibilityLabel("SidePulse Dot brightness")
+        .accessibilityValue(brightnessLabel)
+
         Toggle("KITT scanner while working", isOn: $model.kittModeEnabled)
 
         Toggle("DND On", isOn: $model.dndEnabled)
@@ -648,6 +662,24 @@ struct DotBehaviorControls: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var brightnessPercentage: Binding<Double> {
+        Binding {
+            Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100
+        } set: { percentage in
+            model.dotBrightness = DotBrightness.clamped(
+                Int((percentage / 100 * Double(DotBrightness.maximum)).rounded())
+            )
+        }
+    }
+
+    private var brightnessLabel: String {
+        guard model.dotBrightness > 0 else { return "Off" }
+        let percentage = Int(
+            (Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100).rounded()
+        )
+        return "\(percentage)%"
     }
 }
 

@@ -33,6 +33,16 @@ final class AppModel: ObservableObject {
     }
 
     // SidePulse Dot behaviour, same keys as the Mac app's settings.
+    @Published var dotBrightness: Int {
+        didSet {
+            let value = DotBrightness.clamped(dotBrightness)
+            if value != dotBrightness {
+                dotBrightness = value
+            }
+            DotBrightness.configuredValue = value
+        }
+    }
+
     @Published var kittModeEnabled: Bool {
         didSet { UserDefaults.standard.set(kittModeEnabled, forKey: Defaults.kittModeEnabled) }
     }
@@ -106,6 +116,7 @@ final class AppModel: ObservableObject {
         self.liveMonitorEnabled = UserDefaults.standard.bool(forKey: Defaults.liveMonitorEnabled)
         self.liveMonitorServerURL = UserDefaults.standard.string(forKey: Defaults.liveMonitorServerURL)
             ?? "http://macmini8005:8787"
+        self.dotBrightness = DotBrightness.configuredValue
         self.kittModeEnabled = UserDefaults.standard.bool(forKey: Defaults.kittModeEnabled)
         self.dndEnabled = UserDefaults.standard.bool(forKey: Defaults.dndEnabled)
         self.dndScheduleEnabled = UserDefaults.standard.bool(forKey: Defaults.dndScheduleEnabled)

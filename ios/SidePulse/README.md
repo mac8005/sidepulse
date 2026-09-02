@@ -12,6 +12,7 @@ The app supports:
   validation and writing.
 - Shortcuts or URL actions such as `sidepulse://write?pattern=success`.
 - Optional SidePulse Dot folder writes through Files.
+- Device-wide SidePulse Dot brightness, applied to every LED write.
 
 The bundle identifier is `io.sidepulse.app`.
 
@@ -189,4 +190,6 @@ curl -X POST "http://127.0.0.1:8787/v1/push/raw?device_token=$SIDEPULSE_DEVICE_T
 - SidePulse server settings use the `SIDEPULSE_*` environment-variable prefix.
 - Keep LED programs at or below 512 bytes and 20 physical lines for the SidePulse Dot writer. The DSL is
   documented in the repo root at `LEDS_FORMAT.md`.
+- Brightness defaults to 100%. Below that, the app prepends `brightness N` to
+  every program; a later explicit brightness command in raw LED text can override it.
 - The generated source app icon is kept at `SidePulseIconSource.png`.

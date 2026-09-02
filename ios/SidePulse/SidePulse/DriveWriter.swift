@@ -26,6 +26,34 @@ enum DriveWriterError: LocalizedError {
     }
 }
 
+enum DotBrightness {
+    static let maximum = 255
+
+    private static let defaultsKey = "dotBrightness"
+
+    static var configuredValue: Int {
+        get {
+            guard UserDefaults.standard.object(forKey: defaultsKey) != nil else {
+                return maximum
+            }
+            return clamped(UserDefaults.standard.integer(forKey: defaultsKey))
+        }
+        set {
+            UserDefaults.standard.set(clamped(newValue), forKey: defaultsKey)
+        }
+    }
+
+    static func clamped(_ value: Int) -> Int {
+        min(max(value, 0), maximum)
+    }
+
+    static func apply(to program: String, brightness: Int? = nil) -> String {
+        let value = clamped(brightness ?? configuredValue)
+        guard value < maximum else { return program }
+        return "brightness \(value)\n\(program)"
+    }
+}
+
 final class DriveWriter {
     static let shared = DriveWriter()
 
@@ -72,11 +100,13 @@ final class DriveWriter {
 
     @discardableResult
     func write(_ text: String) throws -> URL {
-        let program = normalizeLEDText(text)
-        let trimmed = program.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedProgram = normalizeLEDText(text)
+        let trimmed = normalizedProgram.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw DriveWriterError.missingText
         }
+
+        let program = DotBrightness.apply(to: normalizedProgram)
 
         let byteCount = program.data(using: .utf8)?.count ?? 0
         guard byteCount <= maxLEDBytes else {

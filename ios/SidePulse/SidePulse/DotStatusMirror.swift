@@ -70,6 +70,11 @@ struct DndScheduleTransition: Equatable {
     let enabled: Bool
 }
 
+private struct DotWriteSignature: Equatable {
+    let program: String
+    let brightness: Int
+}
+
 /// Daily DND window, ported from `status_bar.py`. Times are local "HH:MM".
 enum DndSchedule {
     static let defaultStartTime = "22:00"
@@ -144,7 +149,7 @@ final class DotStatusMirror: ObservableObject {
     private var model: AppModel?
     private var cancellables: Set<AnyCancellable> = []
     private var scheduleTimer: Timer?
-    private var lastProgram: String?
+    private var lastWriteSignature: DotWriteSignature?
     private var lastError: String?
     private var lastAttempt: Date = .distantPast
     /// True while a Focus that shares its status with this app is on. iOS
@@ -169,6 +174,10 @@ final class DotStatusMirror: ObservableObject {
         let triggers: [AnyPublisher<Void, Never>] = [
             stream.$snapshot.map { _ in () }.eraseToAnyPublisher(),
             stream.$state.map { _ in () }.eraseToAnyPublisher(),
+            model.$dotBrightness
+                .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
+                .map { _ in () }
+                .eraseToAnyPublisher(),
             model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$focusDndEnabled.map { _ in () }.eraseToAnyPublisher(),
@@ -199,6 +208,7 @@ final class DotStatusMirror: ObservableObject {
         scheduleTimer?.invalidate()
         scheduleTimer = nil
         stream.stop()
+        lastWriteSignature = nil
         lastError = nil
         focusActive = false
         model = nil
@@ -280,7 +290,7 @@ final class DotStatusMirror: ObservableObject {
         // access right away.
         refreshFocusStatus(model: model, allowPrompt: true)
         guard model.hasFolderAccess else {
-            lastProgram = nil
+            lastWriteSignature = nil
             statusText = "No SidePulse Dot folder selected"
             return
         }
@@ -309,11 +319,16 @@ final class DotStatusMirror: ObservableObject {
         return (state, state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label)
     }
 
-    /// Writes only when the program changes, or when retrying a failed write
-    /// after the back-off. Returns true when the Dot shows `program`.
+    /// Writes only when the program or configured brightness changes, or when
+    /// retrying a failed write after the back-off. Returns true when the Dot
+    /// shows `program`.
     @discardableResult
     private func write(_ program: String, label: String) -> Bool {
-        if program == lastProgram {
+        let signature = DotWriteSignature(
+            program: program,
+            brightness: DotBrightness.configuredValue
+        )
+        if signature == lastWriteSignature {
             if lastError == nil {
                 statusText = label
                 return true
@@ -324,7 +339,7 @@ final class DotStatusMirror: ObservableObject {
         }
 
         lastAttempt = Date()
-        lastProgram = program
+        lastWriteSignature = signature
         do {
             try DriveWriter.shared.write(program)
             lastError = nil
