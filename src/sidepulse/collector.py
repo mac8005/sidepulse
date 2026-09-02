@@ -37,6 +37,10 @@ CODEX_SESSION_INDEX_MAX_LINES = 5000
 COMPLETED_VISIBLE_SECONDS = 20 * 60.0
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
+# Tool and script failures are often recoverable intermediate steps: agents
+# commonly adjust the command and continue immediately. Keep them working for
+# a short window; a failure that remains the latest event is still surfaced.
+TOOL_FAILURE_GRACE_SECONDS = 10.0
 # Codex reasons silently for minutes between tool calls (no events at all),
 # so its crash-safety window must be far wider than Claude's — otherwise a
 # thinking session reads as "Done". Real turn ends still arrive as Stop.
@@ -1423,6 +1427,13 @@ def status_for_snapshot(
     *,
     post_tool_working_visible_seconds: float,
 ) -> AgentStatus:
+    if (
+        status.mode == AgentMode.BLOCKED_ERROR
+        and status.event_name in {"PostToolUse", "PostToolUseFailure"}
+        and status.age_seconds(now) < TOOL_FAILURE_GRACE_SECONDS
+    ):
+        return _replace_mode(status, AgentMode.WORKING)
+
     window = post_tool_working_visible_seconds
     if status.provider == "codex" and window >= 0:
         window = max(window, CODEX_POST_TOOL_WORKING_VISIBLE_SECONDS)
