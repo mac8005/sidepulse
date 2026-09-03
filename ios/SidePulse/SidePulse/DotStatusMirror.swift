@@ -94,17 +94,78 @@ struct DotPushApplyOutcome: Equatable {
     }
 }
 
-/// LEDS.LED programs for the 2-LED SidePulse Dot — the same text the Mac app
-/// writes (`program_for_display_state` with `led_count=2`), so the Dot looks
-/// identical whichever machine it is plugged into.
+enum DotAnimation: String, CaseIterable, Identifiable {
+    case gentle
+    case flow
+    case kitt
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .gentle: return "Gentle"
+        case .flow: return "Flow"
+        case .kitt: return "KITT"
+        }
+    }
+}
+
+struct DotAppearance: Equatable {
+    static let defaultWorkingColor = "#4DA3FF"
+    static let defaultNeedsInputColor = "#FFB020"
+    static let defaultFinishedColor = "#39D98A"
+    static let defaults = DotAppearance()
+
+    var animation: DotAnimation
+    var workingColor: String
+    var needsInputColor: String
+    var finishedColor: String
+
+    init(
+        animation: DotAnimation = .gentle,
+        workingColor: String? = nil,
+        needsInputColor: String? = nil,
+        finishedColor: String? = nil
+    ) {
+        self.animation = animation
+        self.workingColor = Self.normalizedHex(
+            workingColor,
+            fallback: Self.defaultWorkingColor
+        )
+        self.needsInputColor = Self.normalizedHex(
+            needsInputColor,
+            fallback: Self.defaultNeedsInputColor
+        )
+        self.finishedColor = Self.normalizedHex(
+            finishedColor,
+            fallback: Self.defaultFinishedColor
+        )
+    }
+
+    var normalized: DotAppearance {
+        DotAppearance(
+            animation: animation,
+            workingColor: workingColor,
+            needsInputColor: needsInputColor,
+            finishedColor: finishedColor
+        )
+    }
+
+    static func normalizedHex(_ value: String?, fallback: String) -> String {
+        let candidate = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let body = candidate.hasPrefix("#") ? String(candidate.dropFirst()) : candidate
+        guard body.count == 6, body.allSatisfy(\.isHexDigit) else { return fallback }
+        return "#\(body.uppercased())"
+    }
+}
+
+/// LEDS.LED programs for the 2-LED SidePulse Dot.
 enum DotPrograms {
     static let off = "off"
-    static let askAmber = "#FF3A00"
-    static let workingCyan = "#00E5FF"
-    static let doneGreen = "#00FF66"
 
     // Background programs use a 30-minute watchdog, then settle safely if iOS
     // never delivers the terminal silent push.
+    private static let finiteGentleRepeats = 643
     private static let finiteRollingRepeats = 1_526
     private static let finiteKittRepeats = 1_875
     private static let finiteFinishedRollingRepeats = 1_957
@@ -112,25 +173,43 @@ enum DotPrograms {
 
     static func program(
         for state: LedDisplayState,
-        kittMode: Bool,
+        appearance: DotAppearance,
         finiteWorking: Bool = false,
         showFinished: Bool = false
     ) -> String {
+        let appearance = appearance.normalized
         switch state {
         case .idle:
             return off
         case .ask:
-            return "off\n\(askAmber) 1.6s pulse\nrepeat"
+            if appearance.animation == .gentle {
+                return gentleAttention(appearance.needsInputColor)
+            }
+            return "off\n\(appearance.needsInputColor) 1.6s pulse\nrepeat"
         case .done:
-            return doneGreen
+            return appearance.finishedColor
         case .working:
             if showFinished {
-                return workingWithFinished(kittMode: kittMode, finite: finiteWorking)
+                return workingWithFinished(appearance: appearance, finite: finiteWorking)
             }
-            return kittMode
-                ? kittScanner(workingCyan, finite: finiteWorking)
-                : rolling(workingCyan, finite: finiteWorking)
+            switch appearance.animation {
+            case .gentle:
+                return gentleBreath(appearance.workingColor, finite: finiteWorking)
+            case .flow:
+                return rolling(appearance.workingColor, finite: finiteWorking)
+            case .kitt:
+                return kittScanner(appearance.workingColor, finite: finiteWorking)
+            }
         }
+    }
+
+    static func gentleBreath(_ color: String, finite: Bool = false) -> String {
+        let ending = finite ? "repeat \(finiteGentleRepeats)\noff" : "repeat"
+        return "off 400ms cosine\n\(color) 2.4s pulse\n\(ending)"
+    }
+
+    static func gentleAttention(_ color: String) -> String {
+        "off\n\(color) 2.4s pulse\nrepeat"
     }
 
     /// `rolling_program(color, led_count=2)`.
@@ -145,19 +224,34 @@ enum DotPrograms {
         return "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\n\(ending)"
     }
 
-    /// Keep LED 0 solid green while LED 1 continues the selected working
-    /// animation. A finite background program preserves the green indicator
+    /// Keep LED 0 in the finished color while LED 1 continues the selected
+    /// working animation. A finite background program preserves that indicator
     /// and turns only the working LED off when its safety window expires.
-    static func workingWithFinished(kittMode: Bool, finite: Bool = false) -> String {
-        let resetDuration = kittMode ? "80ms" : "160ms"
-        let pulseDuration = kittMode ? "320ms" : "760ms"
-        let repeatCount = kittMode
-            ? finiteFinishedKittRepeats
-            : finiteFinishedRollingRepeats
+    static func workingWithFinished(
+        appearance: DotAppearance,
+        finite: Bool = false
+    ) -> String {
+        let resetDuration: String
+        let pulseDuration: String
+        let repeatCount: Int
+        switch appearance.animation {
+        case .gentle:
+            resetDuration = "400ms"
+            pulseDuration = "2.4s"
+            repeatCount = finiteGentleRepeats
+        case .flow:
+            resetDuration = "160ms"
+            pulseDuration = "760ms"
+            repeatCount = finiteFinishedRollingRepeats
+        case .kitt:
+            resetDuration = "80ms"
+            pulseDuration = "320ms"
+            repeatCount = finiteFinishedKittRepeats
+        }
         let ending = finite
-            ? "repeat \(repeatCount)\n0:\(doneGreen); 1:#000000"
+            ? "repeat \(repeatCount)\n0:\(appearance.finishedColor); 1:#000000"
             : "repeat"
-        return "0:\(doneGreen); 1:#000000 \(resetDuration) cosine\n1:\(workingCyan) \(pulseDuration) pulse 0ms\n\(ending)"
+        return "0:\(appearance.finishedColor); 1:#000000 \(resetDuration) cosine\n1:\(appearance.workingColor) \(pulseDuration) pulse 0ms\n\(ending)"
     }
 }
 
@@ -324,7 +418,10 @@ final class DotStatusMirror: ObservableObject {
                 .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
                 .map { _ in () }
                 .eraseToAnyPublisher(),
-            model.$kittModeEnabled.map { _ in () }.eraseToAnyPublisher(),
+            model.$dotAppearance
+                .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
+                .map { _ in () }
+                .eraseToAnyPublisher(),
             model.$showFinishedEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndEnabled.map { _ in () }.eraseToAnyPublisher(),
             model.$dndScheduleEnabled.map { _ in () }.eraseToAnyPublisher(),
@@ -373,7 +470,7 @@ final class DotStatusMirror: ObservableObject {
             let written = write(
                 DotPrograms.program(
                     for: resolved.state,
-                    kittMode: model.kittModeEnabled,
+                    appearance: model.dotAppearance,
                     finiteWorking: resolved.state == .working,
                     showFinished: shouldShowFinished(snapshot, model: model)
                 ),
@@ -476,7 +573,7 @@ final class DotStatusMirror: ObservableObject {
         let resolved = resolve(mode: aggregateMode, unreachable: false, model: model)
         let program = DotPrograms.program(
             for: resolved.state,
-            kittMode: model.kittModeEnabled,
+            appearance: model.dotAppearance,
             finiteWorking: resolved.state == .working,
             showFinished: model.showFinishedEnabled && hasUnreadFinished
         )
@@ -680,7 +777,7 @@ final class DotStatusMirror: ObservableObject {
         let written = write(
             DotPrograms.program(
                 for: resolved.state,
-                kittMode: model.kittModeEnabled,
+                appearance: model.dotAppearance,
                 showFinished: model.showFinishedEnabled && hasUnreadFinished
             ),
             label: label
@@ -807,7 +904,12 @@ final class DotStatusMirror: ObservableObject {
             return (.idle, "Mac unreachable — Dot off")
         }
         let state = mode.map(LedDisplayState.forMode) ?? .idle
-        return (state, state == .working && model.kittModeEnabled ? "Working (KITT)" : state.label)
+        return (
+            state,
+            state == .working && model.dotAppearance.animation == .kitt
+                ? "Working (KITT)"
+                : state.label
+        )
     }
 
     /// Writes only when the program or configured brightness changes, or when

@@ -38,7 +38,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // SidePulse Dot behaviour, same keys as the Mac app's settings.
+    // SidePulse Dot behaviour.
     @Published var dotBrightness: Int {
         didSet {
             let value = DotBrightness.clamped(dotBrightness)
@@ -49,8 +49,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    @Published var kittModeEnabled: Bool {
-        didSet { UserDefaults.standard.set(kittModeEnabled, forKey: Defaults.kittModeEnabled) }
+    @Published var dotAppearance: DotAppearance {
+        didSet {
+            let value = dotAppearance.normalized
+            if value != dotAppearance {
+                dotAppearance = value
+            }
+            persistDotAppearance(value)
+        }
     }
 
     @Published var showFinishedEnabled: Bool {
@@ -108,6 +114,10 @@ final class AppModel: ObservableObject {
         static let receivedPushes = "receivedPushes"
         static let liveMonitorEnabled = "liveMonitorEnabled"
         static let liveMonitorServerURL = "liveMonitorServerURL"
+        static let dotAnimation = "dotAnimation"
+        static let dotWorkingColor = "dotWorkingColor"
+        static let dotNeedsInputColor = "dotNeedsInputColor"
+        static let dotFinishedColor = "dotFinishedColor"
         static let kittModeEnabled = "kittModeEnabled"
         static let showFinishedEnabled = "showFinishedEnabled"
         static let dndEnabled = "dndEnabled"
@@ -119,30 +129,56 @@ final class AppModel: ObservableObject {
     }
 
     private init() {
-        self.pushToken = UserDefaults.standard.string(forKey: Defaults.pushToken) ?? ""
-        self.ledText = UserDefaults.standard.string(forKey: Defaults.ledText) ?? """
+        let defaults = UserDefaults.standard
+        self.pushToken = defaults.string(forKey: Defaults.pushToken) ?? ""
+        self.ledText = defaults.string(forKey: Defaults.ledText) ?? """
         #404040 1.4s pulse
         off 400ms none
         repeat
         """
-        self.serverBaseURL = UserDefaults.standard.string(forKey: Defaults.serverBaseURL) ?? "http://127.0.0.1:8787"
-        self.sharedSecret = UserDefaults.standard.string(forKey: Defaults.sharedSecret) ?? ""
-        self.liveMonitorEnabled = UserDefaults.standard.bool(forKey: Defaults.liveMonitorEnabled)
-        self.liveMonitorServerURL = UserDefaults.standard.string(forKey: Defaults.liveMonitorServerURL)
+        self.serverBaseURL = defaults.string(forKey: Defaults.serverBaseURL) ?? "http://127.0.0.1:8787"
+        self.sharedSecret = defaults.string(forKey: Defaults.sharedSecret) ?? ""
+        self.liveMonitorEnabled = defaults.bool(forKey: Defaults.liveMonitorEnabled)
+        self.liveMonitorServerURL = defaults.string(forKey: Defaults.liveMonitorServerURL)
             ?? "http://macmini8005:8787"
         self.dotBrightness = DotBrightness.configuredValue
-        self.kittModeEnabled = UserDefaults.standard.bool(forKey: Defaults.kittModeEnabled)
-        self.showFinishedEnabled = UserDefaults.standard.bool(forKey: Defaults.showFinishedEnabled)
-        self.dndEnabled = UserDefaults.standard.bool(forKey: Defaults.dndEnabled)
-        self.dndScheduleEnabled = UserDefaults.standard.bool(forKey: Defaults.dndScheduleEnabled)
-        self.dndStartTime = UserDefaults.standard.string(forKey: Defaults.dndStartTime) ?? DndSchedule.defaultStartTime
-        self.dndEndTime = UserDefaults.standard.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
-        self.dndLastScheduleTransition = UserDefaults.standard.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
-        self.focusDndEnabled = UserDefaults.standard.bool(forKey: Defaults.focusDndEnabled)
+        let savedAnimation = defaults.string(forKey: Defaults.dotAnimation)
+            .flatMap(DotAnimation.init(rawValue:))
+        let animation = savedAnimation
+            ?? (defaults.bool(forKey: Defaults.kittModeEnabled) ? .kitt : .gentle)
+        self.dotAppearance = DotAppearance(
+            animation: animation,
+            workingColor: defaults.string(forKey: Defaults.dotWorkingColor),
+            needsInputColor: defaults.string(forKey: Defaults.dotNeedsInputColor),
+            finishedColor: defaults.string(forKey: Defaults.dotFinishedColor)
+        )
+        self.showFinishedEnabled = defaults.bool(forKey: Defaults.showFinishedEnabled)
+        self.dndEnabled = defaults.bool(forKey: Defaults.dndEnabled)
+        self.dndScheduleEnabled = defaults.bool(forKey: Defaults.dndScheduleEnabled)
+        self.dndStartTime = defaults.string(forKey: Defaults.dndStartTime) ?? DndSchedule.defaultStartTime
+        self.dndEndTime = defaults.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
+        self.dndLastScheduleTransition = defaults.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
+        self.focusDndEnabled = defaults.bool(forKey: Defaults.focusDndEnabled)
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
+        persistDotAppearance(dotAppearance)
         refreshFolderStatus()
         mirrorFocusStatusSettings()
+    }
+
+    func resetDotAppearance() {
+        dotAppearance = .defaults
+    }
+
+    private func persistDotAppearance(_ appearance: DotAppearance) {
+        let defaults = UserDefaults.standard
+        defaults.set(appearance.animation.rawValue, forKey: Defaults.dotAnimation)
+        defaults.set(appearance.workingColor, forKey: Defaults.dotWorkingColor)
+        defaults.set(appearance.needsInputColor, forKey: Defaults.dotNeedsInputColor)
+        defaults.set(appearance.finishedColor, forKey: Defaults.dotFinishedColor)
+        // Keep the legacy setting current so an older build still selects the
+        // closest available working animation after a downgrade.
+        defaults.set(appearance.animation == .kitt, forKey: Defaults.kittModeEnabled)
     }
 
     /// Port of `apply_due_dnd_schedule`: once a schedule boundary has passed,

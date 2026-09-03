@@ -584,6 +584,26 @@ private extension Color {
             opacity: 1
         )
     }
+
+    func rgbHex(fallback: String) -> String {
+        let color = UIColor(self)
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        guard color.getRed(&red, green: &green, blue: &blue, alpha: &alpha) else {
+            return fallback
+        }
+        let components = [red, green, blue].map {
+            min(255, max(0, Int(($0 * 255).rounded())))
+        }
+        return String(
+            format: "#%02X%02X%02X",
+            components[0],
+            components[1],
+            components[2]
+        )
+    }
 }
 
 private struct LiveMonitorSection: View {
@@ -624,11 +644,12 @@ private struct LiveMonitorSection: View {
 struct DotBehaviorControls: View {
     @ObservedObject var model: AppModel
     @ObservedObject private var mirror = DotStatusMirror.shared
+    @State private var isAppearanceExpanded = false
 
     var body: some View {
         LabeledContent("Brightness", value: brightnessLabel)
 
-        Slider(value: brightnessPercentage, in: 0...100, step: 5) {
+        Slider(value: brightnessPercentage, in: 0...100, step: 1) {
             Text("SidePulse Dot brightness")
         } minimumValueLabel: {
             Image(systemName: "sun.min")
@@ -640,12 +661,50 @@ struct DotBehaviorControls: View {
         .accessibilityLabel("SidePulse Dot brightness")
         .accessibilityValue(brightnessLabel)
 
-        Toggle("KITT scanner while working", isOn: $model.kittModeEnabled)
+        DisclosureGroup("Appearance", isExpanded: $isAppearanceExpanded) {
+            Picker("Animation", selection: animation) {
+                ForEach(DotAnimation.allCases) { animation in
+                    Text(animation.label).tag(animation)
+                }
+            }
+            .pickerStyle(.menu)
+
+            ColorPicker(
+                "Working",
+                selection: appearanceColor(
+                    \DotAppearance.workingColor,
+                    fallback: DotAppearance.defaultWorkingColor
+                ),
+                supportsOpacity: false
+            )
+
+            ColorPicker(
+                "Needs input",
+                selection: appearanceColor(
+                    \DotAppearance.needsInputColor,
+                    fallback: DotAppearance.defaultNeedsInputColor
+                ),
+                supportsOpacity: false
+            )
+
+            ColorPicker(
+                "Finished",
+                selection: appearanceColor(
+                    \DotAppearance.finishedColor,
+                    fallback: DotAppearance.defaultFinishedColor
+                ),
+                supportsOpacity: false
+            )
+
+            Button("Reset Appearance") {
+                model.resetDotAppearance()
+            }
+        }
 
         Toggle("Show finished", isOn: $model.showFinishedEnabled)
 
         if model.showFinishedEnabled {
-            Text("Keeps one LED green for unread finished sessions while the other continues showing active work.")
+            Text("Keeps one LED in the Finished color for unread sessions while the other continues showing active work.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -673,11 +732,35 @@ struct DotBehaviorControls: View {
 
     private var brightnessPercentage: Binding<Double> {
         Binding {
-            Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100
+            (Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100).rounded()
         } set: { percentage in
+            let percentage = min(100, max(0, percentage.rounded()))
             model.dotBrightness = DotBrightness.clamped(
                 Int((percentage / 100 * Double(DotBrightness.maximum)).rounded())
             )
+        }
+    }
+
+    private var animation: Binding<DotAnimation> {
+        Binding {
+            model.dotAppearance.animation
+        } set: { animation in
+            var appearance = model.dotAppearance
+            appearance.animation = animation
+            model.dotAppearance = appearance
+        }
+    }
+
+    private func appearanceColor(
+        _ keyPath: WritableKeyPath<DotAppearance, String>,
+        fallback: String
+    ) -> Binding<Color> {
+        Binding {
+            Color(hex: model.dotAppearance[keyPath: keyPath])
+        } set: { color in
+            var appearance = model.dotAppearance
+            appearance[keyPath: keyPath] = color.rgbHex(fallback: fallback)
+            model.dotAppearance = appearance
         }
     }
 

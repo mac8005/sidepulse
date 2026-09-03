@@ -59,6 +59,7 @@ from AppKit import (  # noqa: E402
     NSControl,
     NSImage,
     NSMenu,
+    NSSlider,
     NSView,
     NSWindow,
 )
@@ -331,6 +332,31 @@ class MenuBuildTests(StatusBarTestCase):
         for expected in ("Show finished", "Setup...", "Settings...", "Quit"):
             self.assertIn(expected, titles)
 
+    def test_device_brightness_slider_uses_whole_percentages(self):
+        device = sb.StatusBarDevice(
+            **{
+                **make_device().__dict__,
+                "brightness": 128,
+            }
+        )
+        item = sb.build_brightness_slider_item(device, self.controller)
+        sliders = [
+            view for view in item.view().subviews()
+            if isinstance(view, NSSlider)
+        ]
+
+        self.assertEqual(1, len(sliders))
+        slider = sliders[0]
+        self.assertEqual(0.0, slider.minValue())
+        self.assertEqual(100.0, slider.maxValue())
+        self.assertEqual(50.0, slider.doubleValue())
+        self.assertEqual(1.0, slider.altIncrementValue())
+        slider.setDoubleValue_(29.6)
+        with patch.object(sb.StatusBarController, "set_device_brightness") as setter:
+            self.controller.setDeviceBrightness_(slider)
+        self.assertEqual(30.0, slider.doubleValue())
+        setter.assert_called_once_with("pulsedot", sb.brightness_value_for_percent(30))
+
     def test_recent_statuses_are_capped(self):
         """The menu must not grow unbounded with session count."""
         snapshot = make_snapshot(
@@ -543,6 +569,14 @@ class PureUiLogicTests(unittest.TestCase):
                 text = sb.format_byte_count(size)
                 self.assertTrue(text)
                 self.assertRegex(text, r"\d")
+
+    def test_device_brightness_percentages_round_trip(self):
+        for percentage in range(101):
+            with self.subTest(percentage=percentage):
+                self.assertEqual(
+                    percentage,
+                    sb.brightness_percent(sb.brightness_value_for_percent(percentage)),
+                )
 
     def test_terminal_app_labels_exist_for_every_choice(self):
         for app in sb.TERMINAL_APP_CHOICES:

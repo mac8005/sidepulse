@@ -43,6 +43,11 @@ from .led_status import display_state_for_mode
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
 from .providers import default_state_dir
+from .title_integrity import (
+    humanize_title_text,
+    is_readable_session_title,
+    normalize_user_request,
+)
 
 MAX_AGENT_ROWS = 6
 MAX_FINISHED_ROWS = 3
@@ -952,7 +957,7 @@ class APNsLiveActivityClient:
 
 
 SUMMARY_MAX_CHARS = 90
-SUMMARY_PROMPT_VERSION = 3
+SUMMARY_PROMPT_VERSION = 4
 SUMMARY_FAILURE_BACKOFF_BASE_SECONDS = 60.0
 SUMMARY_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60.0
 SUMMARY_PROGRESS_REFRESH_SECONDS = 45.0
@@ -980,10 +985,6 @@ IOS_COMPACT_PROJECT_LABELS = {
     "cspennyscaler": "Trading",
     "cspennyscalpingtrader": "Trading",
 }
-REQUEST_SECTION_PATTERN = re.compile(
-    r"^\s*#{1,6}\s*My request(?:\s+for\s+[^:\n]+)?\s*:\s*(?:\r?\n|$)",
-    re.IGNORECASE | re.MULTILINE,
-)
 CODEX_TRANSCRIPT_RECOVERY_BYTES = 2 * 1024 * 1024
 CODEX_TRANSCRIPT_RECOVERY_LINES = 500
 CODEX_EXEC_COMMAND = "tools.exec_command"
@@ -1052,12 +1053,9 @@ def _project_name_from_repo_workdir(workdir: Any) -> str | None:
     return None
 
 
-def _request_text(prompt: str) -> str:
-    """Drop Codex's attachment preamble while retaining the user's request."""
-    markers = tuple(REQUEST_SECTION_PATTERN.finditer(prompt))
-    if markers:
-        prompt = prompt[markers[-1].end():]
-    return prompt.strip()
+def _request_text(prompt: str) -> str | None:
+    """Drop harness envelopes while retaining the genuine user request."""
+    return normalize_user_request(prompt)
 
 
 def _js_string(source: str, start: int) -> tuple[str, int] | None:
@@ -1361,8 +1359,10 @@ class PromptTracker:
                 if hook == "UserPromptSubmit":
                     prompt = event.get("prompt")
                     if isinstance(prompt, str) and prompt.strip():
-                        self._prompts[session_id] = _request_text(prompt)
-                        self._actions[session_id] = []  # new turn, new actions
+                        request = _request_text(prompt)
+                        if request:
+                            self._prompts[session_id] = request
+                            self._actions[session_id] = []  # genuine new turn
                 elif hook == "PreToolUse":
                     tool_input = event.get("tool_input")
                     description = None
@@ -1579,6 +1579,9 @@ class SessionSummarizer:
                 text = text[len(prefix):].strip()
         if "; " not in text:
             _log("summary rejected: missing task/state separator")
+            return None
+        if not is_readable_session_title(text):
+            _log("summary rejected: protocol or tool metadata")
             return None
         if text:
             _log(f"summary -> {text[:70]}")
@@ -1900,15 +1903,25 @@ class LiveActivityDaemon:
                 summary = None
         else:
             return status
-        if not summary or "; " not in summary:
+        if (
+            not summary
+            or "; " not in summary
+            or not is_readable_session_title(summary)
+        ):
             summary = self._fallback_summary(prompt, status)
         summary = self._summary_title(status.session_id, summary, status.cwd)
+        if not is_readable_session_title(summary):
+            summary = self._summary_title(
+                status.session_id,
+                self._fallback_summary(None, status),
+                status.cwd,
+            )
         self._publish_summary(status, summary)
         return dataclass_replace(status, display_name=summary)
 
     @staticmethod
     def _fallback_summary(prompt: str | None, status: AgentStatus) -> str:
-        text = " ".join((prompt or "").split())
+        text = humanize_title_text(prompt) or ""
         if text:
             ends = [
                 index
@@ -1921,15 +1934,16 @@ class LiveActivityDaemon:
             text = status.display_name.split(";", 1)[0].strip()
             if ": " in text:
                 text = text.split(": ", 1)[1]
+            text = humanize_title_text(text) or ""
         task = _truncate(text.rstrip(".?!") or "Current task", 56)
         if task:
             task = task[0].upper() + task[1:]
 
-        detail = " ".join((status.message or status.tool_name or "").split())
+        detail = humanize_title_text(status.message) or ""
         if status.mode.value == "blocked_error":
             state = f"blocked by {_truncate(detail, 24)}" if detail else "blocked"
         elif status.mode.value == "waiting_for_input":
-            state = f"waiting for {_truncate(detail, 24)}" if detail else "waiting for input"
+            state = "waiting for input"
         elif status.mode.value == "completed":
             state = "completed"
         elif status.mode.value == "long_task_progress":
@@ -1984,6 +1998,8 @@ class LiveActivityDaemon:
         """Write the summary into the provider's hook log so every consumer
         — the local status bar and remote clients via the stream — titles
         the session with it."""
+        if not is_readable_session_title(summary):
+            return
         if self._published_summaries.get(status.session_id) == summary:
             return
         path = next(
@@ -2022,9 +2038,12 @@ class LiveActivityDaemon:
                 continue
             row = self._last_rows.get(agent_id)
             if row:
+                name = str(row.get("name") or "")
+                if not is_readable_session_title(name):
+                    name = self._finished_title_fallback(row)
                 self._recent_finished[agent_id] = {
                     **row,
-                    "name": _title_with_state(str(row.get("name") or "Current task"), "completed"),
+                    "name": _title_with_state(name, "completed"),
                     "mode": "completed",
                     "detail": None,
                     "finishedAt": now,
@@ -2089,9 +2108,20 @@ class LiveActivityDaemon:
                 }
                 for row in self._recent_finished.values():
                     if row.get("mode") == "completed" and isinstance(row.get("name"), str):
-                        row["name"] = _title_with_state(row["name"], "completed")
+                        name = row["name"]
+                        if not is_readable_session_title(name):
+                            name = self._finished_title_fallback(row)
+                        row["name"] = _title_with_state(name, "completed")
         except (OSError, ValueError):
             pass
+
+    @staticmethod
+    def _finished_title_fallback(row: dict[str, Any]) -> str:
+        provider = str(row.get("provider") or "Agent").strip().capitalize()
+        task = f"{provider} task" if provider else "Agent task"
+        cwd = row.get("cwd")
+        project = _project_name_from_cwd(cwd if isinstance(cwd, str) else None)
+        return f"{project}: {task}" if project else task
 
     def mark_finished_seen(
         self,

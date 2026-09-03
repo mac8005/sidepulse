@@ -2443,7 +2443,7 @@ def test_summarizer_rejects_a_title_without_task_and_state(tmp_path, monkeypatch
     ) is None
 
 
-def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
+def test_prompt_tracker_ignores_protocol_notifications_without_clearing_actions(
     tmp_path, monkeypatch
 ):
     from sidepulse.live_activity import PromptTracker
@@ -2455,6 +2455,12 @@ def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
             "hook_event_name": "UserPromptSubmit",
             "cwd": "/Users/x/Git/live-translator",
             "prompt": "Go to voice translator app repo.",
+        },
+        {
+            "session_id": "s1",
+            "hook_event_name": "PreToolUse",
+            "cwd": "/Users/x/Git/live-translator",
+            "tool_input": {"description": "Wait 20 seconds"},
         },
         {
             "session_id": "s1",
@@ -2477,7 +2483,8 @@ def test_prompt_tracker_keeps_specific_repo_through_generic_notifications(
     assert tracker.trusted_context_for("s1") == (
         "repository observed for this session: live-translator"
     )
-    assert "TestFlight build with summary chip" in tracker.prompt_for("s1")
+    assert tracker.prompt_for("s1") == "Go to voice translator app repo."
+    assert tracker.actions_for("s1") == ["Wait 20 seconds"]
 
 
 def test_prompt_tracker_resolves_scoped_project_and_ignores_subagent_actions(

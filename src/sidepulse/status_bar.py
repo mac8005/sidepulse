@@ -450,6 +450,11 @@ def format_percent_value(value: float | int) -> str:
     return f"{number:.1f}%"
 
 
+def brightness_value_for_percent(value: int | float) -> int:
+    percentage = max(0, min(100, int(round(float(value)))))
+    return normalize_brightness(percentage / 100 * 255)
+
+
 class StatusBarController(NSObject):
     def init(self):
         self = objc.super(StatusBarController, self).init()
@@ -940,7 +945,12 @@ class StatusBarController(NSObject):
         device_id = sender.identifier()
         if device_id is None:
             return
-        self.set_device_brightness(str(device_id), sender.doubleValue())
+        percentage = max(0, min(100, int(round(sender.doubleValue()))))
+        sender.setDoubleValue_(float(percentage))
+        self.set_device_brightness(
+            str(device_id),
+            brightness_value_for_percent(percentage),
+        )
 
     @objc.IBAction
     def toggleVirtualStatusDevice_(self, _sender):
@@ -3340,8 +3350,9 @@ def build_brightness_slider_item(
     view = NSView.alloc().initWithFrame_(((0, 0), (230, 34)))
     slider = NSSlider.alloc().initWithFrame_(((14, 6), (202, 22)))
     slider.setMinValue_(0.0)
-    slider.setMaxValue_(255.0)
-    slider.setDoubleValue_(float(normalize_brightness(device.brightness)))
+    slider.setMaxValue_(100.0)
+    slider.setDoubleValue_(float(brightness_percent(device.brightness)))
+    slider.setAltIncrementValue_(1.0)
     slider.setContinuous_(False)
     slider.setTarget_(target)
     slider.setAction_("setDeviceBrightness:")

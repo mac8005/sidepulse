@@ -23,6 +23,11 @@ from .models import (
 from .origin import aura_headless_entrypoint, origin_label_from_payload
 from .providers import detect_log_path, parse_log_line, SUMMARY_EVENT_NAME
 from .settings import AgentMonitorSettings, load_settings
+from .title_integrity import (
+    humanize_title_text,
+    is_readable_session_title,
+    normalize_user_request,
+)
 
 
 CODEX_TRANSCRIPT_PROVIDER = "codex-transcripts"
@@ -947,10 +952,8 @@ def claude_transcript_event(
                 cwd=cwd,
             )
 
-        prompt = message_text_from_content(content)
+        prompt = normalize_user_request(message_text_from_content(content))
         if not prompt:
-            return None
-        if prompt.strip().startswith("<task-notification>"):
             return None
         return HookEvent(
             provider="claude",
@@ -1099,12 +1102,16 @@ def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
         metadata.cwd = record.cwd
 
     title = title_from_event(record)
-    if title and (metadata.title is None or is_provider_session_title(record, title)):
+    if (
+        title
+        and is_readable_session_title(title)
+        and (metadata.title is None or is_provider_session_title(record, title))
+    ):
         metadata.title = title
 
     if record.event_name == SUMMARY_EVENT_NAME:
         summary = _string_or_none(record.raw.get("summary"))
-        if summary:
+        if summary and is_readable_session_title(summary):
             metadata.summary = summary
 
     origin = record.origin or origin_label_from_payload(record.provider, record.raw)
@@ -1456,6 +1463,10 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
         session_id = _string_or_none(data.get("session_id"))
         cwd = _string_or_none(data.get("cwd"))
         display_name = str(data["display_name"])
+        if not is_readable_session_title(display_name):
+            label = f"{provider_label(provider)} session"
+            project = project_name(cwd)
+            display_name = f"{project}: {label}" if project else label
         if provider == "codex" and session_id:
             title = codex_session_title(session_id)
             if title:
@@ -1523,7 +1534,7 @@ def apply_summary_record(
     if record.event_name != SUMMARY_EVENT_NAME or not record.session_id:
         return False
     summary = _string_or_none(record.raw.get("summary"))
-    if not summary:
+    if not summary or not is_readable_session_title(summary):
         return False
     key = f"{record.provider}:session:{record.session_id}"
     existing = statuses_by_key.get(key)
@@ -1988,7 +1999,11 @@ def codex_session_titles(path: Path | None = None) -> dict[str, str]:
             session_id = _string_or_none(row.get("id"))
             title = _string_or_none(row.get("thread_name"))
             if session_id and title:
-                titles[session_id] = truncate_text(title.strip(), 72)
+                candidate = truncate_text(title.strip(), 72)
+                if not is_readable_session_title(candidate):
+                    candidate = summarize_prompt(title) or ""
+                if is_readable_session_title(candidate):
+                    titles[session_id] = candidate
 
         _codex_session_index_cache = CachedCodexSessionIndex(
             path=index_path,
@@ -2007,17 +2022,9 @@ def summarize_prompt(value: object, max_len: int = 72) -> str | None:
     if not isinstance(value, str):
         return None
 
-    text = value.strip()
-    if not text or text.startswith("<task-notification>"):
+    text = normalize_user_request(value)
+    if not text:
         return None
-
-    marker = re.search(
-        r"##\s+My request for [^:\n]+:\s*(.*)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if marker:
-        text = marker.group(1)
 
     text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -2030,10 +2037,12 @@ def summarize_prompt(value: object, max_len: int = 72) -> str | None:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"#+\s*", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" -:\n\t")
+    text = humanize_title_text(text)
 
     if not text:
         return None
-    return truncate_text(text, max_len)
+    title = truncate_text(text, max_len)
+    return title if is_readable_session_title(title) else None
 
 
 def display_name_for_record(
