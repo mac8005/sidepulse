@@ -1510,6 +1510,59 @@ def test_dot_unread_finished_changes_queue_activation_and_clear_immediately(
     assert daemon._pending_dot.has_unread_finished is False
 
 
+def test_reading_last_finished_session_queues_immediate_idle_dot_push(
+    tmp_path, monkeypatch
+):
+    import types
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    done = make_status(
+        "claude:session:s1",
+        AgentMode.COMPLETED,
+        name="SidePulse: Verify finished indicator; completed",
+        session_id="s1",
+    )
+    daemon.monitor = types.SimpleNamespace(
+        snapshot=lambda include_stale=False: types.SimpleNamespace(
+            statuses=[done],
+            aggregate=types.SimpleNamespace(mode=AgentMode.COMPLETED),
+        )
+    )
+    payloads = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **kwargs: (payloads.append(payload) or (200, "")),
+    )
+
+    daemon._tick()
+    first_command = daemon._pending_dot.command_id
+    assert payloads[-1]["dot"]["aggregateMode"] == "completed"
+    assert payloads[-1]["dot"]["hasUnreadFinished"] is True
+    assert daemon.ack_dot(first_command, "written") is True
+
+    finished_at = daemon._recent_finished[done.agent_id]["finishedAt"]
+    daemon._wake.clear()
+    status, body = _post_seen(
+        daemon,
+        {"id": done.agent_id, "finishedAt": finished_at},
+    )
+    assert status == 200
+    assert body == {"ok": True, "marked": True}
+    assert daemon._wake.is_set()
+
+    payloads.clear()
+    daemon._tick()
+
+    assert daemon._latest["aggregateMode"] == "completed"
+    assert daemon._pending_dot.state == "idle"
+    assert daemon._pending_dot.has_unread_finished is False
+    assert len(payloads) == 1
+    assert payloads[0]["dot"]["aggregateMode"] == "idle_ready"
+    assert payloads[0]["dot"]["activeCount"] == 0
+    assert payloads[0]["dot"]["hasUnreadFinished"] is False
+
+
 def test_attention_dot_states_bypass_settle_but_working_does_not(
     tmp_path, monkeypatch
 ):

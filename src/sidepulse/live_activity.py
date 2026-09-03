@@ -798,6 +798,17 @@ def _has_unread_finished(content_state: dict[str, Any]) -> bool:
     )
 
 
+def _normalize_dot_state(
+    dot_state: str, content_state: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Turn the Dot off once there is no active or unread work left."""
+    if content_state.get("activeCount") == 0 and not _has_unread_finished(
+        content_state
+    ):
+        return "idle", {**content_state, "aggregateMode": "idle_ready"}
+    return dot_state, content_state
+
+
 def compute_alerts(
     previous_modes: dict[str, str],
     statuses: list[AgentStatus],
@@ -1762,7 +1773,8 @@ class LiveActivityDaemon:
         # rewrite LEDS.LED. Brief mode flaps coalesce, and the resulting
         # command remains pending until the phone confirms the file write.
         dot_state = display_state_for_mode(snapshot.aggregate.mode).value
-        self._observe_dot_state(dot_state, content_state, now)
+        dot_state, dot_content_state = _normalize_dot_state(dot_state, content_state)
+        self._observe_dot_state(dot_state, dot_content_state, now)
         self._send_pending_dot_if_due(now)
 
         if active:

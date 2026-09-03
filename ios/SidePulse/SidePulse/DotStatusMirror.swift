@@ -175,7 +175,8 @@ enum DotPrograms {
         for state: LedDisplayState,
         appearance: DotAppearance,
         finiteWorking: Bool = false,
-        showFinished: Bool = false
+        showFinished: Bool = false,
+        hasUnreadFinished: Bool
     ) -> String {
         let appearance = appearance.normalized
         switch state {
@@ -187,9 +188,9 @@ enum DotPrograms {
             }
             return "off\n\(appearance.needsInputColor) 1.6s pulse\nrepeat"
         case .done:
-            return appearance.finishedColor
+            return hasUnreadFinished ? appearance.finishedColor : off
         case .working:
-            if showFinished {
+            if showFinished && hasUnreadFinished {
                 return workingWithFinished(appearance: appearance, finite: finiteWorking)
             }
             switch appearance.animation {
@@ -467,14 +468,20 @@ final class DotStatusMirror: ObservableObject {
                 unreachable: false,
                 model: model
             )
+            let hasUnreadFinished = snapshotHasUnreadFinished(snapshot)
             let written = write(
                 DotPrograms.program(
                     for: resolved.state,
                     appearance: model.dotAppearance,
                     finiteWorking: resolved.state == .working,
-                    showFinished: shouldShowFinished(snapshot, model: model)
+                    showFinished: model.showFinishedEnabled,
+                    hasUnreadFinished: hasUnreadFinished
                 ),
-                label: resolved.label
+                label: displayLabel(
+                    state: resolved.state,
+                    fallback: resolved.label,
+                    hasUnreadFinished: hasUnreadFinished
+                )
             )
             if written {
                 recordSuccessfulStreamWrite(updatedAt: snapshot.updatedAt)
@@ -571,11 +578,17 @@ final class DotStatusMirror: ObservableObject {
         }
 
         let resolved = resolve(mode: aggregateMode, unreachable: false, model: model)
+        let label = displayLabel(
+            state: resolved.state,
+            fallback: resolved.label,
+            hasUnreadFinished: hasUnreadFinished
+        )
         let program = DotPrograms.program(
             for: resolved.state,
             appearance: model.dotAppearance,
             finiteWorking: resolved.state == .working,
-            showFinished: model.showFinishedEnabled && hasUnreadFinished
+            showFinished: model.showFinishedEnabled,
+            hasUnreadFinished: hasUnreadFinished
         )
         let signature = DotWriteSignature(
             program: program,
@@ -591,7 +604,7 @@ final class DotStatusMirror: ObservableObject {
             && lastError == nil
         let written = write(
             program,
-            label: resolved.label,
+            label: label,
             force: newWorkingCommand
         )
         if written {
@@ -601,7 +614,7 @@ final class DotStatusMirror: ObservableObject {
             if !staleCommand, let sourceUpdatedAt {
                 lastPushSourceUpdatedAt = max(lastPushSourceUpdatedAt, sourceUpdatedAt)
             }
-            let suffix = duplicateCommand && alreadyCurrent ? "already current" : resolved.label
+            let suffix = duplicateCommand && alreadyCurrent ? "already current" : label
             EventLog.append("Dot push (\(aggregateMode)): \(suffix)")
             return DotPushApplyOutcome(
                 result: alreadyCurrent ? .alreadyCurrent : .written,
@@ -770,7 +783,11 @@ final class DotStatusMirror: ObservableObject {
             return
         }
         let resolved = resolve(mode: mode, unreachable: unreachable, model: model)
-        var label = resolved.label
+        var label = displayLabel(
+            state: resolved.state,
+            fallback: resolved.label,
+            hasUnreadFinished: hasUnreadFinished
+        )
         if let focusAccessHint {
             label += focusAccessHint
         }
@@ -778,7 +795,8 @@ final class DotStatusMirror: ObservableObject {
             DotPrograms.program(
                 for: resolved.state,
                 appearance: model.dotAppearance,
-                showFinished: model.showFinishedEnabled && hasUnreadFinished
+                showFinished: model.showFinishedEnabled,
+                hasUnreadFinished: hasUnreadFinished
             ),
             label: label
         )
@@ -837,10 +855,18 @@ final class DotStatusMirror: ObservableObject {
         stream.start(baseURL: model.liveMonitorServerURL, dotToken: dotToken)
     }
 
-    private func shouldShowFinished(_ snapshot: AgentSnapshot, model: AppModel) -> Bool {
-        model.showFinishedEnabled && snapshot.agents.contains {
+    private func snapshotHasUnreadFinished(_ snapshot: AgentSnapshot) -> Bool {
+        snapshot.agents.contains {
             $0.mode == "completed" && $0.unread == true
         }
+    }
+
+    private func displayLabel(
+        state: LedDisplayState,
+        fallback: String,
+        hasUnreadFinished: Bool
+    ) -> String {
+        state == .done && !hasUnreadFinished ? "All read — Dot off" : fallback
     }
 
     private func configuredUnavailability(model: AppModel, now: Date) -> DotAvailability? {
