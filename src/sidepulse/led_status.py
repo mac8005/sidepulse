@@ -74,16 +74,26 @@ def program_for_display_state(
     show_finished: bool = False,
 ) -> str:
     if state == LedDisplayState.IDLE:
+        if show_finished:
+            return apply_brightness(
+                idle_with_finished_program(led_count=led_count),
+                brightness,
+            )
         return "off"
     if state == LedDisplayState.ASK:
-        return apply_brightness(
-            "\n".join(
+        program = (
+            ask_with_finished_program(ASK_AMBER, led_count=led_count)
+            if show_finished
+            else "\n".join(
                 [
                     "off",
                     f"{ASK_AMBER} 1.6s pulse",
                     "repeat",
                 ]
-            ),
+            )
+        )
+        return apply_brightness(
+            program,
             brightness,
         )
     if state == LedDisplayState.DONE:
@@ -144,6 +154,35 @@ def kitt_scanner_program(color: str, *, led_count: int = 8) -> str:
     )
 
 
+def idle_with_finished_program(*, led_count: int = 8) -> str:
+    """Keep one half green and the idle half off."""
+    count = max(2, min(8, int(led_count)))
+    finished_count = count // 2
+    return "; ".join(
+        [
+            *(f"{index}:{DONE_GREEN}" for index in range(finished_count)),
+            *(f"{index}:#000000" for index in range(finished_count, count)),
+        ]
+    )
+
+
+def ask_with_finished_program(color: str, *, led_count: int = 8) -> str:
+    """Keep one half green while the attention half pulses."""
+    count = max(2, min(8, int(led_count)))
+    finished_count = count // 2
+    attention = "; ".join(
+        f"{index}:{color} 1.6s pulse"
+        for index in range(finished_count, count)
+    )
+    return "\n".join(
+        [
+            idle_with_finished_program(led_count=count),
+            attention,
+            "repeat",
+        ]
+    )
+
+
 def working_with_finished_program(
     color: str,
     *,
@@ -162,7 +201,7 @@ def working_with_finished_program(
                 for index in range(finished_count)
             ),
             *(
-                f"{index}:off {reset_ms}ms cosine"
+                f"{index}:#000000 {reset_ms}ms cosine"
                 for index in moving_indexes
             ),
         ]
@@ -301,7 +340,7 @@ class AgentLedController:
         state = display_state_for_mode(mode)
         brightness = normalize_brightness(self.brightness)
         kitt_mode = bool(kitt_mode)
-        show_finished = state == LedDisplayState.WORKING and bool(show_finished)
+        show_finished = bool(show_finished)
         now = time.monotonic()
         if (
             state == self.last_state

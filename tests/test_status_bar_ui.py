@@ -651,18 +651,14 @@ class PureUiLogicTests(unittest.TestCase):
             make_snapshot(statuses=[active], stale_statuses=[finished]),
         )
         self.assertEqual({"finishing"}, target.unread_finished_agent_ids)
-        self.assertTrue(
-            sb.StatusBarController.should_show_finished_on_leds(
-                target,
-                AgentMode.WORKING,
-            )
-        )
-        self.assertFalse(
-            sb.StatusBarController.should_show_finished_on_leds(
-                target,
-                AgentMode.COMPLETED,
-            )
-        )
+        for mode in AgentMode:
+            with self.subTest(mode=mode.value):
+                self.assertTrue(
+                    sb.StatusBarController.should_show_finished_on_leds(
+                        target,
+                        mode,
+                    )
+                )
 
         reactivated = make_status(agent_id="finishing", mode=AgentMode.TOOL_RUNNING)
         sb.StatusBarController.observe_finished_sessions(

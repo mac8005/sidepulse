@@ -48,7 +48,7 @@ try:
         NSWindowStyleMaskTitled,
         NSVariableStatusItemLength,
     )
-    from Foundation import NSObject, NSString, NSTimer, NSURL
+    from Foundation import NSAttributedString, NSObject, NSString, NSTimer, NSURL
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
@@ -2441,12 +2441,6 @@ class StatusBarController(NSObject):
         return (
             self.settings.show_finished_enabled
             and (has_canonical_unread or has_local_unread)
-            and mode
-            in {
-                AgentMode.WORKING,
-                AgentMode.TOOL_RUNNING,
-                AgentMode.LONG_TASK_PROGRESS,
-            }
         )
 
     def reset_led_controllers_for_display_change(self) -> None:
@@ -5003,17 +4997,29 @@ def build_session_menu_item(
     if unread is None:
         checker = getattr(target, "is_status_unread", None)
         unread = bool(checker(status)) if callable(checker) else False
+    title = native_session_menu_title(
+        status,
+        disambiguate=disambiguate_title,
+    )
     item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        native_session_menu_title(
-            status,
-            disambiguate=disambiguate_title,
-            unread=unread,
-        ),
+        title,
         "openSessionPrimary:",
         "",
     )
     item.setTarget_(target)
     item.setRepresentedObject_(status)
+    if unread:
+        menu_font = NSFont.menuFontOfSize_(0)
+        bold_title = NSAttributedString.alloc().initWithString_attributes_(
+            title,
+            {
+                NSFontAttributeName: NSFont.boldSystemFontOfSize_(
+                    menu_font.pointSize()
+                )
+            },
+        )
+        item.setAttributedTitle_(bold_title)
+        item.setAccessibilityLabel_(f"Unread finished session: {title}")
     image = session_row_icon_for_status(status)
     if image is not None:
         item.setImage_(image)
@@ -5024,7 +5030,6 @@ def native_session_menu_title(
     status: AgentStatus,
     *,
     disambiguate: bool = False,
-    unread: bool = False,
 ) -> str:
     title, project = session_title_parts(status)
     if disambiguate and status.session_id:
@@ -5032,8 +5037,7 @@ def native_session_menu_title(
     parts = [title]
     if project:
         parts.append(project)
-    label = "  ".join(parts)
-    return f"NEW — {label}" if unread else label
+    return "  ".join(parts)
 
 
 def build_session_options_menu(

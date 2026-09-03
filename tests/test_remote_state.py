@@ -420,7 +420,7 @@ def test_post_seen_reports_transport_or_invalid_ack_failure(monkeypatch) -> None
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires AppKit")
-def test_native_menu_item_prefixes_unread_completed_session() -> None:
+def test_native_menu_item_bolds_unread_completed_session_without_new_label() -> None:
     from sidepulse import status_bar
     from sidepulse.settings import AgentMonitorSettings
 
@@ -434,8 +434,40 @@ def test_native_menu_item_prefixes_unread_completed_session() -> None:
         ),
     )
 
-    assert item.title().startswith("NEW — ")
-    assert item.title() == status_bar.native_session_menu_title(status, unread=True)
+    assert item.title() == status_bar.native_session_menu_title(status)
+    assert "NEW" not in item.title()
+    assert item.view() is None
+    assert item.attributedTitle().string() == item.title()
+    font, _effective_range = item.attributedTitle().attribute_atIndex_effectiveRange_(
+        status_bar.NSFontAttributeName,
+        0,
+        None,
+    )
+    assert font == status_bar.NSFont.boldSystemFontOfSize_(
+        status_bar.NSFont.menuFontOfSize_(0).pointSize()
+    )
+    assert item.accessibilityLabel() == f"Unread finished session: {item.title()}"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires AppKit")
+def test_native_menu_item_keeps_read_session_title_and_style_native() -> None:
+    from sidepulse import status_bar
+    from sidepulse.settings import AgentMonitorSettings
+
+    status = remote_status()
+    item = status_bar.build_session_menu_item(
+        status,
+        datetime.now(timezone.utc),
+        SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            is_status_unread=lambda _candidate: False,
+        ),
+    )
+
+    assert item.title() == status_bar.native_session_menu_title(status)
+    assert item.attributedTitle() is None
+    assert item.accessibilityLabel() == item.title()
+    assert item.view() is None
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires AppKit")
