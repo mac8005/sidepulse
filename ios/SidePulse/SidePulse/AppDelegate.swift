@@ -21,7 +21,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
 
         if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
-            if !handleDotNotification(userInfo, completion: { _ in }) {
+            if !handleLiveActivityReconcileNotification(userInfo, completion: { _ in }),
+               !handleDotNotification(userInfo, completion: { _ in }) {
                 processNotification(userInfo, source: "Launch notification")
             }
         }
@@ -54,6 +55,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        if handleLiveActivityReconcileNotification(userInfo, completion: completionHandler) {
+            return
+        }
         if handleDotNotification(userInfo, completion: completionHandler) {
             return
         }
@@ -147,6 +151,25 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
 
         return status != .failed
+    }
+
+    /// A bounded silent repair push asks ActivityKit for its real current
+    /// state. The manager either reconnects a reusable activity or reports
+    /// its absence so the daemon can issue a fresh push-to-start request.
+    private func handleLiveActivityReconcileNotification(
+        _ userInfo: [AnyHashable: Any],
+        completion: @escaping (UIBackgroundFetchResult) -> Void
+    ) -> Bool {
+        guard userInfo["sidepulseAction"] as? String == "reconcileLiveActivity" else {
+            return false
+        }
+
+        EventLog.append("Background push requested Live Activity reconcile")
+        Task { @MainActor in
+            await LiveMonitorManager.shared.reconcileNow(model: AppModel.shared)
+            completion(.newData)
+        }
+        return true
     }
 
     /// The daemon's Dot mirror push: rewrite LEDS.LED, acknowledge the

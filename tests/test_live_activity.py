@@ -177,6 +177,35 @@ def test_token_store_round_trip(tmp_path):
     assert TokenStore(tmp_path / "tokens.json").tokens("update") == []
 
 
+def test_token_store_keeps_same_named_devices_with_distinct_stable_ids(tmp_path):
+    store = TokenStore(tmp_path / "tokens.json")
+
+    store.replace_for_device(
+        "push_to_start", "phone-a", {"device": "iPhone", "device_id": "A"}
+    )
+    store.replace_for_device(
+        "push_to_start", "phone-b", {"device": "iPhone", "device_id": "B"}
+    )
+
+    assert set(store.tokens("push_to_start")) == {"phone-a", "phone-b"}
+
+
+def test_token_store_rotates_stable_device_after_rename(tmp_path):
+    store = TokenStore(tmp_path / "tokens.json")
+    store.replace_for_device(
+        "push_to_start", "old", {"device": "iPhone", "device_id": "A"}
+    )
+
+    store.replace_for_device(
+        "push_to_start",
+        "new",
+        {"device": "Massimo's iPhone", "device_id": "A"},
+    )
+
+    assert store.tokens("push_to_start") == ["new"]
+    assert store.entries("push_to_start")["new"]["device"] == "Massimo's iPhone"
+
+
 def test_compute_alerts_only_on_transition_with_cooldown():
     from sidepulse.live_activity import compute_alerts
 
@@ -368,10 +397,12 @@ def test_rate_limited_structural_change_still_pushes(tmp_path, monkeypatch):
     assert daemon._differs_from_pushed(state(False)) is False
 
 
-def test_reregistering_push_to_start_reopens_the_start_cap(tmp_path, monkeypatch):
-    # iOS drops start pushes while an app stays force-quit, so those attempts
-    # burn the cap. Launching the app re-registers its (unchanged) token, and
-    # that evidence must reopen the cap or the activity never comes back.
+def test_only_a_changed_push_to_start_token_reopens_the_start_cap(
+    tmp_path, monkeypatch
+):
+    # A cold-app wake re-registers the same token. That is not evidence that
+    # the prior start pushes created no activities, so it must not permit a
+    # fresh burst and stack unreachable cards.
     from sidepulse.live_activity import (
         MAX_UNANSWERED_START_PUSHES,
         LiveActivityConfig,
@@ -392,8 +423,18 @@ def test_reregistering_push_to_start_reopens_the_start_cap(tmp_path, monkeypatch
     daemon._maybe_push_to_start(state, 10_000.0)
     assert sent == [], "capped: no more activities may be stacked"
 
-    # What the register handler does for an already-known token.
-    daemon._start_push_attempts = 0
+    assert daemon.register_push_to_start_token(
+        "p2s", {"device": "phone", "activity_id": ""}
+    ) is False
+    assert daemon._start_push_attempts == MAX_UNANSWERED_START_PUSHES
+    daemon._maybe_push_to_start(state, 10_000.0)
+    assert sent == []
+
+    # A rotated owner is new evidence and may reopen the bounded burst.
+    assert daemon.register_push_to_start_token(
+        "p2s-new", {"device": "phone", "activity_id": ""}
+    ) is True
+    assert daemon._start_push_attempts == 0
     daemon._maybe_push_to_start(state, 10_000.0)
     assert sent == ["push_to_start"]
 
@@ -1424,6 +1465,38 @@ def test_activity_alerts_use_the_bundled_sound_for_each_kind(tmp_path, monkeypat
         assert payloads[-1]["aps"]["alert"]["sound"] == sound
 
 
+def test_structural_update_respects_frequent_push_setting_but_alert_stays_high(
+    tmp_path, monkeypatch
+):
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.tokens.register(
+        "update",
+        "activity-token",
+        {"activity_id": "a", "frequent_pushes_enabled": False},
+    )
+    priorities = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: (priorities.append(priority) or True),
+    )
+    state = _dot_state("working", 1)
+
+    daemon._push_update(state, now=100.0, important=True)
+    daemon._push_update(
+        state,
+        now=101.0,
+        important=True,
+        alert={"kind": "completed", "title": "Finished", "body": "Done"},
+    )
+    daemon.tokens.update_metadata(
+        "update", "activity-token", {"frequent_pushes_enabled": None}
+    )
+    daemon._push_update(state, now=102.0, important=True)
+
+    assert priorities == [5, 10, 10]
+
+
 def test_deferred_finished_alert_preserves_its_kind(tmp_path, monkeypatch):
     daemon = _make_dot_daemon(tmp_path, monkeypatch)
 
@@ -1814,6 +1887,41 @@ def test_update_token_rotation_preserves_activity_age(tmp_path, monkeypatch):
     assert list(entries) == ["rotated"]
     assert entries["rotated"]["activity_started_at"] == 100.0
     assert daemon._pushes_this_activity == 7
+
+
+def test_older_same_activity_token_cannot_replace_a_newer_emission(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    assert daemon.register_update_token(
+        "token-t2",
+        {
+            "activity_id": "same-activity",
+            "activity_observed_at": 100.0,
+            "token_observed_at": 200.0,
+        },
+    ) is True
+    assert daemon.register_update_token(
+        "token-t1",
+        {
+            "activity_id": "same-activity",
+            "activity_observed_at": 100.0,
+            "token_observed_at": 150.0,
+        },
+    ) is False
+
+    assert daemon.tokens.tokens("update") == ["token-t2"]
+    assert daemon.tokens.entries("update")["token-t2"]["token_observed_at"] == 200.0
 
 
 def test_new_push_to_start_token_keeps_current_activity(tmp_path, monkeypatch):
@@ -2236,6 +2344,665 @@ def test_push_to_start_retries_until_activity_registers(tmp_path, monkeypatch):
     # the daemon can never end.
     daemon._maybe_push_to_start(state, t2 + 10 * PUSH_TO_START_MAX_BACKOFF_SECONDS)
     assert len(sent) == 3
+
+
+def test_activitykit_metadata_is_stored_and_terminal_update_is_not_live(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("push_to_start", "p2s", {"device": "phone"})
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "update",
+            "token": "update-token",
+            "device": "phone",
+            "activity_id": "activity-a",
+            "activity_state": "active",
+            "activities_enabled": True,
+            "frequent_pushes_enabled": False,
+        },
+    )
+    assert status == 200
+    stored = daemon.tokens.entries("update")["update-token"]
+    assert stored["activity_state"] == "active"
+    assert stored["activities_enabled"] is True
+    assert stored["frequent_pushes_enabled"] is False
+    assert daemon.tokens.entries("push_to_start")["p2s"]["activities_enabled"] is True
+    health = daemon._activity_health()
+    assert health["activityLive"] is True
+    assert health["activityClientState"] == "active"
+    assert health["activitiesEnabled"] is True
+    assert health["frequentPushesEnabled"] is False
+    assert health["startRecovery"] == "live"
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "update",
+            "token": "update-token",
+            "device": "phone",
+            "activity_id": "activity-a",
+            "activity_state": "dismissed",
+            "activities_enabled": True,
+            "frequent_pushes_enabled": False,
+        },
+    )
+    assert status == 200
+    assert daemon.tokens.tokens("update") == []
+    health = daemon._activity_health()
+    assert health["activityLive"] is False
+    assert health["activityClientState"] == "dismissed"
+    assert health["startPushAttempts"] == 0
+    assert health["startRecovery"] == "ready"
+    for nonlive_state in ("none", "unknown"):
+        assert daemon.register_update_token(
+            f"invalid-{nonlive_state}",
+            {
+                "device": "phone",
+                "activity_id": f"activity-{nonlive_state}",
+                "activity_state": nonlive_state,
+            },
+        ) is False
+        assert daemon.tokens.tokens("update") == []
+
+
+def test_terminal_report_from_an_old_activity_does_not_clear_the_current_one(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    assert daemon.register_update_token(
+        "current",
+        {
+            "device": "phone",
+            "activity_id": "activity-new",
+            "activity_state": "active",
+        },
+    )
+
+    assert daemon.register_update_token(
+        "late-old",
+        {
+            "device": "phone",
+            "activity_id": "activity-old",
+            "activity_state": "ended",
+        },
+    ) is False
+    assert daemon.tokens.tokens("update") == ["current"]
+    health = daemon._activity_health()
+    assert health["activityLive"] is True
+    assert health["activityClientState"] == "active"
+
+
+def test_unqualified_nonlive_reset_cannot_clear_a_current_update_owner(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import (
+        MAX_UNANSWERED_START_PUSHES,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.register_update_token(
+        "current",
+        {
+            "device": "primary phone",
+            "device_id": "primary-device",
+            "activity_id": "activity-current",
+            "activity_state": "active",
+            "activity_observed_at": 100.0,
+        },
+    )
+    daemon._start_push_attempts = MAX_UNANSWERED_START_PUSHES
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "second phone",
+            "device_id": "second-device",
+            "activity_observed_at": 200.0,
+            "activity_state": "none",
+            "activities_enabled": True,
+            "frequent_pushes_enabled": True,
+        },
+    )
+
+    assert status == 200
+    assert daemon.tokens.tokens("update") == ["current"]
+    assert daemon._start_push_attempts == MAX_UNANSWERED_START_PUSHES
+    health = daemon._activity_health()
+    assert health["activityLive"] is True
+    assert health["activityClientState"] == "active"
+
+
+def test_unqualified_same_device_reset_must_be_newer_than_current_owner(
+    tmp_path, monkeypatch
+):
+    import time
+
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    observed_at = time.time()
+    daemon.register_update_token(
+        "current",
+        {
+            "device": "phone",
+            "device_id": "stable-device",
+            "activity_id": "activity-current",
+            "activity_state": "active",
+            "activity_observed_at": observed_at,
+        },
+    )
+
+    stale_status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "phone",
+            "device_id": "stable-device",
+            "activity_observed_at": observed_at - 1.0,
+            "activity_state": "none",
+        },
+    )
+    assert stale_status == 200
+    assert daemon.tokens.tokens("update") == ["current"]
+
+    fresh_status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "phone",
+            "device_id": "stable-device",
+            "activity_observed_at": time.time() + 1.0,
+            "activity_state": "none",
+        },
+    )
+    assert fresh_status == 200
+    assert daemon.tokens.tokens("update") == []
+    assert daemon._activity_health()["activityClientState"] == "none"
+
+
+def test_newer_same_label_reset_can_retire_one_legacy_owner_without_device_id(
+    tmp_path, monkeypatch
+):
+    import time
+
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    observed_at = time.time() - 60.0
+    daemon.register_update_token(
+        "legacy-current",
+        {
+            "device": "Massimo’s iPhone",
+            "activity_id": "legacy-activity",
+            "activity_state": "active",
+            "activity_observed_at": observed_at,
+        },
+    )
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "Massimo’s iPhone",
+            "device_id": "new-stable-id",
+            "activity_observed_at": time.time() + 1.0,
+            "activity_state": "none",
+        },
+    )
+
+    assert status == 200
+    assert daemon.tokens.tokens("update") == []
+
+
+def test_terminal_reset_without_a_registered_update_reopens_start_recovery(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import (
+        MAX_UNANSWERED_START_PUSHES,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register("push_to_start", "p2s", {"device": "phone"})
+    daemon = LiveActivityDaemon(config, token_store=store)
+    daemon._start_push_attempts = MAX_UNANSWERED_START_PUSHES
+    daemon._last_start_push_at = 100.0
+    daemon._save_activity_recovery_state()
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "phone",
+            "activity_id": "activity-missing",
+            "activity_state": "ended",
+            "activities_enabled": True,
+            "frequent_pushes_enabled": True,
+        },
+    )
+    assert status == 200
+    assert daemon._start_push_attempts == 0
+    assert daemon._activity_health()["activityClientState"] == "ended"
+    p2s = daemon.tokens.entries("push_to_start")["p2s"]
+    assert p2s["activities_enabled"] is True
+    assert p2s["frequent_pushes_enabled"] is True
+
+    restarted = LiveActivityDaemon(
+        config, token_store=TokenStore(tmp_path / "tok.json")
+    )
+    restarted_health = restarted._activity_health()
+    assert restarted_health["activityClientState"] == "ended"
+    assert restarted_health["startPushAttempts"] == 0
+
+
+def test_exhausted_start_burst_nudges_once_and_reopens_after_safety_window(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import (
+        MAX_UNANSWERED_START_PUSHES,
+        START_PUSH_SAFE_RECOVERY_SECONDS,
+        START_RECONCILE_NUDGE_DELAY_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register("push_to_start", "p2s", {"device": "phone"})
+    store.register("device", "ordinary", {"device": "phone"})
+    daemon = LiveActivityDaemon(config, token_store=store)
+    daemon._start_push_attempts = MAX_UNANSWERED_START_PUSHES
+    daemon._last_start_push_at = 100.0
+    daemon._save_activity_recovery_state()
+    sent = []
+    responses = [(500, "rejected"), (200, "")]
+
+    def send(token, payload, **options):
+        sent.append((token, payload, options))
+        return responses.pop(0)
+
+    monkeypatch.setattr(daemon.apns, "send", send)
+    state = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [],
+        "updatedAt": 100.0,
+    }
+
+    daemon._maybe_push_to_start(
+        state, 100.0 + START_RECONCILE_NUDGE_DELAY_SECONDS - 0.1
+    )
+    assert sent == []
+    daemon._maybe_push_to_start(
+        state, 100.0 + START_RECONCILE_NUDGE_DELAY_SECONDS
+    )
+    assert len(sent) == 1
+    token, payload, options = sent[0]
+    assert token == "ordinary"
+    assert payload == {
+        "aps": {"content-available": 1},
+        "sidepulseAction": "reconcileLiveActivity",
+    }
+    assert options["priority"] == 5
+    assert options["push_type"] == "background"
+    assert options["collapse_id"] == "sidepulse-live-activity-reconcile"
+    daemon._maybe_push_to_start(state, 1000.0)
+    assert len(sent) == 1, "the reconcile retry cadence must not be bypassed"
+    health = daemon._activity_health(now=1000.0)
+    assert health["startRecovery"] == "reconciling"
+    assert health["reconcileNudgeAccepted"] is False
+
+    restarted = LiveActivityDaemon(
+        config, token_store=TokenStore(tmp_path / "tok.json")
+    )
+    after_restart = []
+    monkeypatch.setattr(
+        restarted.apns,
+        "send",
+        lambda token, payload, **options: (
+            after_restart.append((token, payload, options)) or (200, "")
+        ),
+    )
+    restarted._maybe_push_to_start(state, 1001.0)
+    assert after_restart == [], "restart must not repeat the reconcile wake"
+
+    from sidepulse.live_activity import START_RECONCILE_RETRY_SECONDS
+
+    retry_at = 100.0 + START_RECONCILE_NUDGE_DELAY_SECONDS + START_RECONCILE_RETRY_SECONDS
+    restarted._maybe_push_to_start(state, retry_at - 0.1)
+    assert after_restart == []
+    restarted._maybe_push_to_start(state, retry_at)
+    assert len(after_restart) == 1
+    assert after_restart[0][0] == "ordinary"
+    assert after_restart[0][1]["sidepulseAction"] == "reconcileLiveActivity"
+    assert restarted._activity_health(now=retry_at)["reconcileNudgeAccepted"] is True
+
+    restarted._maybe_push_to_start(
+        state, 100.0 + START_PUSH_SAFE_RECOVERY_SECONDS
+    )
+    assert len(after_restart) == 2
+    assert after_restart[1][0] == "p2s"
+    assert after_restart[1][1]["aps"]["event"] == "start"
+    assert restarted._start_push_attempts == 1
+
+
+def test_missing_activity_report_nudges_at_low_cadence(tmp_path, monkeypatch):
+    from sidepulse.live_activity import (
+        START_RECONCILE_RETRY_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register("device", "ordinary", {"device": "phone"})
+    daemon.tokens.register(
+        "update",
+        "ghost",
+        {"device": "phone", "activity_id": "ghost-activity"},
+    )
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **options: (
+            sent.append((token, payload, options)) or (200, "")
+        ),
+    )
+
+    assert daemon._maybe_reconcile_stale_activity(100.0) is True
+    assert sent[0][0] == "ordinary"
+    assert sent[0][1]["sidepulseAction"] == "reconcileLiveActivity"
+    assert daemon._maybe_reconcile_stale_activity(
+        100.0 + START_RECONCILE_RETRY_SECONDS - 0.1
+    ) is False
+    assert len(sent) == 1
+    assert daemon._maybe_reconcile_stale_activity(
+        100.0 + START_RECONCILE_RETRY_SECONDS
+    ) is True
+    assert len(sent) == 2
+
+
+def test_reconcile_nudge_targets_current_activity_owner_among_two_devices(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register(
+        "device", "ordinary-a", {"device": "iPhone", "device_id": "device-a"}
+    )
+    store.register(
+        "device", "ordinary-b", {"device": "iPhone", "device_id": "device-b"}
+    )
+    store.register(
+        "update",
+        "activity-b",
+        {
+            "device": "iPhone",
+            "device_id": "device-b",
+            "activity_id": "current-activity",
+        },
+    )
+    daemon = LiveActivityDaemon(config, token_store=store)
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **options: (sent.append(token) or (200, "")),
+    )
+
+    assert daemon._send_activity_reconcile_nudge(100.0, "stale report") is True
+    assert sent == ["ordinary-b"]
+
+
+def test_reconcile_nudge_fans_out_when_there_is_no_activity_owner(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register(
+        "device", "ordinary-a", {"device": "iPhone", "device_id": "device-a"}
+    )
+    store.register(
+        "device", "ordinary-b", {"device": "iPad", "device_id": "device-b"}
+    )
+    daemon = LiveActivityDaemon(config, token_store=store)
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **options: (sent.append(token) or (200, "")),
+    )
+
+    assert daemon._send_activity_reconcile_nudge(100.0, "no owner") is True
+    assert sent == ["ordinary-a", "ordinary-b"]
+
+
+def test_fresh_current_activity_report_suppresses_reconcile_nudge(
+    tmp_path, monkeypatch
+):
+    import time
+
+    from sidepulse.live_activity import (
+        ACTIVITY_REPORT_STALE_SECONDS,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.tokens.register(
+        "device", "ordinary", {"device": "phone", "device_id": "stable-device"}
+    )
+    daemon.register_update_token(
+        "current",
+        {
+            "device": "phone",
+            "device_id": "stable-device",
+            "activity_id": "activity-current",
+            "activity_state": "active",
+            "activity_observed_at": time.time(),
+        },
+    )
+    reported_at = daemon._last_activity_report["reported_at"]
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns,
+        "send",
+        lambda token, payload, **options: (
+            sent.append(payload) or (200, "")
+        ),
+    )
+
+    assert daemon._maybe_reconcile_stale_activity(
+        reported_at + ACTIVITY_REPORT_STALE_SECONDS - 0.1
+    ) is False
+    assert sent == []
+    assert daemon._maybe_reconcile_stale_activity(
+        reported_at + ACTIVITY_REPORT_STALE_SECONDS
+    ) is True
+    assert sent[0]["sidepulseAction"] == "reconcileLiveActivity"
+
+
+def test_disabled_live_activities_block_start_until_client_reenables_them(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.register_push_to_start_token(
+        "p2s", {"device": "phone", "activities_enabled": False}
+    )
+    sent = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: sent.append(kind),
+    )
+    state = {
+        "aggregateMode": "working",
+        "activeCount": 1,
+        "agents": [],
+        "updatedAt": 0.0,
+    }
+
+    daemon._maybe_push_to_start(state, 100.0)
+    assert sent == []
+    assert daemon._activity_health()["startRecovery"] == "disabled"
+
+    daemon.register_push_to_start_token(
+        "p2s", {"device": "phone", "activities_enabled": True}
+    )
+    daemon._maybe_push_to_start(state, 100.0)
+    assert sent == ["push_to_start"]
+
+
+def test_register_rejects_invalid_activitykit_metadata(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    invalid = [
+        {"activity_state": "bogus"},
+        {"activities_enabled": 1},
+        {"frequent_pushes_enabled": "yes"},
+        {"device_id": 123},
+        {"activity_observed_at": "now"},
+        {"token_observed_at": "now"},
+    ]
+    for metadata in invalid:
+        status, body = _post_json(
+            daemon,
+            "/register",
+            {
+                "kind": "update",
+                "token": "update-token",
+                "activity_id": "activity-a",
+                **metadata,
+            },
+        )
+        assert status == 400
+        assert "error" in body
+    assert daemon.tokens.tokens("update") == []
 
 
 def test_dead_update_token_cannot_spawn_a_stack_of_activities(tmp_path, monkeypatch):

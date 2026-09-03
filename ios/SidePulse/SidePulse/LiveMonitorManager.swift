@@ -61,6 +61,12 @@ private struct DotDeviceRegistrationRequest {
     let model: AppModel
 }
 
+private struct LiveActivityResetRequest {
+    let activityID: String?
+    let activityState: String
+    let observedAt: TimeInterval
+}
+
 /// Bridges ActivityKit tokens to the `sidepulse live-activity` daemon.
 ///
 /// The daemon owns the activity lifecycle: it starts the Live Activity with a
@@ -75,9 +81,14 @@ final class LiveMonitorManager: ObservableObject {
 
     private var observersStarted = false
     private var localActivityStartInProgress = false
+    private var nextLocalActivityStartAt = Date.distantPast
+    private var scheduledReconcileTask: Task<Void, Never>?
     private var observedActivityIDs: Set<String> = []
+    private var knownActivityIDs: [String] = []
     private var selectedActivityID: String?
-    private var intentionallyEndedActivityIDs: Set<String> = []
+    private var forceReportingActivityIDs: Set<String> = []
+    private var intentionallyEndedActivityIDs: [String] = []
+    private var handledTerminalActivityIDs: [String] = []
     private var registeredDotDeviceKey: String?
     private var pendingDotDeviceRegistration: DotDeviceRegistrationRequest?
     private var dotDeviceRegistrationRunning = false
@@ -123,26 +134,71 @@ final class LiveMonitorManager: ObservableObject {
             }
         }
 
+        for activity in Activity<AgentActivityAttributes>.activities {
+            _ = rememberKnownActivityID(activity.id)
+        }
         Task {
-            for await _ in Activity<AgentActivityAttributes>.activityUpdates {
-                self.reconcileActivities(model: model)
-            }
-        }
-        if #available(iOS 17.2, *) {
-            reconcileActivities(model: model)
-            // A start push whose activity token never reached the daemon
-            // leaves an orphan the Mac can no longer end, so the app clears
-            // leftovers every time it comes forward — not just at launch.
-            NotificationCenter.default.addObserver(
-                forName: UIApplication.willEnterForegroundNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    self?.reconcileActivities(model: model)
+            for await activity in Activity<AgentActivityAttributes>.activityUpdates {
+                let isNewActivity = self.rememberKnownActivityID(activity.id)
+                if isNewActivity {
+                    EventLog.append(
+                        "Live Activity \(activity.id.prefix(8)) newly emitted as \(self.activityStateName(activity.activityState)); preferring replacement"
+                    )
+                    model.refreshEventLog()
                 }
+                await self.reconcileActivities(
+                    model: model,
+                    source: "ActivityKit update",
+                    preferredActivityID: isNewActivity ? activity.id : nil
+                )
             }
         }
+        Task {
+            let appIsActive = UIApplication.shared.applicationState == .active
+            await self.reconcileActivities(
+                model: model,
+                source: "monitor start",
+                forceReportCurrent: appIsActive
+            )
+        }
+        // A start push whose activity token never reached the daemon
+        // leaves an orphan the Mac can no longer end, so the app clears
+        // leftovers every time it becomes active — not just at launch.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.reconcileActivities(
+                    model: model,
+                    source: "app foreground",
+                    forceReportCurrent: true
+                )
+            }
+        }
+    }
+
+    /// Rechecks ActivityKit in response to a bounded background repair push.
+    /// In the background the daemon starts the replacement with push-to-start;
+    /// local Activity.request is reserved for a genuinely foreground app.
+    func reconcileNow(model: AppModel) async {
+        guard model.liveMonitorEnabled else {
+            EventLog.append("Live Activity reconcile ignored: monitoring is off")
+            model.refreshEventLog()
+            return
+        }
+        guard #available(iOS 17.2, *) else { return }
+        if !observersStarted {
+            start(model: model)
+        }
+        let appIsActive = UIApplication.shared.applicationState == .active
+        await reconcileActivities(
+            model: model,
+            source: "server repair request",
+            reportAbsenceToServer: !appIsActive,
+            forceReportCurrent: true
+        )
     }
 
     /// On a fresh install the APNs token arrives after `start`; the daemon
@@ -244,48 +300,236 @@ final class LiveMonitorManager: ObservableObject {
             && registration.model.liveMonitorServerURL == registration.serverURL
     }
 
-    /// Keep exactly one activity: the freshest. Older ones are orphans whose
-    /// tokens the daemon no longer has, so only the app can end them. With
-    /// none left, start one locally so the app and daemon cannot race to
-    /// create competing activities.
+    /// Keep exactly one reusable activity: the freshest. Terminal ActivityKit
+    /// objects can remain in `Activity.activities`, and an ended activity may
+    /// remain visible, but terminal objects are non-updatable and must never
+    /// block a replacement or have their token reused.
     @available(iOS 17.2, *)
-    private func reconcileActivities(model: AppModel) {
+    private func reconcileActivities(
+        model: AppModel,
+        source: String,
+        reportAbsenceToServer: Bool = false,
+        pendingResetRequests: [LiveActivityResetRequest] = [],
+        preferredActivityID: String? = nil,
+        forceReportCurrent: Bool = false
+    ) async {
+        let observedAt = Date().timeIntervalSince1970
         let existing = Activity<AgentActivityAttributes>.activities
-        let selected = selectedActivityID.flatMap { selectedID in
-            existing.first { $0.id == selectedID }
-        } ?? existing.max { lhs, rhs in
+        let reusable = existing.filter { isReusable($0.activityState) }
+        let terminal = existing.filter { !isReusable($0.activityState) }
+        var resetRequests = pendingResetRequests
+        var forcedCurrentActivity: Activity<AgentActivityAttributes>?
+
+        for activity in terminal {
+            let state = activity.activityState
+            if consumeTerminalActivity(activity, state: state, model: model, source: source) {
+                resetRequests.append(LiveActivityResetRequest(
+                    activityID: activity.id,
+                    activityState: activityStateName(state),
+                    observedAt: observedAt
+                ))
+            }
+        }
+
+        let preferred = preferredActivityID.flatMap { preferredID in
+            reusable.first { $0.id == preferredID }
+        }
+        let selected = preferred ?? selectedActivityID.flatMap { selectedID in
+            reusable.first { $0.id == selectedID }
+        } ?? reusable.max { lhs, rhs in
+            if lhs.content.state.updatedAt != rhs.content.state.updatedAt {
+                return lhs.content.state.updatedAt < rhs.content.state.updatedAt
+            }
             if lhs.content.state.activeCount != rhs.content.state.activeCount {
                 return lhs.content.state.activeCount < rhs.content.state.activeCount
             }
-            return lhs.content.state.updatedAt < rhs.content.state.updatedAt
+            return lhs.id < rhs.id
         }
 
         if let selected {
-            selectedActivityID = selected.id
-            for stale in existing where stale.id != selected.id {
-                let activity = stale
-                intentionallyEndedActivityIDs.insert(activity.id)
-                Task { await activity.end(nil, dismissalPolicy: .immediate) }
+            if preferred != nil, selectedActivityID != selected.id {
+                let previous = selectedActivityID.map { String($0.prefix(8)) } ?? "none"
+                EventLog.append(
+                    "Live Activity replacement \(selected.id.prefix(8)) selected over \(previous)"
+                )
+                model.refreshEventLog()
             }
+            scheduledReconcileTask?.cancel()
+            scheduledReconcileTask = nil
+            selectedActivityID = selected.id
+            for stale in reusable where stale.id != selected.id {
+                let activity = stale
+                if !intentionallyEndedActivityIDs.contains(activity.id) {
+                    intentionallyEndedActivityIDs.append(activity.id)
+                    pruneActivityIDHistory(&intentionallyEndedActivityIDs)
+                    EventLog.append(
+                        "Live Activity \(activity.id.prefix(8)) deduplicating; keeping \(selected.id.prefix(8))"
+                    )
+                    model.refreshEventLog()
+                    Task { await activity.end(nil, dismissalPolicy: .immediate) }
+                }
+            }
+            let shouldForceReport = forceReportCurrent
+                && forceReportingActivityIDs.insert(selected.id).inserted
             observe(activity: selected, model: model)
+            if shouldForceReport {
+                forcedCurrentActivity = selected
+            }
         } else {
             selectedActivityID = nil
-            // iOS refuses push-to-start while an app stays force-quit (and
-            // after an app update), so waiting for the Mac can leave the
-            // Live Activity gone for good. The app can always start one
-            // itself; the daemon takes over as soon as its token arrives.
-            startActivityLocally(model: model)
+            if reportAbsenceToServer, resetRequests.isEmpty {
+                let state = terminal.first.map { activityStateName($0.activityState) } ?? "none"
+                resetRequests.append(LiveActivityResetRequest(
+                    activityID: nil,
+                    activityState: state,
+                    observedAt: observedAt
+                ))
+            }
+        }
+
+        // Selection, observer attachment, and deduplication all happen before
+        // yielding to the network. Qualified IDs and observation timestamps
+        // let the daemon reject a reset superseded by a replacement token.
+        let resetTasks = resetRequests.map { reset in
+            Task {
+                await self.sendReset(
+                    model: model,
+                    activityID: reset.activityID,
+                    activityState: reset.activityState,
+                    activityObservedAt: reset.observedAt
+                )
+            }
+        }
+        for task in resetTasks {
+            await task.value
+        }
+        if let forcedCurrentActivity {
+            let activityID = forcedCurrentActivity.id
+            defer { forceReportingActivityIDs.remove(activityID) }
+            if selectedActivityID == activityID,
+               isReusable(forcedCurrentActivity.activityState),
+               let currentToken = forcedCurrentActivity.pushToken {
+                let forceObservedAt = Date().timeIntervalSince1970
+                EventLog.append(
+                    "Live Activity \(activityID.prefix(8)) force-reporting current token after server repair request"
+                )
+                model.refreshEventLog()
+                _ = await register(
+                    kind: "update",
+                    token: currentToken,
+                    model: model,
+                    activityID: activityID,
+                    activityObservedAt: forceObservedAt,
+                    tokenObservedAt: forceObservedAt,
+                    isStillCurrent: {
+                        self.selectedActivityID == activityID
+                            && self.isReusable(forcedCurrentActivity.activityState)
+                            && forcedCurrentActivity.pushToken == currentToken
+                    },
+                    attemptLimit: 1
+                )
+            } else {
+                EventLog.append(
+                    "Live Activity \(activityID.prefix(8)) repair found no current reusable update token; observer remains armed"
+                )
+                model.refreshEventLog()
+            }
+        }
+
+        // Activity.request is the foreground recovery path. Foreground
+        // reconciles deliberately avoid an absence reset first, because that
+        // could wake push-to-start and race this local replacement.
+        if selected == nil, UIApplication.shared.applicationState == .active {
+            await startActivityLocally(model: model)
         }
     }
 
     @available(iOS 17.2, *)
-    private func startActivityLocally(model: AppModel) {
+    private func consumeTerminalActivity(
+        _ activity: Activity<AgentActivityAttributes>,
+        state: ActivityState,
+        model: AppModel,
+        source: String
+    ) -> Bool {
+        let intentional: Bool
+        if let index = intentionallyEndedActivityIDs.firstIndex(of: activity.id) {
+            intentionallyEndedActivityIDs.remove(at: index)
+            intentional = true
+        } else {
+            intentional = false
+        }
+        if selectedActivityID == activity.id {
+            selectedActivityID = nil
+        }
+        observedActivityIDs.remove(activity.id)
+        knownActivityIDs.removeAll { $0 == activity.id }
+
+        guard !handledTerminalActivityIDs.contains(activity.id) else {
+            return false
+        }
+        handledTerminalActivityIDs.append(activity.id)
+        pruneActivityIDHistory(&handledTerminalActivityIDs)
+        let disposition = intentional ? "intentional; ignored" : "requesting replacement"
+        EventLog.append(
+            "Live Activity \(activity.id.prefix(8)) is \(activityStateName(state)) during \(source); \(disposition)"
+        )
+        model.refreshEventLog()
+        return !intentional
+    }
+
+    @available(iOS 17.2, *)
+    private func handleTerminalTransition(
+        _ activity: Activity<AgentActivityAttributes>,
+        state: ActivityState,
+        model: AppModel,
+        source: String
+    ) async {
+        var resetRequests: [LiveActivityResetRequest] = []
+        if consumeTerminalActivity(activity, state: state, model: model, source: source) {
+            resetRequests.append(LiveActivityResetRequest(
+                activityID: activity.id,
+                activityState: activityStateName(state),
+                observedAt: Date().timeIntervalSince1970
+            ))
+        }
+        await reconcileActivities(
+            model: model,
+            source: source,
+            pendingResetRequests: resetRequests
+        )
+    }
+
+    @available(iOS 17.2, *)
+    private func startActivityLocally(model: AppModel) async {
         guard !localActivityStartInProgress else { return }
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+        let authorization = ActivityAuthorizationInfo()
+        guard authorization.areActivitiesEnabled else {
+            localActivityStartInProgress = true
             statusMessage = "Live Activities are turned off in Settings"
+            EventLog.append("Live Activity start skipped: disabled in Settings")
+            model.refreshEventLog()
+            await sendReset(
+                model: model,
+                activityState: "none",
+                activityObservedAt: Date().timeIntervalSince1970
+            )
+            localActivityStartInProgress = false
             return
         }
+        let now = Date()
+        guard now >= nextLocalActivityStartAt else {
+            scheduleReconcile(
+                model: model,
+                after: nextLocalActivityStartAt.timeIntervalSince(now)
+            )
+            return
+        }
+        nextLocalActivityStartAt = now.addingTimeInterval(5)
         localActivityStartInProgress = true
+        EventLog.append(
+            "Live Activity local start requested (frequent pushes: \(authorization.frequentPushesEnabled))"
+        )
+        model.refreshEventLog()
         Task {
             let label = await hostLabel(model: model)
             let state = await initialContentState(model: model)
@@ -293,9 +537,9 @@ final class LiveMonitorManager: ObservableObject {
             // A push-to-start may have landed while the snapshot requests
             // were in flight. Let that activity win instead of creating a
             // second one.
-            guard Activity<AgentActivityAttributes>.activities.isEmpty else {
+            guard reusableActivities().isEmpty else {
                 localActivityStartInProgress = false
-                reconcileActivities(model: model)
+                await reconcileActivities(model: model, source: "local-start race")
                 return
             }
             do {
@@ -306,20 +550,39 @@ final class LiveMonitorManager: ObservableObject {
                 )
                 localActivityStartInProgress = false
                 selectedActivityID = activity.id
+                _ = rememberKnownActivityID(activity.id)
+                EventLog.append(
+                    "Live Activity \(activity.id.prefix(8)) started locally as \(activityStateName(activity.activityState))"
+                )
+                model.refreshEventLog()
                 observe(activity: activity, model: model)
-                reconcileActivities(model: model)
+                await reconcileActivities(model: model, source: "local start")
                 statusMessage = "Live Activity started"
             } catch {
                 localActivityStartInProgress = false
                 statusMessage = "Could not start Live Activity: \(error.localizedDescription)"
+                EventLog.append("Live Activity local start failed: \(error.localizedDescription)")
+                model.refreshEventLog()
                 // Local creation is the primary path. Only after it fails do
                 // we clear the daemon's stale token and let push-to-start try.
-                if Activity<AgentActivityAttributes>.activities.isEmpty {
-                    await sendReset(model: model)
-                } else {
-                    reconcileActivities(model: model)
-                }
+                await sendReset(
+                    model: model,
+                    activityState: "none",
+                    activityObservedAt: Date().timeIntervalSince1970
+                )
             }
+        }
+    }
+
+    @available(iOS 17.2, *)
+    private func scheduleReconcile(model: AppModel, after delay: TimeInterval) {
+        guard scheduledReconcileTask == nil else { return }
+        scheduledReconcileTask = Task { [weak self] in
+            let nanoseconds = UInt64(max(0.25, delay) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            self.scheduledReconcileTask = nil
+            await self.reconcileActivities(model: model, source: "local-start cooldown")
         }
     }
 
@@ -369,18 +632,43 @@ final class LiveMonitorManager: ObservableObject {
         return label
     }
 
-    private func sendReset(model: AppModel, activityID: String? = nil) async {
+    @available(iOS 17.2, *)
+    private func sendReset(
+        model: AppModel,
+        activityID: String? = nil,
+        activityState: String,
+        activityObservedAt: TimeInterval
+    ) async {
         guard let url = URL(string: model.liveMonitorServerURL)?.appendingPathComponent("register") else {
+            EventLog.append("Live Activity reset failed: invalid server URL")
+            model.refreshEventLog()
             return
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        var payload = ["kind": "reset"]
+        var payload: [String: Any] = [
+            "kind": "reset",
+            "device": await deviceName(),
+            "device_id": await deviceID(),
+        ]
         if let activityID { payload["activity_id"] = activityID }
+        payload["activity_observed_at"] = activityObservedAt
+        addActivityContext(activityState: activityState, to: &payload)
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = 10
-        _ = try? await URLSession.shared.data(for: request)
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (200..<300).contains(code) {
+                EventLog.append("Live Activity reset sent (state: \(activityState))")
+            } else {
+                EventLog.append("Live Activity reset failed: server error \(code)")
+            }
+        } catch {
+            EventLog.append("Live Activity reset failed: \(error.localizedDescription)")
+        }
+        model.refreshEventLog()
     }
 
     /// Confirms the daemon's current Dot command only after the app applied
@@ -562,60 +850,74 @@ final class LiveMonitorManager: ObservableObject {
 
     @available(iOS 17.2, *)
     private func observe(activity: Activity<AgentActivityAttributes>, model: AppModel) {
+        let initialState = activity.activityState
+        guard isReusable(initialState) else {
+            Task {
+                await self.handleTerminalTransition(
+                    activity,
+                    state: initialState,
+                    model: model,
+                    source: "observer attachment"
+                )
+            }
+            return
+        }
         guard observedActivityIDs.insert(activity.id).inserted else { return }
         let observedAt = Date().timeIntervalSince1970
+        EventLog.append(
+            "Live Activity \(activity.id.prefix(8)) observing as \(activityStateName(initialState))"
+        )
+        model.refreshEventLog()
         // Push the current token right away (an activity observed at launch
         // may not re-emit it), then follow rotations.
         if let current = activity.pushToken {
+            let tokenObservedAt = Date().timeIntervalSince1970
             Task {
                 await self.register(
                     kind: "update",
                     token: current,
                     model: model,
                     activityID: activity.id,
-                    activityObservedAt: observedAt
+                    activityObservedAt: observedAt,
+                    tokenObservedAt: tokenObservedAt
                 )
             }
         }
         Task {
             for await tokenData in activity.pushTokenUpdates {
+                let tokenObservedAt = Date().timeIntervalSince1970
                 await self.register(
                     kind: "update",
                     token: tokenData,
                     model: model,
                     activityID: activity.id,
-                    activityObservedAt: observedAt
+                    activityObservedAt: observedAt,
+                    tokenObservedAt: tokenObservedAt
                 )
             }
         }
-        // A swiped-away (or 8-hour-expired) activity reports .dismissed;
-        // tell the daemon so it can start a fresh one while agents are
-        // active. Programmatic ends (.ended) stay silent — those are the
-        // daemon's own idle-end and the dedup cleanup.
         Task { [weak self] in
+            guard let self else { return }
+            var previousState = initialState
             for await state in activity.activityStateUpdates {
-                if state == .dismissed {
-                    let intentional = self?.intentionallyEndedActivityIDs.remove(activity.id) != nil
-                    if !intentional {
-                        if self?.selectedActivityID == activity.id {
-                            self?.selectedActivityID = nil
-                        }
-                        await self?.sendReset(model: model, activityID: activity.id)
-                    }
-                    break
+                if state != previousState {
+                    EventLog.append(
+                        "Live Activity \(activity.id.prefix(8)) state \(self.activityStateName(previousState)) -> \(self.activityStateName(state))"
+                    )
+                    model.refreshEventLog()
+                    previousState = state
                 }
-                if state == .ended {
-                    self?.intentionallyEndedActivityIDs.remove(activity.id)
-                    if self?.selectedActivityID == activity.id {
-                        self?.selectedActivityID = nil
-                    }
+                if !self.isReusable(state) {
+                    await self.handleTerminalTransition(
+                        activity,
+                        state: state,
+                        model: model,
+                        source: "state transition"
+                    )
                     break
                 }
             }
-            self?.observedActivityIDs.remove(activity.id)
-            if self?.selectedActivityID == activity.id {
-                self?.selectedActivityID = nil
-            }
+            self.observedActivityIDs.remove(activity.id)
         }
     }
 
@@ -626,11 +928,17 @@ final class LiveMonitorManager: ObservableObject {
         model: AppModel,
         activityID: String? = nil,
         activityObservedAt: TimeInterval? = nil,
+        tokenObservedAt: TimeInterval? = nil,
         serverURL: String? = nil,
         isStillCurrent: (() -> Bool)? = nil,
-        updatesStatus: Bool = true
+        updatesStatus: Bool = true,
+        attemptLimit: Int = 5
     ) async -> Bool {
-        if kind == "update", selectedActivityID != activityID { return false }
+        if kind == "update" {
+            guard #available(iOS 17.2, *),
+                  isCurrentReusableUpdateActivity(activityID, token: token)
+            else { return false }
+        }
         if let isStillCurrent, !isStillCurrent() { return false }
         let tokenHex = token.map { String(format: "%02x", $0) }.joined()
         let targetServerURL = serverURL ?? model.liveMonitorServerURL
@@ -644,9 +952,17 @@ final class LiveMonitorManager: ObservableObject {
             "kind": kind,
             "token": tokenHex,
             "device": await deviceName(),
+            "device_id": await deviceID(),
         ]
         if let activityID { payload["activity_id"] = activityID }
         if let activityObservedAt { payload["activity_observed_at"] = activityObservedAt }
+        if let tokenObservedAt { payload["token_observed_at"] = tokenObservedAt }
+        if #available(iOS 17.2, *) {
+            addActivityContext(
+                activityState: currentActivityStateName(activityID: activityID),
+                to: &payload
+            )
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -658,8 +974,13 @@ final class LiveMonitorManager: ObservableObject {
         // update, so a transient failure (cellular blip, Tailscale waking)
         // retries with backoff before giving up.
         var delay: UInt64 = 2
-        for attempt in 1...5 {
-            if kind == "update", selectedActivityID != activityID { return false }
+        let attempts = max(1, attemptLimit)
+        for attempt in 1...attempts {
+            if kind == "update" {
+                guard #available(iOS 17.2, *),
+                      isCurrentReusableUpdateActivity(activityID, token: token)
+                else { return false }
+            }
             if let isStillCurrent, !isStillCurrent() { return false }
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
@@ -669,6 +990,12 @@ final class LiveMonitorManager: ObservableObject {
                         statusMessage = kind == "push_to_start"
                             ? "Registered — the Mac can now start the Live Activity"
                             : "Live Activity connected"
+                    }
+                    if kind == "update" || kind == "push_to_start" {
+                        EventLog.append(
+                            "Live Activity \(kind) token registered (state: \(payload["activity_state"] as? String ?? "unknown"))"
+                        )
+                        model.refreshEventLog()
                     }
                     return true
                 }
@@ -680,11 +1007,94 @@ final class LiveMonitorManager: ObservableObject {
                     statusMessage = "Cannot reach server: \(error.localizedDescription)"
                 }
             }
-            guard attempt < 5 else { return false }
+            guard attempt < attempts else { return false }
             try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
             delay *= 2
         }
         return false
+    }
+
+    @available(iOS 17.2, *)
+    private func reusableActivities() -> [Activity<AgentActivityAttributes>] {
+        Activity<AgentActivityAttributes>.activities.filter { isReusable($0.activityState) }
+    }
+
+    @available(iOS 17.2, *)
+    private func isCurrentReusableUpdateActivity(
+        _ activityID: String?,
+        token: Data
+    ) -> Bool {
+        guard let activityID,
+              selectedActivityID == activityID,
+              let activity = Activity<AgentActivityAttributes>.activities.first(where: { $0.id == activityID })
+        else { return false }
+        return isReusable(activity.activityState) && activity.pushToken == token
+    }
+
+    @available(iOS 17.2, *)
+    private func isReusable(_ state: ActivityState) -> Bool {
+        if state == .active || state == .stale {
+            return true
+        }
+        if #available(iOS 26.0, *), state == .pending {
+            return true
+        }
+        return false
+    }
+
+    @available(iOS 17.2, *)
+    private func activityStateName(_ state: ActivityState) -> String {
+        if #available(iOS 26.0, *), state == .pending { return "pending" }
+        if state == .active { return "active" }
+        if state == .stale { return "stale" }
+        if state == .ended { return "ended" }
+        if state == .dismissed { return "dismissed" }
+        return "unknown"
+    }
+
+    private func pruneActivityIDHistory(_ history: inout [String]) {
+        let limit = 32
+        if history.count > limit {
+            history.removeFirst(history.count - limit)
+        }
+    }
+
+    private func rememberKnownActivityID(_ activityID: String) -> Bool {
+        guard !knownActivityIDs.contains(activityID) else { return false }
+        knownActivityIDs.append(activityID)
+        pruneActivityIDHistory(&knownActivityIDs)
+        return true
+    }
+
+    @available(iOS 17.2, *)
+    private func currentActivityStateName(activityID: String? = nil) -> String {
+        let activities = Activity<AgentActivityAttributes>.activities
+        if let activityID,
+           let activity = activities.first(where: { $0.id == activityID }) {
+            return activityStateName(activity.activityState)
+        }
+        if let selectedActivityID,
+           let selected = activities.first(where: { $0.id == selectedActivityID }) {
+            return activityStateName(selected.activityState)
+        }
+        if let reusable = activities.first(where: { isReusable($0.activityState) }) {
+            return activityStateName(reusable.activityState)
+        }
+        if let terminal = activities.first {
+            return activityStateName(terminal.activityState)
+        }
+        return "none"
+    }
+
+    @available(iOS 17.2, *)
+    private func addActivityContext(
+        activityState: String,
+        to payload: inout [String: Any]
+    ) {
+        let authorization = ActivityAuthorizationInfo()
+        payload["activity_state"] = activityState
+        payload["activities_enabled"] = authorization.areActivitiesEnabled
+        payload["frequent_pushes_enabled"] = authorization.frequentPushesEnabled
     }
 
     private func deviceName() async -> String {
@@ -692,6 +1102,21 @@ final class LiveMonitorManager: ObservableObject {
         return await UIDevice.current.name
         #else
         return "iPhone"
+        #endif
+    }
+
+    private func deviceID() async -> String {
+        #if canImport(UIKit)
+        let defaultsKey = "liveActivityFallbackDeviceID"
+        if let saved = UserDefaults.standard.string(forKey: defaultsKey), !saved.isEmpty {
+            return saved
+        }
+        let identifier = UIDevice.current.identifierForVendor?.uuidString.lowercased()
+            ?? UUID().uuidString.lowercased()
+        UserDefaults.standard.set(identifier, forKey: defaultsKey)
+        return identifier
+        #else
+        return "sidepulse-ios-unsupported"
         #endif
     }
 }

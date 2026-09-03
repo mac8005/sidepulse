@@ -88,6 +88,19 @@ START_PUSH_MIN_GAP_SECONDS = 45.0
 # a start push — a real "the phone has nothing" reset survives the wait.
 RESET_ECHO_SECONDS = 60.0
 MAX_UNANSWERED_START_PUSHES = 3
+# Once an unanswered start burst is exhausted, ask the ordinary app process
+# to reconcile ActivityKit once. This push cannot create a duplicate activity;
+# it only gives the app a chance to report what iOS actually has.
+START_RECONCILE_NUDGE_DELAY_SECONDS = 60.0
+START_RECONCILE_RETRY_SECONDS = 30 * 60.0
+ACTIVITY_REPORT_STALE_SECONDS = 30 * 60.0
+START_RECONCILE_NUDGE_EXPIRY_SECONDS = 15 * 60.0
+START_RECONCILE_COLLAPSE_ID = "sidepulse-live-activity-reconcile"
+# An unconfirmed push-to-start activity can remain active for eight hours and
+# its ended card can linger for four more. Only reopen the autonomous start
+# burst after that complete safety window, so recovery is eventual without
+# building an unreachable stack on the Lock Screen.
+START_PUSH_SAFE_RECOVERY_SECONDS = 12 * 3600.0
 # iOS ends a Live Activity eight hours in: the Dynamic Island slot goes at
 # once while a dead card lingers on the Lock Screen for hours. Rotate a
 # little early, so the swap happens while the update token still answers.
@@ -197,6 +210,45 @@ class DotDndSchedule:
 
 class StaleCompletionError(Exception):
     """The client tried to acknowledge an older completion generation."""
+
+
+LIVE_ACTIVITY_STATES = {
+    "active",
+    "pending",
+    "stale",
+    "ended",
+    "dismissed",
+    "none",
+    "unknown",
+}
+LIVE_ACTIVITY_NONLIVE_STATES = {"ended", "dismissed", "none", "unknown"}
+LIVE_ACTIVITY_METADATA_KEYS = (
+    "activity_state",
+    "activities_enabled",
+    "frequent_pushes_enabled",
+)
+DEVICE_ID_MAX_CHARS = 128
+
+
+def _parse_live_activity_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    """Validate optional ActivityKit capability and lifecycle evidence."""
+    metadata: dict[str, Any] = {}
+    if "activity_state" in body:
+        state = body["activity_state"]
+        if not isinstance(state, str):
+            raise ValueError("activity_state must be a string")
+        state = state.strip().lower().removeprefix(".")
+        if state not in LIVE_ACTIVITY_STATES:
+            raise ValueError("invalid activity_state")
+        metadata["activity_state"] = state
+    for key in ("activities_enabled", "frequent_pushes_enabled"):
+        if key not in body:
+            continue
+        value = body[key]
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean")
+        metadata[key] = value
+    return metadata
 
 
 def _parse_dot_availability(
@@ -376,11 +428,19 @@ class TokenStore:
         """Keep one token per device while preserving other registered phones."""
         with self._lock:
             device = str(meta.get("device", ""))
+            device_id = str(meta.get("device_id", ""))
             previous = set(self._data[kind])
             self._data[kind] = {
                 old_token: old_meta
                 for old_token, old_meta in self._data[kind].items()
-                if old_token == token or str(old_meta.get("device", "")) != device
+                if old_token == token
+                or (
+                    str(old_meta.get("device_id", "")) != device_id
+                    if device_id
+                    else bool(str(old_meta.get("device_id", "")))
+                    or not device
+                    or str(old_meta.get("device", "")) != device
+                )
             }
             stored_meta = dict(meta)
             stored_meta["registered_at"] = datetime.now(timezone.utc).isoformat()
@@ -1618,6 +1678,8 @@ class LiveActivityDaemon:
         self._retired_activity_ids: set[str] = set()
         self._last_push_state: str | None = None
         self._last_start_push_at = 0.0
+        self._last_reconcile_nudge_at = 0.0
+        self._last_reconcile_nudge_accepted: bool | None = None
         self._pushes_this_activity = 0
         self._last_dot_state: str | None = None
         self._last_dot_has_unread_finished: bool | None = None
@@ -1634,6 +1696,19 @@ class LiveActivityDaemon:
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
+        self._last_activity_report: dict[str, Any] = {}
+        self._activity_recovery_path = (
+            default_state_dir() / "live_activity_recovery.json"
+        )
+        self._load_activity_recovery_state()
+        for token, metadata in self.tokens.entries("update").items():
+            if metadata.get("activity_state") not in LIVE_ACTIVITY_NONLIVE_STATES:
+                continue
+            activity_id = str(metadata.get("activity_id", ""))
+            if activity_id:
+                self._retired_activity_ids.add(activity_id)
+            self.tokens.drop("update", token)
+        self._activity_live = bool(self.tokens.tokens("update"))
         self._agent_modes: dict[str, str] = {}
         self._last_alerts: dict[tuple[str, str], float] = {}
         self._last_rows: dict[str, dict[str, Any]] = {}
@@ -1795,8 +1870,11 @@ class LiveActivityDaemon:
         # arrives, whatever an earlier start push claimed. Finished rows earn
         # an island too: gating this on active work meant an activity that
         # died while the host idled stayed dead until new work began.
-        if (active or has_recent_finished) and not self.tokens.tokens("update"):
-            self._maybe_push_to_start(content_state, now)
+        if active or has_recent_finished:
+            if self.tokens.tokens("update"):
+                self._maybe_reconcile_stale_activity(now)
+            else:
+                self._maybe_push_to_start(content_state, now)
 
     def _sync_background_tasks(self, statuses, now: float) -> None:
         """Mirror held-open sessions onto the Moonside lamp markers.
@@ -2215,10 +2293,13 @@ class LiveActivityDaemon:
         topic: str | None = None,
         expiration: int | None = None,
         collapse_id: str | None = None,
+        target_tokens: list[str] | None = None,
     ) -> bool:
         payload = shrink_payload(payload)
         accepted = False
-        for token in self.tokens.tokens(kind):
+        for token in (
+            target_tokens if target_tokens is not None else self.tokens.tokens(kind)
+        ):
             options: dict[str, Any] = {
                 "priority": priority,
                 "push_type": push_type,
@@ -2241,6 +2322,7 @@ class LiveActivityDaemon:
                     # cannot spawn a stack of activities).
                     self._activity_live = False
                     self._start_push_attempts = 0
+                    self._save_activity_recovery_state()
             elif status != 200:
                 _log(f"APNs {kind} push -> {status} {body[:120]}")
         return accepted
@@ -2313,6 +2395,249 @@ class LiveActivityDaemon:
         """
         return bool(self._last_start_push_at) and now - self._last_start_push_at < RESET_ECHO_SECONDS
 
+    def _load_activity_recovery_state(self) -> None:
+        """Restore start safety and the last client report across restarts."""
+        try:
+            raw = json.loads(self._activity_recovery_path.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        attempts = raw.get("start_push_attempts")
+        if (
+            isinstance(attempts, int)
+            and not isinstance(attempts, bool)
+            and 0 <= attempts <= MAX_UNANSWERED_START_PUSHES
+        ):
+            self._start_push_attempts = attempts
+        for key, attribute in (
+            ("last_start_push_at", "_last_start_push_at"),
+            ("last_reconcile_nudge_at", "_last_reconcile_nudge_at"),
+        ):
+            value = raw.get(key)
+            if (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                setattr(self, attribute, float(value))
+        accepted = raw.get("last_reconcile_nudge_accepted")
+        if isinstance(accepted, bool):
+            self._last_reconcile_nudge_accepted = accepted
+        report = raw.get("last_activity_report")
+        if isinstance(report, dict):
+            self._last_activity_report = {
+                key: value
+                for key, value in report.items()
+                if key
+                in {
+                    *LIVE_ACTIVITY_METADATA_KEYS,
+                    "activity_id",
+                    "activity_observed_at",
+                    "device",
+                    "device_id",
+                    "reported_at",
+                    "source",
+                }
+            }
+
+    def _save_activity_recovery_state(self) -> None:
+        with self._push_state_lock:
+            data = {
+                "start_push_attempts": self._start_push_attempts,
+                "last_start_push_at": self._last_start_push_at,
+                "last_reconcile_nudge_at": self._last_reconcile_nudge_at,
+                "last_reconcile_nudge_accepted": self._last_reconcile_nudge_accepted,
+                "last_activity_report": self._last_activity_report,
+            }
+            temporary = self._activity_recovery_path.with_name(
+                f".{self._activity_recovery_path.name}.tmp"
+            )
+            try:
+                self._activity_recovery_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary.write_text(json.dumps(data, sort_keys=True))
+                temporary.replace(self._activity_recovery_path)
+            except OSError:
+                temporary.unlink(missing_ok=True)
+
+    def _record_activity_report(
+        self,
+        meta: dict[str, Any],
+        source: str,
+        *,
+        persist_for_device: bool = False,
+    ) -> None:
+        evidence = {
+            key: meta[key]
+            for key in LIVE_ACTIVITY_METADATA_KEYS
+            if key in meta
+        }
+        if not evidence:
+            return
+        moment = time.time()
+        report = {
+            **evidence,
+            "activity_id": str(meta.get("activity_id", "")),
+            "activity_observed_at": meta.get("activity_observed_at"),
+            "device": str(meta.get("device", "")),
+            "device_id": str(meta.get("device_id", "")),
+            "reported_at": moment,
+            "source": source,
+        }
+        with self._push_state_lock:
+            self._last_activity_report = report
+            if persist_for_device:
+                device = report["device"]
+                device_id = report["device_id"]
+                values = {**evidence, "activity_status_at": moment}
+                for kind in ("push_to_start", "device", "dot_device"):
+                    entries = self.tokens.entries(kind)
+                    for token, stored in entries.items():
+                        if device_id and str(stored.get("device_id", "")) != device_id:
+                            continue
+                        if (
+                            not device_id
+                            and device
+                            and str(stored.get("device", "")) != device
+                        ):
+                            continue
+                        if not device_id and not device and len(entries) != 1:
+                            continue
+                        self.tokens.update_metadata(kind, token, values)
+            self._save_activity_recovery_state()
+        labels = []
+        if "activity_state" in evidence:
+            labels.append(f"state={evidence['activity_state']}")
+        if "activities_enabled" in evidence:
+            labels.append(
+                "activities=" + ("on" if evidence["activities_enabled"] else "off")
+            )
+        if "frequent_pushes_enabled" in evidence:
+            labels.append(
+                "frequent="
+                + ("on" if evidence["frequent_pushes_enabled"] else "off")
+            )
+        _log(
+            f"{source} activity report from {report['device'] or 'unknown'}: "
+            + ", ".join(labels)
+        )
+
+    def _activity_health(self, now: float | None = None) -> dict[str, Any]:
+        """Concise evidence for ActivityKit state and bounded recovery."""
+        moment = time.time() if now is None else now
+        with self._push_state_lock:
+            update_entries = self.tokens.entries("update")
+            current = next(iter(update_entries.values()), {})
+            report = self._last_activity_report
+            current_state = current.get("activity_state")
+            current_id = str(current.get("activity_id", ""))
+            report_id = str(report.get("activity_id", ""))
+            if current_state not in LIVE_ACTIVITY_STATES and (
+                not update_entries or not report_id or report_id == current_id
+            ):
+                current_state = report.get("activity_state")
+            if current_state not in LIVE_ACTIVITY_STATES:
+                current_state = None
+
+            def capability(key: str) -> bool | None:
+                value = report.get(key)
+                if isinstance(value, bool):
+                    return value
+                value = current.get(key)
+                return value if isinstance(value, bool) else None
+
+            report_time = report.get("reported_at")
+            report_age = (
+                max(0.0, round(moment - float(report_time), 1))
+                if not isinstance(report_time, bool)
+                and isinstance(report_time, (int, float))
+                and math.isfinite(report_time)
+                else None
+            )
+            live = bool(update_entries) and (
+                current_state not in LIVE_ACTIVITY_NONLIVE_STATES
+            )
+            if live:
+                recovery = "live"
+            elif capability("activities_enabled") is False:
+                recovery = "disabled"
+            elif self._start_push_attempts >= MAX_UNANSWERED_START_PUSHES:
+                recovery = (
+                    "reconciling"
+                    if self._last_reconcile_nudge_at >= self._last_start_push_at
+                    and self._last_reconcile_nudge_at > 0
+                    else "exhausted"
+                )
+            elif self._start_push_attempts:
+                recovery = "awaiting_registration"
+            else:
+                recovery = "ready"
+            return {
+                "activityLive": live,
+                "activityClientState": current_state,
+                "activitiesEnabled": capability("activities_enabled"),
+                "frequentPushesEnabled": capability(
+                    "frequent_pushes_enabled"
+                ),
+                "activityReportAgeSeconds": report_age,
+                "startPushAttempts": self._start_push_attempts,
+                "startRecovery": recovery,
+                "secondsSinceLastStartPush": (
+                    max(0.0, round(moment - self._last_start_push_at, 1))
+                    if self._last_start_push_at
+                    else None
+                ),
+                "secondsSinceReconcileNudge": (
+                    max(0.0, round(moment - self._last_reconcile_nudge_at, 1))
+                    if self._last_reconcile_nudge_at
+                    else None
+                ),
+                "reconcileNudgeAccepted": self._last_reconcile_nudge_accepted,
+            }
+
+    def _activities_can_start(self) -> bool:
+        entries = self.tokens.entries("push_to_start")
+        return any(
+            metadata.get("activities_enabled") is not False
+            for metadata in entries.values()
+        )
+
+    def _current_activity_report_is_fresh(self, now: float) -> bool:
+        report = self._last_activity_report
+        reported_at = report.get("reported_at")
+        if (
+            isinstance(reported_at, bool)
+            or not isinstance(reported_at, (int, float))
+            or not math.isfinite(reported_at)
+            or now - reported_at >= ACTIVITY_REPORT_STALE_SECONDS
+            or report.get("activity_state") not in {"active", "pending", "stale"}
+        ):
+            return False
+        current = next(iter(self.tokens.entries("update").values()), {})
+        current_device_id = current.get("device_id")
+        report_device_id = report.get("device_id")
+        if isinstance(current_device_id, str) and current_device_id:
+            return current_device_id == report_device_id
+        current_device = current.get("device")
+        report_device = report.get("device")
+        return (
+            isinstance(current_device, str)
+            and bool(current_device)
+            and current_device == report_device
+        )
+
+    def _maybe_reconcile_stale_activity(self, now: float) -> bool:
+        if self._current_activity_report_is_fresh(now) or (
+            self._last_reconcile_nudge_at
+            and now - self._last_reconcile_nudge_at
+            < START_RECONCILE_RETRY_SECONDS
+        ):
+            return False
+        return self._send_activity_reconcile_nudge(
+            now, "activity lifecycle report is stale or missing"
+        )
+
     def _activity_started_at(self, activity_id: str) -> float | None:
         """When this activity first registered, across token rotations."""
         if not activity_id:
@@ -2352,8 +2677,34 @@ class LiveActivityDaemon:
             previous = self.tokens.entries("update")
             current_meta = next(iter(previous.values()), {})
             current_activity_id = str(current_meta.get("activity_id", ""))
+            if meta.get("activity_state") in LIVE_ACTIVITY_NONLIVE_STATES:
+                self._record_activity_report(
+                    meta, "update", persist_for_device=True
+                )
+                if activity_id:
+                    self._retired_activity_ids.add(activity_id)
+                    while len(self._retired_activity_ids) > 32:
+                        self._retired_activity_ids.pop()
+                affects_current = (
+                    not previous
+                    or token in previous
+                    or bool(activity_id and activity_id == current_activity_id)
+                )
+                if affects_current:
+                    self._retire_update_tokens()
+                    self._activity_live = False
+                    self._start_push_attempts = 0
+                    self._save_activity_recovery_state()
+                    self._wake.set()
+                _log(
+                    "refusing terminal activity token "
+                    f"{activity_id[:8] or 'unknown'} ({meta['activity_state']})"
+                )
+                return False
             incoming_observed_at = meta.get("activity_observed_at")
             current_observed_at = current_meta.get("activity_observed_at")
+            incoming_token_observed_at = meta.get("token_observed_at")
+            current_token_observed_at = current_meta.get("token_observed_at")
             if activity_id in self._retired_activity_ids or (
                 activity_id
                 and current_activity_id
@@ -2363,6 +2714,14 @@ class LiveActivityDaemon:
                         and isinstance(current_observed_at, (int, float))
                         and incoming_observed_at < current_observed_at
                 )
+            ) or (
+                activity_id
+                and activity_id == current_activity_id
+                and isinstance(incoming_token_observed_at, (int, float))
+                and not isinstance(incoming_token_observed_at, bool)
+                and isinstance(current_token_observed_at, (int, float))
+                and not isinstance(current_token_observed_at, bool)
+                and incoming_token_observed_at < current_token_observed_at
             ):
                 _log(f"ignoring retired activity token {activity_id[:8]}")
                 return False
@@ -2389,27 +2748,107 @@ class LiveActivityDaemon:
                 self._wake.set()
             self._activity_live = True
             self._start_push_attempts = 0
+            self._record_activity_report(meta, "update", persist_for_device=True)
         return owner_changed
 
     def register_push_to_start_token(self, token: str, meta: dict[str, Any]) -> bool:
         """Register future-start authority without touching a live activity."""
         changed = self.tokens.replace_for_device("push_to_start", token, meta)
-        self._start_push_attempts = 0
+        with self._push_state_lock:
+            if changed:
+                self._start_push_attempts = 0
+            self._record_activity_report(
+                meta, "push_to_start", persist_for_device=True
+            )
         self._wake.set()
         return changed
 
-    def reset_activity(self, activity_id: str = "") -> bool:
+    def reset_activity(
+        self, activity_id: str = "", meta: dict[str, Any] | None = None
+    ) -> bool:
         """Reset only the activity that reported its own dismissal."""
         with self._push_state_lock:
+            current_entries = self.tokens.entries("update")
+            current = next(iter(current_entries.values()), {})
             current_ids = {
-                str(meta.get("activity_id", ""))
-                for meta in self.tokens.entries("update").values()
+                str(entry.get("activity_id", ""))
+                for entry in current_entries.values()
             }
-            if activity_id and activity_id not in current_ids:
+            if activity_id and current_ids and activity_id not in current_ids:
                 _log(f"ignoring reset from non-current activity {activity_id[:8]}")
                 return False
+            state = meta.get("activity_state") if meta is not None else None
+            if (
+                not activity_id
+                and current_ids
+                and state in LIVE_ACTIVITY_NONLIVE_STATES
+                and not (
+                    len(current_entries) == 1
+                    and self._unqualified_reset_matches_owner(meta or {}, current)
+                )
+            ):
+                _log("ignoring stale or cross-device unqualified activity reset")
+                return False
+            if meta is not None:
+                self._record_activity_report(
+                    meta, "reset", persist_for_device=True
+                )
+            if state in LIVE_ACTIVITY_NONLIVE_STATES:
+                if activity_id:
+                    self._retired_activity_ids.add(activity_id)
+                self._retire_update_tokens()
+                self._activity_live = False
+                self._start_push_attempts = 0
+                self._save_activity_recovery_state()
+                self._wake.set()
+                _log(f"client confirmed activity {state}; will restart")
+                return True
             self._end_stale_activity("app reports no activity")
             return True
+
+    @staticmethod
+    def _unqualified_reset_matches_owner(
+        reset_meta: dict[str, Any], current_meta: dict[str, Any]
+    ) -> bool:
+        """Only a newer same-device report may clear an unqualified ghost."""
+        reset_device_id = reset_meta.get("device_id")
+        current_device_id = current_meta.get("device_id")
+        if not isinstance(reset_device_id, str) or not reset_device_id:
+            return False
+        if isinstance(current_device_id, str) and current_device_id:
+            if reset_device_id != current_device_id:
+                return False
+        else:
+            reset_device = reset_meta.get("device")
+            current_device = current_meta.get("device")
+            if (
+                not isinstance(reset_device, str)
+                or not reset_device
+                or reset_device != current_device
+            ):
+                return False
+        absence_at = reset_meta.get("activity_observed_at")
+        if (
+            isinstance(absence_at, bool)
+            or not isinstance(absence_at, (int, float))
+            or not math.isfinite(absence_at)
+        ):
+            return False
+        current_times = []
+        observed_at = current_meta.get("activity_observed_at")
+        if (
+            not isinstance(observed_at, bool)
+            and isinstance(observed_at, (int, float))
+            and math.isfinite(observed_at)
+        ):
+            current_times.append(float(observed_at))
+        registered_at = current_meta.get("registered_at")
+        if isinstance(registered_at, str):
+            try:
+                current_times.append(datetime.fromisoformat(registered_at).timestamp())
+            except ValueError:
+                pass
+        return not current_times or max(current_times) <= float(absence_at)
 
     def _retire_update_tokens(self) -> None:
         """Prevent ended activity observers from reclaiming token ownership."""
@@ -2428,11 +2867,17 @@ class LiveActivityDaemon:
     def _maybe_push_to_start(self, content_state: dict[str, Any], now: float) -> None:
         if not self.tokens.tokens("push_to_start"):
             return
-        if self._start_push_attempts >= MAX_UNANSWERED_START_PUSHES:
-            # Starting more activities would only stack unreachable ones.
-            # Wait for evidence: a registered update token, a dead token, or
-            # the app reporting it has no activity.
+        if not self._activities_can_start():
             return
+        if self._start_push_attempts >= MAX_UNANSWERED_START_PUSHES:
+            if now - self._last_start_push_at < START_PUSH_SAFE_RECOVERY_SECONDS:
+                self._maybe_send_activity_reconcile_nudge(now)
+                return
+            # By now even the newest unconfirmed activity and its lingering
+            # Lock Screen card have aged out. Reopen one bounded start burst.
+            _log("unconfirmed start safety window elapsed; reopening recovery")
+            self._start_push_attempts = 0
+            self._save_activity_recovery_state()
         # First retry after the base cooldown, then doubling per attempt —
         # but never faster than the floor, even right after a reset.
         wait = max(
@@ -2447,7 +2892,10 @@ class LiveActivityDaemon:
         if now - self._last_start_push_at < wait:
             return
         self._last_start_push_at = now
+        if self._start_push_attempts == 0:
+            self._last_reconcile_nudge_accepted = None
         self._start_push_attempts += 1
+        self._save_activity_recovery_state()
         aps: dict[str, Any] = {
             "timestamp": int(now),
             "event": "start",
@@ -2468,6 +2916,98 @@ class LiveActivityDaemon:
         self._apns_fanout("push_to_start", payload)
         # _activity_live flips only when the phone registers the activity's
         # update token — a sent start push is not a started activity.
+
+    def _maybe_send_activity_reconcile_nudge(self, now: float) -> bool:
+        """Wake the ordinary app at a low cadence while starts are exhausted."""
+        nudged_this_burst = (
+            self._last_reconcile_nudge_at >= self._last_start_push_at
+            and self._last_reconcile_nudge_at > 0
+        )
+        retry_after = (
+            START_RECONCILE_RETRY_SECONDS
+            if nudged_this_burst
+            else START_RECONCILE_NUDGE_DELAY_SECONDS
+        )
+        previous = (
+            self._last_reconcile_nudge_at
+            if nudged_this_burst
+            else self._last_start_push_at
+        )
+        if (
+            not self.tokens.tokens("device")
+            or now - previous < retry_after
+        ):
+            return False
+        return self._send_activity_reconcile_nudge(
+            now, "start attempts exhausted"
+        )
+
+    def _send_activity_reconcile_nudge(self, now: float, reason: str) -> bool:
+        targets = self._activity_reconcile_targets()
+        if not targets:
+            return False
+        self._last_reconcile_nudge_at = now
+        self._last_reconcile_nudge_accepted = None
+        self._save_activity_recovery_state()
+        _log(f"{reason}; requesting app activity reconcile")
+        accepted = self._apns_fanout(
+            "device",
+            {
+                "aps": {"content-available": 1},
+                "sidepulseAction": "reconcileLiveActivity",
+            },
+            priority=5,
+            push_type="background",
+            topic=self.config.bundle_id,
+            expiration=int(now + START_RECONCILE_NUDGE_EXPIRY_SECONDS),
+            collapse_id=START_RECONCILE_COLLAPSE_ID,
+            target_tokens=targets,
+        )
+        self._last_reconcile_nudge_accepted = accepted
+        self._save_activity_recovery_state()
+        return accepted
+
+    def _activity_reconcile_targets(self) -> list[str]:
+        """Target the current activity's phone, or all phones if ownerless."""
+        devices = self.tokens.entries("device")
+        if not devices:
+            return []
+        updates = self.tokens.entries("update")
+        if not updates:
+            return list(devices)
+
+        owner = next(iter(updates.values()))
+        owner_id = owner.get("device_id")
+        if isinstance(owner_id, str) and owner_id:
+            exact = [
+                token
+                for token, meta in devices.items()
+                if meta.get("device_id") == owner_id
+            ]
+            if exact:
+                return exact
+
+        owner_device = owner.get("device")
+        if not isinstance(owner_device, str) or not owner_device:
+            return []
+        legacy_matches = [
+            (token, meta)
+            for token, meta in devices.items()
+            if meta.get("device") == owner_device
+        ]
+        if len(legacy_matches) != 1:
+            return []
+        token, meta = legacy_matches[0]
+        candidate_id = meta.get("device_id")
+        if (
+            isinstance(owner_id, str)
+            and owner_id
+            and isinstance(candidate_id, str)
+            and candidate_id
+            and candidate_id != owner_id
+        ):
+            return []
+        return [token]
 
     def _push_update(
         self,
@@ -2496,7 +3036,7 @@ class LiveActivityDaemon:
         }
         # Apple: priority 10 for updates people would notice (state changes,
         # alerts); 5 only for the silent heartbeat.
-        priority = 10 if (alert or important) else 5
+        priority = self._update_push_priority(alert=alert, important=important)
         if alert:
             _log(f"alerting update -> {alert['title']}")
             aps["alert"] = {
@@ -2519,6 +3059,17 @@ class LiveActivityDaemon:
             self._activity_live = True
             self._last_pushed_signature = _structure_signature(content_state)
             self._last_pushed_state = content_state
+
+    def _update_push_priority(
+        self, *, alert: dict[str, str] | None, important: bool
+    ) -> int:
+        """Respect the elected phone's explicitly reported push budget."""
+        if alert:
+            return 10
+        if not important:
+            return 5
+        current = next(iter(self.tokens.entries("update").values()), {})
+        return 5 if current.get("frequent_pushes_enabled") is False else 10
 
     def _queue_dot_state(
         self,
@@ -3188,6 +3739,7 @@ class LiveActivityDaemon:
             self._retire_update_tokens()
             self._activity_live = False
             self._start_push_attempts = 0
+            self._save_activity_recovery_state()
 
     def _push_end(self, content_state: dict[str, Any], now: float) -> None:
         with self._push_state_lock:
@@ -3247,6 +3799,7 @@ class LiveActivityDaemon:
                                 else None
                             ),
                             "pushesThisActivity": daemon._pushes_this_activity,
+                            **daemon._activity_health(),
                             **daemon._dot_health(),
                             # The app needs this to label an activity it
                             # starts itself; attributes are fixed at creation.
@@ -3445,16 +3998,56 @@ class LiveActivityDaemon:
                     return
                 kind = body.get("kind")
                 token = body.get("token", "")
+                try:
+                    activity_metadata = _parse_live_activity_metadata(body)
+                except ValueError as exc:
+                    self._json(400, {"error": str(exc)})
+                    return
+                device_id = body.get("device_id", "")
+                if (
+                    not isinstance(device_id, str)
+                    or len(device_id) > DEVICE_ID_MAX_CHARS
+                ):
+                    self._json(400, {"error": "invalid device_id"})
+                    return
+                activity_observed_at = body.get("activity_observed_at")
+                if activity_observed_at is not None and (
+                    isinstance(activity_observed_at, bool)
+                    or not isinstance(activity_observed_at, (int, float))
+                    or not math.isfinite(activity_observed_at)
+                ):
+                    self._json(400, {"error": "invalid activity_observed_at"})
+                    return
+                token_observed_at = body.get("token_observed_at")
+                if token_observed_at is not None and (
+                    isinstance(token_observed_at, bool)
+                    or not isinstance(token_observed_at, (int, float))
+                    or not math.isfinite(token_observed_at)
+                ):
+                    self._json(400, {"error": "invalid token_observed_at"})
+                    return
                 if kind == "reset":
                     activity_id = str(body.get("activity_id", ""))
                     # Legacy unqualified resets can still echo a start push;
                     # current clients identify the dismissed activity, so a
                     # stale duplicate cannot clear the selected winner.
-                    if not activity_id and daemon._is_reset_echo(time.time()):
+                    if (
+                        not activity_id
+                        and activity_metadata.get("activity_state")
+                        not in LIVE_ACTIVITY_NONLIVE_STATES
+                        and daemon._is_reset_echo(time.time())
+                    ):
                         _log("ignoring reset echo just after a start push")
                         self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                         return
-                    daemon.reset_activity(activity_id)
+                    reset_meta = {
+                        "device": str(body.get("device", "")),
+                        "device_id": device_id,
+                        "activity_id": activity_id,
+                        "activity_observed_at": activity_observed_at,
+                        **activity_metadata,
+                    }
+                    daemon.reset_activity(activity_id, reset_meta)
                     self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
                     return
                 if (
@@ -3466,8 +4059,11 @@ class LiveActivityDaemon:
                     return
                 meta = {
                     "device": str(body.get("device", "")),
+                    "device_id": device_id,
                     "activity_id": str(body.get("activity_id", "")),
-                    "activity_observed_at": body.get("activity_observed_at"),
+                    "activity_observed_at": activity_observed_at,
+                    "token_observed_at": token_observed_at,
+                    **activity_metadata,
                 }
                 dot_owner_changed = False
                 if kind == "update":
@@ -3483,19 +4079,25 @@ class LiveActivityDaemon:
                             if key in previous[token]:
                                 meta[key] = previous[token][key]
                     dot_owner_changed = daemon.tokens.replace(kind, token, meta)
+                    daemon._record_activity_report(
+                        meta, kind, persist_for_device=True
+                    )
                 elif kind == "device":
                     daemon.tokens.register(kind, token, meta)
-                if kind == "push_to_start":
-                    # This token controls only future starts. Its rotation
-                    # says nothing about an existing activity's update token,
-                    # and ending that activity here races a local app start.
-                    # Registration does prove the app is reachable, so reopen
-                    # any start-push cap without touching the current owner.
-                    daemon._start_push_attempts = 0
-                elif kind in ("device", "dot_device"):
+                    daemon._record_activity_report(
+                        meta, kind, persist_for_device=True
+                    )
+                if kind in ("device", "dot_device"):
                     if daemon.request_dot_resync(force=dot_owner_changed):
                         daemon._wake.set()
-                _log(f"registered {kind} token from {meta['device'] or 'unknown'}")
+                if not (
+                    kind == "update"
+                    and meta.get("activity_state") in LIVE_ACTIVITY_NONLIVE_STATES
+                ):
+                    _log(
+                        f"registered {kind} token from "
+                        f"{meta['device'] or 'unknown'}"
+                    )
                 self._json(200, {"ok": True, "tokens": daemon.tokens.summary()})
 
         class Server(ThreadingHTTPServer):
