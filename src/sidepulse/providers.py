@@ -62,6 +62,10 @@ GROK_EVENTS = (
 )
 
 HOOK_PROVIDERS = ("codex", "claude", "grok")
+# Providers whose sessions are mirrored into the event stream by a monitor
+# instead of by hooks installed into the agent (see paseo_monitor).
+MIRRORED_PROVIDERS = ("paseo",)
+EVENT_PROVIDERS = HOOK_PROVIDERS + MIRRORED_PROVIDERS
 # Synthetic record written by the live-activity daemon: carries the AI
 # summary of a session so every consumer can title the session with it.
 SUMMARY_EVENT_NAME = "SidepulseSummary"

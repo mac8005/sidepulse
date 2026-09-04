@@ -40,6 +40,7 @@ from .collector import AgentMonitor
 from .ipc import HookEventServer
 from .hook import write_hook_line
 from .led_status import display_state_for_mode
+from .paseo_monitor import paseo_agent_link, paseo_server_id
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
 from .providers import default_state_dir
@@ -516,6 +517,9 @@ class DeepLinkResolver:
     Codex Remote links combine the thread UUID with the owning Mac's current
     Remote environment id. The /app wrapper is claimed by ChatGPT's iOS
     associated domains and unwraps to the native remote-thread route.
+
+    Paseo links combine the agent id with the local daemon's server id; the
+    iOS and desktop apps resolve the server id to the paired host.
     """
 
     MISS_TTL_SECONDS = 120.0
@@ -530,6 +534,7 @@ class DeepLinkResolver:
         self._codex_global_state = self._codex_state_dir / ".codex-global-state.json"
         self._codex_environment: str | None = None
         self._codex_environment_checked_at: float | None = None
+        self._paseo_server_id: str | None = None
 
     def link_for(self, provider: str, session_id: str | None) -> str | None:
         # remote: rows live on another host, so their transcript can never
@@ -539,6 +544,10 @@ class DeepLinkResolver:
             return None
         if provider == "codex":
             return self._codex_link(session_id)
+        if provider == "paseo":
+            if self._paseo_server_id is None:
+                self._paseo_server_id = paseo_server_id()
+            return paseo_agent_link(self._paseo_server_id, session_id)
         if provider != "claude":
             return None
         cached = self._cache.get(session_id)

@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
 from .models import AgentStatus
+from .paseo_monitor import paseo_agent_link, paseo_server_id
 
 SESSION_OPEN_APP = "app"
 SESSION_OPEN_TERMINAL = "terminal"
@@ -22,6 +23,14 @@ def session_deep_link(status: AgentStatus) -> str | None:
 
     if provider == "codex" and session_id:
         return f"codex://threads/{quote(session_id, safe='')}"
+    if provider == "paseo":
+        # The link carries the daemon's server id, which only the origin
+        # host knows; remote rows arrive with it already attached.
+        if status.deep_link and status.deep_link.startswith("paseo://"):
+            return status.deep_link
+        if remote_session_parts(status.session_id):
+            return "paseo://"
+        return paseo_agent_link(paseo_server_id(), session_id) or "paseo://"
     if provider == "claude":
         # A remote session's transcript lives on the host, so claude://resume
         # fails on the client with "transcript may have been removed"; just
@@ -172,6 +181,8 @@ def session_open_action_label(status: AgentStatus, action: str) -> str:
             return "Open in Codex"
         if provider == "claude":
             return "Open Claude App"
+        if provider == "paseo":
+            return "Open in Paseo"
         return "Open App"
     if action == SESSION_OPEN_VSCODE:
         return "Open in VS Code"

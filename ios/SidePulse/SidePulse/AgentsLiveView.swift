@@ -173,6 +173,8 @@ private struct AgentLiveRow: View {
             candidates = [URL(string: "claude://")!, URL(string: "https://claude.ai")!]
         case "codex":
             candidates = [URL(string: "chatgpt://")!, URL(string: "https://chatgpt.com")!]
+        case "paseo":
+            candidates = [URL(string: "paseo://")!]
         default:
             return
         }

@@ -600,6 +600,7 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
     if active_settings.claude_transcripts_enabled:
         sources.append(SourceSpec(CLAUDE_TRANSCRIPT_PROVIDER, Path.home() / ".claude" / "projects"))
     sources.append(SourceSpec("grok", detect_log_path("grok")))
+    sources.append(SourceSpec("paseo", detect_log_path("paseo")))
     sources.extend(SourceSpec(provider, path) for provider, path in configured_remote_logs())
     return unique_sources(sources)
 

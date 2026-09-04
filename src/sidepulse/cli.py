@@ -36,6 +36,7 @@ from .lid_sleep import (
 )
 from .models import AgentStatus
 from .providers import (
+    EVENT_PROVIDERS,
     HOOK_PROVIDERS,
     detect_claude_config,
     detect_codex_config,
@@ -143,6 +144,7 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     add_sidepulse_battery_parser(subparsers)
     add_sidepulse_remote_parser(subparsers)
     add_remote_agent_parser(subparsers)
+    add_paseo_monitor_parser(subparsers)
     add_live_activity_parser(subparsers)
     # Agent configs written by older installs invoke `sidepulse hook-log`
     # directly, and `python -m sidepulse` lands here too, so both CLIs must
@@ -344,7 +346,7 @@ def add_sidepulse_remote_parser(subparsers: argparse._SubParsersAction) -> None:
     add.add_argument(
         "--provider",
         action="append",
-        choices=HOOK_PROVIDERS,
+        choices=EVENT_PROVIDERS,
         help="Provider to monitor. Repeat to select more than one. Default: codex and claude.",
     )
     add.add_argument("--no-start", action="store_true", help="Save without starting the monitor.")
@@ -375,10 +377,26 @@ def add_remote_agent_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     commands = remote_agent.add_subparsers(dest="remote_agent_command", required=True)
     stream = commands.add_parser("stream", help=argparse.SUPPRESS)
-    stream.add_argument("--provider", action="append", choices=HOOK_PROVIDERS)
+    stream.add_argument("--provider", action="append", choices=EVENT_PROVIDERS)
     stream.add_argument("--replay-lines", type=int, default=300)
     stream.add_argument("--poll-interval", type=float, default=0.25)
     stream.set_defaults(func=cmd_remote_agent_stream)
+
+
+def add_paseo_monitor_parser(subparsers: argparse._SubParsersAction) -> None:
+    monitor = subparsers.add_parser(
+        "paseo-monitor",
+        help="Mirror the agents of a Paseo daemon into the SidePulse event stream.",
+    )
+    monitor.add_argument(
+        "--host",
+        help="Paseo daemon host:port. Default: $PASEO_HOST or 127.0.0.1:6767.",
+    )
+    monitor.add_argument(
+        "--password",
+        help="Paseo daemon password. Default: $PASEO_PASSWORD.",
+    )
+    monitor.set_defaults(func=cmd_paseo_monitor)
 
 
 def add_hook_log_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1195,11 +1213,17 @@ def cmd_remote_agent_stream(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_paseo_monitor(args: argparse.Namespace) -> int:
+    from .paseo_monitor import run_paseo_monitor
+
+    return run_paseo_monitor(host=args.host, password=args.password)
+
+
 def monitor_from_args(args: argparse.Namespace) -> AgentMonitor:
     if any(getattr(args, f"{provider}_log", None) for provider in HOOK_PROVIDERS):
         fallback_sources = default_sources()
         sources = []
-        for provider in HOOK_PROVIDERS:
+        for provider in EVENT_PROVIDERS:
             explicit = getattr(args, f"{provider}_log", None)
             if explicit:
                 sources.append(SourceSpec(provider, explicit.expanduser()))

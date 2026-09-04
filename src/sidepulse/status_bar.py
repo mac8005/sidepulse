@@ -5148,6 +5148,9 @@ def provider_icon_for_provider(provider: str):
     elif provider == "grok":
         image = app_icon("/Applications/Grok.app")
         image = image or grok_badge_icon()
+    elif provider == "paseo":
+        image = app_icon("/Applications/Paseo.app")
+        image = image or image_for_symbol("point.3.connected.trianglepath.dotted", "Paseo")
     else:
         image = image_for_symbol("terminal", provider.title() or "Agent")
     _provider_icon_cache[provider] = image

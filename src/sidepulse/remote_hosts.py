@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from .hook import write_hook_line
 from .ipc import send_hook_event
 from .models import provider_label
-from .providers import HOOK_PROVIDERS, default_state_dir, detect_log_path
+from .providers import EVENT_PROVIDERS, default_state_dir, detect_log_path
 
 
 REMOTE_CONFIG_VERSION = 1
@@ -74,7 +74,7 @@ class RemoteHost:
             raise ValueError("SSH target must be a non-empty host or SSH config alias.")
         if not self.providers:
             raise ValueError("At least one remote provider is required.")
-        invalid = tuple(provider for provider in self.providers if provider not in HOOK_PROVIDERS)
+        invalid = tuple(provider for provider in self.providers if provider not in EVENT_PROVIDERS)
         if invalid:
             raise ValueError(f"Unsupported remote provider: {invalid[0]}")
         object.__setattr__(self, "monitor_url", normalize_monitor_url(self.monitor_url))

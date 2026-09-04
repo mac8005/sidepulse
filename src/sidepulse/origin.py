@@ -270,6 +270,11 @@ def background_session_source(
     if str(env.get("AURA_TASK_DIR") or "").strip():
         return "env:AURA_TASK_DIR"
 
+    # Agents hosted by a Paseo daemon are mirrored by the ``paseo`` provider
+    # (see paseo_monitor), so their own hook lines would only be duplicates.
+    if str(env.get("PASEO_AGENT_ID") or "").strip():
+        return "env:PASEO_AGENT_ID"
+
     service = str(env.get("XPC_SERVICE_NAME") or "").strip()
     if service in BACKGROUND_XPC_SERVICES:
         return f"env:XPC_SERVICE_NAME:{service}"
