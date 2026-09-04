@@ -247,7 +247,12 @@ def annotate_payload_with_origin(
     result = dict(payload)
     if "agent_origin" not in payload and "agentOrigin" not in payload:
         result.update(detect_agent_origin(provider, env=active_env).to_payload())
-    background_source = background_session_source(active_env, payload)
+    if provider.lower() == "claude":
+        interactive_source = claude_remote_control_source(payload)
+        if interactive_source:
+            result["sidepulse_interactive_session"] = True
+            result.setdefault("sidepulse_interactive_source", interactive_source)
+    background_source = background_session_source(active_env, result)
     if background_source:
         result["sidepulse_background_session"] = True
         result.setdefault("sidepulse_background_source", background_source)
@@ -269,12 +274,18 @@ def background_session_source(
     if service in BACKGROUND_XPC_SERVICES:
         return f"env:XPC_SERVICE_NAME:{service}"
 
+    if payload is not None and payload.get("sidepulse_interactive_session") is True:
+        return None
+
     if payload is not None and aura_headless_entrypoint(payload) == "sdk-cli":
         return "transcript:entrypoint:sdk-cli"
     return None
 
 
 def aura_headless_entrypoint(payload: Mapping[str, Any]) -> str | None:
+    if payload.get("sidepulse_interactive_session") is True:
+        return None
+
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not any(
         part in {"aura", "aura-server"} for part in Path(cwd).parts
@@ -289,6 +300,29 @@ def aura_headless_entrypoint(payload: Mapping[str, Any]) -> str | None:
     except OSError:
         return None
     return transcript_entrypoint(transcript_path, stat.st_mtime_ns, stat.st_size)
+
+
+def claude_remote_control_source(payload: Mapping[str, Any]) -> str | None:
+    session_id = payload.get("session_id") or payload.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+
+    registry = Path.home() / ".claude" / "sessions"
+    try:
+        entries = registry.glob("*.json")
+    except OSError:
+        return None
+    for path in entries:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("sessionId") != session_id:
+            continue
+        bridge_id = record.get("bridgeSessionId")
+        if record.get("kind") == "interactive" and isinstance(bridge_id, str) and bridge_id:
+            return "claude-registry:interactive-remote-control"
+    return None
 
 
 @lru_cache(maxsize=1024)

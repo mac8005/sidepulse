@@ -31,7 +31,11 @@ from sidepulse import hook as hook_module
 from sidepulse.cli import build_parser, build_sidepulse_parser, cmd_hook_log
 from sidepulse.hook import format_hook_payload, hook_log_main, routed_hook_payload
 from sidepulse.install import fail_open_command, hook_command
-from sidepulse.origin import annotate_payload_with_origin, background_session_source
+from sidepulse.origin import (
+    annotate_payload_with_origin,
+    aura_headless_entrypoint,
+    background_session_source,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -311,6 +315,50 @@ class HappyPathTests(HookIsolationMixin, unittest.TestCase):
         self.assertEqual(
             "transcript:entrypoint:sdk-cli",
             payload["sidepulse_background_source"],
+        )
+
+    def test_remote_control_aura_session_is_not_tagged_as_headless(self):
+        transcript = self.home / "remote-control.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "user", "entrypoint": "sdk-cli"}) + "\n",
+            encoding="utf-8",
+        )
+        registry = self.home / ".claude" / "sessions"
+        registry.mkdir(parents=True)
+        (registry / "70386.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": "remote-session",
+                    "kind": "interactive",
+                    "bridgeSessionId": "session_01RemoteControl",
+                }
+            ),
+            encoding="utf-8",
+        )
+        source = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "remote-session",
+            "cwd": "/Users/x/Git/aura-server",
+            "transcript_path": str(transcript),
+        }
+
+        payload = annotate_payload_with_origin("claude", source, env={})
+
+        self.assertIs(True, payload["sidepulse_interactive_session"])
+        self.assertEqual(
+            "claude-registry:interactive-remote-control",
+            payload["sidepulse_interactive_source"],
+        )
+        self.assertNotIn("sidepulse_background_session", payload)
+        self.assertIsNone(aura_headless_entrypoint(payload))
+
+        daemon_payload = annotate_payload_with_origin(
+            "claude", source, env={"AURA_TASK_DIR": "/tmp/aura-task"}
+        )
+        self.assertIs(True, daemon_payload["sidepulse_background_session"])
+        self.assertEqual(
+            "env:AURA_TASK_DIR",
+            daemon_payload["sidepulse_background_source"],
         )
 
 
