@@ -1924,6 +1924,83 @@ def test_older_same_activity_token_cannot_replace_a_newer_emission(
     assert daemon.tokens.entries("update")["token-t2"]["token_observed_at"] == 200.0
 
 
+def test_current_update_token_reregistration_is_accepted_without_rehydrating(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    assert daemon.register_update_token(
+        "current",
+        {
+            "activity_id": "activity-a",
+            "activity_observed_at": 100.0,
+            "token_observed_at": 200.0,
+        },
+    ) is True
+    generation = daemon._update_token_generation
+    signature = ("working", 1, ())
+    daemon._last_pushed_signature = signature
+    daemon._wake.clear()
+
+    assert daemon.register_update_token(
+        "current",
+        {
+            "activity_id": "activity-a",
+            "activity_observed_at": 100.0,
+            "token_observed_at": 200.0,
+        },
+    ) is True
+    assert daemon._update_token_generation == generation
+    assert daemon._last_pushed_signature == signature
+    assert daemon._wake.is_set() is False
+
+
+def test_register_endpoint_reports_a_rejected_update_token(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    common = {
+        "kind": "update",
+        "device": "phone",
+        "activity_id": "activity-a",
+        "activity_observed_at": 100.0,
+        "activity_state": "active",
+    }
+    assert _post_json(
+        daemon,
+        "/register",
+        {**common, "token": "token-t2", "token_observed_at": 200.0},
+    )[0] == 200
+
+    status, body = _post_json(
+        daemon,
+        "/register",
+        {**common, "token": "token-t1", "token_observed_at": 150.0},
+    )
+
+    assert status == 409
+    assert body == {"ok": False, "error": "stale_update_token"}
+    assert daemon.tokens.tokens("update") == ["token-t2"]
+
+
 def test_new_push_to_start_token_keeps_current_activity(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 
@@ -2660,6 +2737,75 @@ def test_terminal_reset_without_a_registered_update_reopens_start_recovery(
     restarted_health = restarted._activity_health()
     assert restarted_health["activityClientState"] == "ended"
     assert restarted_health["startPushAttempts"] == 0
+
+
+def test_repeated_unqualified_absence_preserves_exhausted_start_safety(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import (
+        MAX_UNANSWERED_START_PUSHES,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register("push_to_start", "p2s", {"device": "phone"})
+    daemon = LiveActivityDaemon(config, token_store=store)
+    daemon._start_push_attempts = MAX_UNANSWERED_START_PUSHES
+    daemon._last_start_push_at = 100.0
+    daemon._save_activity_recovery_state()
+
+    reports = [
+        {
+            "kind": "reset",
+            "device": "phone",
+            "device_id": "stable-phone",
+            "activity_observed_at": 200.0,
+            "activity_state": "none",
+            "activities_enabled": True,
+        },
+        {
+            "kind": "reset",
+            "device": "phone",
+            "device_id": "stable-phone",
+        },
+    ]
+    for report in reports:
+        status, _ = _post_json(daemon, "/register", report)
+        assert status == 200
+        assert daemon.tokens.tokens("update") == []
+        assert daemon._start_push_attempts == MAX_UNANSWERED_START_PUSHES
+
+    sent = []
+    monkeypatch.setattr(
+        daemon,
+        "_apns_fanout",
+        lambda kind, payload, priority=10: sent.append(kind),
+    )
+    daemon._maybe_push_to_start(
+        {
+            "aggregateMode": "working",
+            "activeCount": 1,
+            "agents": [],
+            "updatedAt": 200.0,
+        },
+        now=200.0,
+    )
+    assert sent == []
+
+    restarted = LiveActivityDaemon(
+        config, token_store=TokenStore(tmp_path / "tok.json")
+    )
+    assert restarted._start_push_attempts == MAX_UNANSWERED_START_PUSHES
 
 
 def test_exhausted_start_burst_nudges_once_and_reopens_after_safety_window(
@@ -3941,9 +4087,14 @@ def test_a_dead_activity_restarts_while_only_finished_rows_remain(tmp_path, monk
 
     daemon._tick()
     assert [kind for kind, _ in sent] == ["push_to_start"]
-    # Putting the island back for work that already finished is a repair, not
-    # news: it must not buzz the phone.
-    assert "alert" not in sent[0][1]["aps"]
+    # Apple requires an alert even for this repair. It carries no sound, and
+    # its copy must describe a restored finished state rather than active work.
+    alert = sent[0][1]["aps"]["alert"]
+    assert alert == {
+        "title": "SidePulse restored on " + config.host_label,
+        "body": "Finished session status restored",
+    }
+    assert "sound" not in alert
 
     # With nothing at all to show, no activity is started.
     sent.clear()

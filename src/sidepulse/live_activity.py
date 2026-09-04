@@ -72,8 +72,8 @@ PUSH_HEARTBEAT_SECONDS = 5 * 60.0
 IDLE_HEARTBEAT_SECONDS = 900.0
 # Push-to-start retry while there is something to show but the phone has
 # not registered an activity: a start push can be lost or throttled, and the
-# system ends activities after eight hours. A start push for active work
-# alerts, so retries back off (2, 4, 8, 16, then every 30 minutes).
+# system ends activities after eight hours. Every start carries Apple's
+# required alert, so retries back off (2, 4, 8, 16, then every 30 minutes).
 PUSH_TO_START_COOLDOWN_SECONDS = 120.0
 PUSH_TO_START_MAX_BACKOFF_SECONDS = 1800.0
 # Every start push creates a NEW activity, and one whose token never reaches
@@ -2664,7 +2664,7 @@ class LiveActivityDaemon:
         return now - min(stamps) if stamps else None
 
     def register_update_token(self, token: str, meta: dict[str, Any]) -> bool:
-        """Elect the current activity token and hydrate it on its next tick.
+        """Accept the current activity token and hydrate a new owner next tick.
 
         A locally created activity begins with fallback content. Reusing the
         previous activity's pushed signature made the daemon believe that
@@ -2749,7 +2749,7 @@ class LiveActivityDaemon:
             self._activity_live = True
             self._start_push_attempts = 0
             self._record_activity_report(meta, "update", persist_for_device=True)
-        return owner_changed
+        return True
 
     def register_push_to_start_token(self, token: str, meta: dict[str, Any]) -> bool:
         """Register future-start authority without touching a live activity."""
@@ -2793,6 +2793,24 @@ class LiveActivityDaemon:
                 self._record_activity_report(
                     meta, "reset", persist_for_device=True
                 )
+            unqualified_absence_without_owner = (
+                not activity_id
+                and not current_entries
+                and (state is None or state in LIVE_ACTIVITY_NONLIVE_STATES)
+            )
+            if unqualified_absence_without_owner:
+                # A bare "none" cannot prove which unanswered start it refers
+                # to. Reconcile nudges can report this repeatedly while iOS is
+                # still processing a newer start; reopening the burst here
+                # bypasses MAX_UNANSWERED_START_PUSHES and stacks activities.
+                self._activity_live = False
+                self._save_activity_recovery_state()
+                self._wake.set()
+                _log(
+                    "client reports no identifiable activity; "
+                    "preserving unanswered start safety"
+                )
+                return True
             if state in LIVE_ACTIVITY_NONLIVE_STATES:
                 if activity_id:
                     self._retired_activity_ids.add(activity_id)
@@ -2909,8 +2927,14 @@ class LiveActivityDaemon:
                 "title": f"Agents active on {self.config.host_label}",
                 "body": f"{content_state['activeCount']} agent(s) running",
             }
-        # Putting the island back for work that already finished is a repair,
-        # not news: it starts silently.
+        else:
+            # Apple requires an alert for every push-to-start request. Keep
+            # the repair quiet by omitting sound, but still provide truthful
+            # text when only finished rows remain.
+            aps["alert"] = {
+                "title": f"SidePulse restored on {self.config.host_label}",
+                "body": "Finished session status restored",
+            }
         payload = {"aps": aps}
         _log("sending push-to-start")
         self._apns_fanout("push_to_start", payload)
@@ -4067,7 +4091,14 @@ class LiveActivityDaemon:
                 }
                 dot_owner_changed = False
                 if kind == "update":
-                    daemon.register_update_token(token, meta)
+                    update_accepted = daemon.register_update_token(token, meta)
+                    if (
+                        not update_accepted
+                        and meta.get("activity_state")
+                        not in LIVE_ACTIVITY_NONLIVE_STATES
+                    ):
+                        self._json(409, {"ok": False, "error": "stale_update_token"})
+                        return
                 elif kind == "push_to_start":
                     daemon.register_push_to_start_token(token, meta)
                 elif kind == "dot_device":

@@ -67,6 +67,12 @@ private struct LiveActivityResetRequest {
     let observedAt: TimeInterval
 }
 
+private struct LiveActivityTokenObservation: Equatable {
+    let token: Data
+    let activityObservedAt: TimeInterval
+    let tokenObservedAt: TimeInterval
+}
+
 /// Bridges ActivityKit tokens to the `sidepulse live-activity` daemon.
 ///
 /// The daemon owns the activity lifecycle: it starts the Live Activity with a
@@ -84,6 +90,7 @@ final class LiveMonitorManager: ObservableObject {
     private var nextLocalActivityStartAt = Date.distantPast
     private var scheduledReconcileTask: Task<Void, Never>?
     private var observedActivityIDs: Set<String> = []
+    private var latestUpdateTokenObservations: [String: LiveActivityTokenObservation] = [:]
     private var knownActivityIDs: [String] = []
     private var selectedActivityID: String?
     private var forceReportingActivityIDs: Set<String> = []
@@ -149,7 +156,7 @@ final class LiveMonitorManager: ObservableObject {
                 await self.reconcileActivities(
                     model: model,
                     source: "ActivityKit update",
-                    preferredActivityID: isNewActivity ? activity.id : nil
+                    preferredActivity: isNewActivity ? activity : nil
                 )
             }
         }
@@ -310,7 +317,7 @@ final class LiveMonitorManager: ObservableObject {
         source: String,
         reportAbsenceToServer: Bool = false,
         pendingResetRequests: [LiveActivityResetRequest] = [],
-        preferredActivityID: String? = nil,
+        preferredActivity: Activity<AgentActivityAttributes>? = nil,
         forceReportCurrent: Bool = false
     ) async {
         let observedAt = Date().timeIntervalSince1970
@@ -331,8 +338,8 @@ final class LiveMonitorManager: ObservableObject {
             }
         }
 
-        let preferred = preferredActivityID.flatMap { preferredID in
-            reusable.first { $0.id == preferredID }
+        let preferred = preferredActivity.flatMap { activity in
+            isReusable(activity.activityState) ? activity : nil
         }
         let selected = preferred ?? selectedActivityID.flatMap { selectedID in
             reusable.first { $0.id == selectedID }
@@ -359,6 +366,7 @@ final class LiveMonitorManager: ObservableObject {
             selectedActivityID = selected.id
             for stale in reusable where stale.id != selected.id {
                 let activity = stale
+                latestUpdateTokenObservations.removeValue(forKey: activity.id)
                 if !intentionallyEndedActivityIDs.contains(activity.id) {
                     intentionallyEndedActivityIDs.append(activity.id)
                     pruneActivityIDHistory(&intentionallyEndedActivityIDs)
@@ -406,25 +414,37 @@ final class LiveMonitorManager: ObservableObject {
         if let forcedCurrentActivity {
             let activityID = forcedCurrentActivity.id
             defer { forceReportingActivityIDs.remove(activityID) }
-            if selectedActivityID == activityID,
-               isReusable(forcedCurrentActivity.activityState),
-               let currentToken = forcedCurrentActivity.pushToken {
-                let forceObservedAt = Date().timeIntervalSince1970
+            var observation = latestUpdateTokenObservations[activityID]
+            if observation == nil, let currentToken = forcedCurrentActivity.pushToken {
+                let observedAt = Date().timeIntervalSince1970
+                let current = LiveActivityTokenObservation(
+                    token: currentToken,
+                    activityObservedAt: observedAt,
+                    tokenObservedAt: observedAt
+                )
+                if rememberUpdateToken(current, for: forcedCurrentActivity) {
+                    observation = current
+                }
+            }
+            if let observation,
+               isCurrentUpdateToken(observation, for: forcedCurrentActivity) {
                 EventLog.append(
                     "Live Activity \(activityID.prefix(8)) force-reporting current token after server repair request"
                 )
                 model.refreshEventLog()
                 _ = await register(
                     kind: "update",
-                    token: currentToken,
+                    token: observation.token,
                     model: model,
                     activityID: activityID,
-                    activityObservedAt: forceObservedAt,
-                    tokenObservedAt: forceObservedAt,
+                    activityObservedAt: observation.activityObservedAt,
+                    tokenObservedAt: observation.tokenObservedAt,
+                    activityState: activityStateName(forcedCurrentActivity.activityState),
                     isStillCurrent: {
-                        self.selectedActivityID == activityID
-                            && self.isReusable(forcedCurrentActivity.activityState)
-                            && forcedCurrentActivity.pushToken == currentToken
+                        self.isCurrentUpdateToken(
+                            observation,
+                            for: forcedCurrentActivity
+                        )
                     },
                     attemptLimit: 1
                 )
@@ -462,6 +482,7 @@ final class LiveMonitorManager: ObservableObject {
             selectedActivityID = nil
         }
         observedActivityIDs.remove(activity.id)
+        latestUpdateTokenObservations.removeValue(forKey: activity.id)
         knownActivityIDs.removeAll { $0 == activity.id }
 
         guard !handledTerminalActivityIDs.contains(activity.id) else {
@@ -556,7 +577,11 @@ final class LiveMonitorManager: ObservableObject {
                 )
                 model.refreshEventLog()
                 observe(activity: activity, model: model)
-                await reconcileActivities(model: model, source: "local start")
+                await reconcileActivities(
+                    model: model,
+                    source: "local start",
+                    preferredActivity: activity
+                )
                 statusMessage = "Live Activity started"
             } catch {
                 localActivityStartInProgress = false
@@ -872,27 +897,50 @@ final class LiveMonitorManager: ObservableObject {
         // may not re-emit it), then follow rotations.
         if let current = activity.pushToken {
             let tokenObservedAt = Date().timeIntervalSince1970
-            Task {
-                await self.register(
-                    kind: "update",
-                    token: current,
-                    model: model,
-                    activityID: activity.id,
-                    activityObservedAt: observedAt,
-                    tokenObservedAt: tokenObservedAt
-                )
+            let observation = LiveActivityTokenObservation(
+                token: current,
+                activityObservedAt: observedAt,
+                tokenObservedAt: tokenObservedAt
+            )
+            if rememberUpdateToken(observation, for: activity) {
+                Task {
+                    await self.register(
+                        kind: "update",
+                        token: current,
+                        model: model,
+                        activityID: activity.id,
+                        activityObservedAt: observedAt,
+                        tokenObservedAt: tokenObservedAt,
+                        activityState: self.activityStateName(activity.activityState),
+                        isStillCurrent: {
+                            self.isCurrentUpdateToken(observation, for: activity)
+                        }
+                    )
+                }
             }
         }
         Task {
             for await tokenData in activity.pushTokenUpdates {
                 let tokenObservedAt = Date().timeIntervalSince1970
+                let observation = LiveActivityTokenObservation(
+                    token: tokenData,
+                    activityObservedAt: observedAt,
+                    tokenObservedAt: tokenObservedAt
+                )
+                guard self.rememberUpdateToken(observation, for: activity) else {
+                    continue
+                }
                 await self.register(
                     kind: "update",
                     token: tokenData,
                     model: model,
                     activityID: activity.id,
                     activityObservedAt: observedAt,
-                    tokenObservedAt: tokenObservedAt
+                    tokenObservedAt: tokenObservedAt,
+                    activityState: self.activityStateName(activity.activityState),
+                    isStillCurrent: {
+                        self.isCurrentUpdateToken(observation, for: activity)
+                    }
                 )
             }
         }
@@ -929,17 +977,15 @@ final class LiveMonitorManager: ObservableObject {
         activityID: String? = nil,
         activityObservedAt: TimeInterval? = nil,
         tokenObservedAt: TimeInterval? = nil,
+        activityState: String? = nil,
         serverURL: String? = nil,
         isStillCurrent: (() -> Bool)? = nil,
         updatesStatus: Bool = true,
         attemptLimit: Int = 5
     ) async -> Bool {
         if kind == "update" {
-            guard #available(iOS 17.2, *),
-                  isCurrentReusableUpdateActivity(activityID, token: token)
-            else { return false }
-        }
-        if let isStillCurrent, !isStillCurrent() { return false }
+            guard isStillCurrent?() == true else { return false }
+        } else if let isStillCurrent, !isStillCurrent() { return false }
         let tokenHex = token.map { String(format: "%02x", $0) }.joined()
         let targetServerURL = serverURL ?? model.liveMonitorServerURL
         guard let url = URL(string: targetServerURL)?.appendingPathComponent("register") else {
@@ -959,7 +1005,7 @@ final class LiveMonitorManager: ObservableObject {
         if let tokenObservedAt { payload["token_observed_at"] = tokenObservedAt }
         if #available(iOS 17.2, *) {
             addActivityContext(
-                activityState: currentActivityStateName(activityID: activityID),
+                activityState: activityState ?? currentActivityStateName(activityID: activityID),
                 to: &payload
             )
         }
@@ -976,14 +1022,12 @@ final class LiveMonitorManager: ObservableObject {
         var delay: UInt64 = 2
         let attempts = max(1, attemptLimit)
         for attempt in 1...attempts {
-            if kind == "update" {
-                guard #available(iOS 17.2, *),
-                      isCurrentReusableUpdateActivity(activityID, token: token)
-                else { return false }
-            }
             if let isStillCurrent, !isStillCurrent() { return false }
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (_, response) = try await performRegistrationRequest(
+                    request,
+                    preserveBackgroundExecution: kind == "update"
+                )
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (200..<300).contains(code) {
                     if updatesStatus {
@@ -1014,21 +1058,57 @@ final class LiveMonitorManager: ObservableObject {
         return false
     }
 
+    private func performRegistrationRequest(
+        _ request: URLRequest,
+        preserveBackgroundExecution: Bool
+    ) async throws -> (Data, URLResponse) {
+        #if canImport(UIKit)
+        guard preserveBackgroundExecution else {
+            return try await URLSession.shared.data(for: request)
+        }
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        backgroundTask = UIApplication.shared.beginBackgroundTask(
+            withName: "Register Live Activity update token"
+        ) {
+            guard backgroundTask != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        defer {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+                backgroundTask = .invalid
+            }
+        }
+        #endif
+        return try await URLSession.shared.data(for: request)
+    }
+
     @available(iOS 17.2, *)
     private func reusableActivities() -> [Activity<AgentActivityAttributes>] {
         Activity<AgentActivityAttributes>.activities.filter { isReusable($0.activityState) }
     }
 
     @available(iOS 17.2, *)
-    private func isCurrentReusableUpdateActivity(
-        _ activityID: String?,
-        token: Data
+    private func rememberUpdateToken(
+        _ observation: LiveActivityTokenObservation,
+        for activity: Activity<AgentActivityAttributes>
     ) -> Bool {
-        guard let activityID,
-              selectedActivityID == activityID,
-              let activity = Activity<AgentActivityAttributes>.activities.first(where: { $0.id == activityID })
+        guard selectedActivityID == activity.id,
+              isReusable(activity.activityState)
         else { return false }
-        return isReusable(activity.activityState) && activity.pushToken == token
+        latestUpdateTokenObservations[activity.id] = observation
+        return true
+    }
+
+    @available(iOS 17.2, *)
+    private func isCurrentUpdateToken(
+        _ observation: LiveActivityTokenObservation,
+        for activity: Activity<AgentActivityAttributes>
+    ) -> Bool {
+        selectedActivityID == activity.id
+            && isReusable(activity.activityState)
+            && latestUpdateTokenObservations[activity.id] == observation
     }
 
     @available(iOS 17.2, *)
