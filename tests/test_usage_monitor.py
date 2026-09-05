@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
+import urllib.error
+from pathlib import Path
+
+import pytest
+
 from sidepulse.usage_monitor import (
     UsageMonitor,
+    consume_codex_reset,
     normalise_claude,
     normalise_usage,
     window_label,
@@ -236,6 +244,96 @@ def test_monitor_keeps_fresh_claude_reading_when_only_the_cli_fails() -> None:
     assert snapshot["error"] == "codexbar exited 1"
     assert [item["id"] for item in snapshot["providers"]] == ["claude"]
     assert snapshot["providers"][0]["plan"] == "max"
+
+
+class _FakeResponse(io.BytesIO):
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _codex_auth(tmp_path: Path) -> Path:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"tokens": {"access_token": "tok-123", "account_id": "acct-9"}}))
+    return auth
+
+
+def test_consume_codex_reset_posts_the_idempotency_key_with_the_cli_login(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def urlopen(request, timeout):  # noqa: ANN001
+        seen["url"] = request.full_url
+        seen["headers"] = {k.lower(): v for k, v in request.header_items()}
+        seen["body"] = json.loads(request.data)
+        return _FakeResponse(json.dumps({"code": "reset", "windows_reset": 1}).encode())
+
+    monkeypatch.setattr("sidepulse.usage_monitor.urllib.request.urlopen", urlopen)
+    result = consume_codex_reset("req-1", auth_path=_codex_auth(tmp_path))
+
+    assert seen["url"] == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+    assert seen["body"] == {"redeem_request_id": "req-1"}
+    assert seen["headers"]["authorization"] == "Bearer tok-123"
+    assert seen["headers"]["chatgpt-account-id"] == "acct-9"
+    assert result == {
+        "ok": True,
+        "code": "reset",
+        "windowsReset": 1,
+        "message": "Codex usage limits reset",
+    }
+
+
+def test_consume_codex_reset_reports_non_reset_outcomes_without_failing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "sidepulse.usage_monitor.urllib.request.urlopen",
+        lambda request, timeout: _FakeResponse(b'{"code": "nothing_to_reset"}'),
+    )
+    result = consume_codex_reset("req-2", auth_path=_codex_auth(tmp_path))
+    assert result["ok"] is False
+    assert result["code"] == "nothing_to_reset"
+    assert result["message"] == "Codex usage does not need a reset right now"
+
+
+def test_consume_codex_reset_explains_missing_or_expired_login(tmp_path: Path, monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match="not logged in"):
+        consume_codex_reset("req-3", auth_path=tmp_path / "missing.json")
+
+    def unauthorized(request, timeout):  # noqa: ANN001
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("sidepulse.usage_monitor.urllib.request.urlopen", unauthorized)
+    with pytest.raises(RuntimeError, match="login expired"):
+        consume_codex_reset("req-3", auth_path=_codex_auth(tmp_path))
+
+
+def test_monitor_request_refresh_wakes_the_loop_early() -> None:
+    import threading
+
+    calls: list[str] = []
+    refreshed = threading.Event()
+
+    def runner(binary: str, provider: str) -> list[dict[str, object]]:
+        calls.append(provider)
+        refreshed.set()
+        return CODEXBAR_PAYLOAD
+
+    monitor = UsageMonitor(
+        refresh_seconds=3600, runner=runner, claude_fetcher=_failing_claude, binary="/fake/codexbar"
+    )
+    monitor.start()
+    try:
+        assert refreshed.wait(2.0)
+        refreshed.clear()
+        monitor.request_refresh()
+        assert refreshed.wait(2.0)
+        assert len(calls) == 2
+    finally:
+        monitor.stop()
 
 
 def test_monitor_without_cli_reports_it_instead_of_running(monkeypatch) -> None:

@@ -3,17 +3,16 @@ import SwiftUI
 /// "Usage" section of the Mac Agents screen: one row per provider with a
 /// meter per rate-limit window and a live countdown to its reset.
 struct UsageSection: View {
-    let snapshot: UsageSnapshot?
-    let failure: String?
+    @ObservedObject var usage: UsageClient
 
     var body: some View {
         Section {
-            if let snapshot, !snapshot.providers.isEmpty {
+            if let snapshot = usage.snapshot, !snapshot.providers.isEmpty {
                 ForEach(snapshot.providers) { provider in
-                    UsageProviderRow(provider: provider)
+                    UsageProviderRow(provider: provider, usage: usage)
                 }
             } else {
-                Text(snapshot?.error ?? failure ?? "Waiting for data…")
+                Text(usage.snapshot?.error ?? usage.failure ?? "Waiting for data…")
                     .foregroundStyle(.secondary)
             }
         } header: {
@@ -25,10 +24,10 @@ struct UsageSection: View {
 
     @ViewBuilder
     private var footer: some View {
-        if let message = snapshot?.error ?? failure, snapshot?.providers.isEmpty == false {
+        if let message = usage.snapshot?.error ?? usage.failure, usage.snapshot?.providers.isEmpty == false {
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
-        } else if let updatedAt = snapshot?.updatedAt {
+        } else if let updatedAt = usage.snapshot?.updatedAt {
             Text("Updated ") + Text(Date(timeIntervalSince1970: updatedAt), style: .relative) + Text(" ago")
         }
     }
@@ -36,6 +35,8 @@ struct UsageSection: View {
 
 private struct UsageProviderRow: View {
     let provider: UsageSnapshot.Provider
+    @ObservedObject var usage: UsageClient
+    @State private var confirmingReset = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -68,32 +69,65 @@ private struct UsageProviderRow: View {
             }
         }
         .padding(.vertical, 4)
+        .confirmationDialog(
+            "Use one free Codex reset now?",
+            isPresented: $confirmingReset,
+            titleVisibility: .visible
+        ) {
+            Button("Apply reset") {
+                Task { await usage.applyCodexReset() }
+            }
+        } message: {
+            Text("This clears your current Codex usage limits and consumes one of your \(provider.resetCredits ?? 0) free resets.")
+        }
     }
 
     /// Only Codex reports reset credits; a zero count still tells the user
     /// there is nothing to fall back on when the weekly meter runs out.
     @ViewBuilder
     private func resetCredits(_ credits: Int) -> some View {
-        if credits > 0 {
-            Label {
-                (Text("\(credits) free reset\(credits == 1 ? "" : "s") available")
-                    + expiry(provider.resetCreditsExpireAt))
-                    .lineLimit(1)
-            } icon: {
-                Image(systemName: "arrow.counterclockwise.circle.fill")
-            }
-            .font(.caption)
-            .foregroundStyle(.green)
-        } else {
-            Label("No free resets", systemImage: "arrow.counterclockwise.circle")
+        HStack(spacing: 8) {
+            if credits > 0 {
+                Label {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(credits) free reset\(credits == 1 ? "" : "s") available")
+                        if let expiresAt = provider.resetCreditsExpireAt {
+                            Text("First expires \(Date(timeIntervalSince1970: expiresAt), format: .dateTime.day().month())")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "arrow.counterclockwise.circle.fill")
+                }
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.green)
+                Spacer(minLength: 4)
+                Button {
+                    confirmingReset = true
+                } label: {
+                    if usage.isApplyingReset {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Text("Apply")
+                            .font(.caption.bold())
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(usage.isApplyingReset)
+            } else {
+                Label("No free resets", systemImage: "arrow.counterclockwise.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
-    }
-
-    private func expiry(_ expiresAt: Double?) -> Text {
-        guard let expiresAt else { return Text("") }
-        return Text(" · first expires in ") + Text(Date(timeIntervalSince1970: expiresAt), style: .relative)
+        if let outcome = usage.resetOutcome {
+            Label(outcome.message, systemImage: outcome.ok ? "checkmark.circle" : "exclamationmark.circle")
+                .font(.caption)
+                .foregroundStyle(outcome.ok ? .green : .orange)
+        }
     }
 }
 

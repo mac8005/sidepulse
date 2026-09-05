@@ -44,7 +44,7 @@ from .paseo_monitor import paseo_agent_link, paseo_server_id
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
 from .providers import default_state_dir
-from .usage_monitor import UsageMonitor
+from .usage_monitor import UsageMonitor, consume_codex_reset
 from .title_integrity import (
     humanize_title_text,
     is_readable_session_title,
@@ -3996,6 +3996,26 @@ class LiveActivityDaemon:
                         200,
                         {"ok": True, "updated": updated, **daemon._dot_health()},
                     )
+                    return
+                if self.path == "/usage/codex-reset":
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, OSError):
+                        self._json(400, {"error": "invalid body"})
+                        return
+                    request_id = body.get("requestId") if isinstance(body, dict) else None
+                    if not isinstance(request_id, str) or not (0 < len(request_id) <= 64):
+                        self._json(400, {"error": "requestId is required"})
+                        return
+                    try:
+                        result = consume_codex_reset(request_id)
+                    except Exception as exc:  # login, network or unexpected payload
+                        self._json(502, {"ok": False, "message": str(exc)})
+                        return
+                    if result["ok"]:
+                        daemon.usage.request_refresh()
+                    self._json(200, result)
                     return
                 if self.path == "/seen":
                     try:

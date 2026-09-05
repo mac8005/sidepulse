@@ -44,7 +44,7 @@ struct AgentsLiveView: View {
                 }
             }
 
-            UsageSection(snapshot: usage.snapshot, failure: usage.failure)
+            UsageSection(usage: usage)
 
             Section {
                 DisclosureGroup("Dot settings", isExpanded: $dotSettingsExpanded) {

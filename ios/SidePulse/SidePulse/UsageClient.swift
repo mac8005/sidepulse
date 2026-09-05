@@ -38,12 +38,30 @@ struct UsageSnapshot: Codable, Equatable {
 /// up its newest cached reading.
 @MainActor
 final class UsageClient: ObservableObject {
+    struct ResetOutcome: Equatable {
+        var ok: Bool
+        var message: String
+    }
+
+    private struct ResetReply: Decodable {
+        var ok: Bool
+        var message: String
+    }
+
     @Published var snapshot: UsageSnapshot?
     @Published var failure: String?
+    @Published var resetOutcome: ResetOutcome?
+    @Published var isApplyingReset = false
 
     private let pollInterval: TimeInterval = 60
+    private var baseURL = ""
+    /// Idempotency key for the daemon's `/usage/codex-reset`. It is kept
+    /// across retries of a request that never got an answer, so a flaky
+    /// connection cannot burn two credits for one tap.
+    private var pendingResetRequestID: String?
 
     func poll(baseURL: String) async {
+        self.baseURL = baseURL
         while !Task.isCancelled {
             await fetch(baseURL: baseURL)
             try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
@@ -68,6 +86,44 @@ final class UsageClient: ObservableObject {
             if Task.isCancelled { return }
             // Keep the last reading on screen; only the banner changes.
             failure = error.localizedDescription
+        }
+    }
+
+    /// Redeems one free Codex rate-limit reset through the daemon, then
+    /// re-reads usage once the daemon has had time to refresh it.
+    func applyCodexReset() async {
+        guard !isApplyingReset else { return }
+        guard let url = URL(string: baseURL)?.appendingPathComponent("usage/codex-reset") else {
+            resetOutcome = ResetOutcome(ok: false, message: "Invalid server URL")
+            return
+        }
+        let requestID = pendingResetRequestID ?? UUID().uuidString
+        pendingResetRequestID = requestID
+        isApplyingReset = true
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["requestId": requestID])
+        request.timeoutInterval = 30
+        let reply: ResetReply
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            reply = try JSONDecoder().decode(ResetReply.self, from: data)
+        } catch {
+            isApplyingReset = false
+            resetOutcome = ResetOutcome(ok: false, message: error.localizedDescription)
+            return
+        }
+        // Any decoded reply is definitive; only a transport failure keeps the key.
+        pendingResetRequestID = nil
+        isApplyingReset = false
+        resetOutcome = ResetOutcome(ok: reply.ok, message: reply.message)
+        if reply.ok {
+            // The daemon re-reads Codex right after a reset; the CLI it uses
+            // needs a few seconds.
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            await fetch(baseURL: baseURL)
         }
     }
 }

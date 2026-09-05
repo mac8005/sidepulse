@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +33,15 @@ DEFAULT_REFRESH_SECONDS = 300.0
 CLI_TIMEOUT_SECONDS = 90.0
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# The endpoint `codex` itself calls when a free reset is redeemed from /limits.
+CODEX_RESET_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+CODEX_RESET_MESSAGES = {
+    "reset": "Codex usage limits reset",
+    "nothing_to_reset": "Codex usage does not need a reset right now",
+    "no_credit": "No free Codex resets available",
+    "already_redeemed": "This reset was already redeemed",
+}
 _CODEXBAR_FALLBACKS = (
     Path("/opt/homebrew/bin/codexbar"),
     Path("/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"),
@@ -104,6 +114,51 @@ def fetch_claude_usage() -> dict[str, Any]:
     if not isinstance(usage, dict):
         raise RuntimeError("Unexpected Claude usage response")
     return {"usage": usage, "plan": oauth.get("subscriptionType")}
+
+
+def consume_codex_reset(request_id: str, auth_path: Path = CODEX_AUTH_PATH) -> dict[str, Any]:
+    """Redeem one free Codex rate-limit reset with the Codex CLI's login.
+
+    ``request_id`` is the idempotency key the backend uses, so a client that
+    retries the same request cannot burn a second credit.
+    """
+    try:
+        tokens = json.loads(auth_path.read_text()).get("tokens") or {}
+    except (OSError, ValueError, AttributeError):
+        raise RuntimeError("Codex is not logged in on the Mac") from None
+    token = tokens.get("access_token") if isinstance(tokens, dict) else None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Codex is not logged in on the Mac")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "codex-cli",
+    }
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    request = urllib.request.Request(
+        CODEX_RESET_URL,
+        data=json.dumps({"redeem_request_id": request_id}).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError("Codex login expired on the Mac; run codex once to refresh it") from None
+        raise RuntimeError(f"Codex reset failed with HTTP {exc.code}") from None
+    code = payload.get("code") if isinstance(payload, dict) else None
+    if not isinstance(code, str):
+        raise RuntimeError("Unexpected Codex reset response")
+    return {
+        "ok": code == "reset",
+        "code": code,
+        "windowsReset": payload.get("windows_reset", 0),
+        "message": CODEX_RESET_MESSAGES.get(code, code),
+    }
 
 
 def window_label(window_minutes: Any) -> str:
@@ -276,6 +331,7 @@ class UsageMonitor:
         self._lock = threading.Lock()
         self._snapshot: dict[str, Any] | None = None
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     @property
@@ -340,12 +396,18 @@ class UsageMonitor:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
         thread = self._thread
         self._thread = None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
 
+    def request_refresh(self) -> None:
+        """Refresh ahead of schedule, e.g. right after a reset credit was used."""
+        self._wake.set()
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             self.refresh()
-            self._stop.wait(self.refresh_seconds)
+            self._wake.wait(self.refresh_seconds)
+            self._wake.clear()
