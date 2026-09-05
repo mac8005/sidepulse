@@ -12,6 +12,7 @@ struct AgentsLiveView: View {
 
     @ObservedObject var model: AppModel
     @ObservedObject private var stream = DotStatusMirror.shared.stream
+    @StateObject private var usage = UsageClient()
     /// Completions tapped this app session, keyed by the row's finish time
     /// so the dimming applies only to the completion the user actually
     /// opened — a session that finishes another turn re-arms as unread.
@@ -43,6 +44,8 @@ struct AgentsLiveView: View {
                 }
             }
 
+            UsageSection(snapshot: usage.snapshot, failure: usage.failure)
+
             Section {
                 DisclosureGroup("Dot settings", isExpanded: $dotSettingsExpanded) {
                     DotBehaviorControls(model: model)
@@ -54,6 +57,9 @@ struct AgentsLiveView: View {
             // Normally already running from the scene going active; harmless
             // to repeat.
             DotStatusMirror.shared.start(model: model)
+        }
+        .task(id: model.liveMonitorServerURL) {
+            await usage.poll(baseURL: model.liveMonitorServerURL)
         }
     }
 

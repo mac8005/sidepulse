@@ -44,6 +44,7 @@ from .paseo_monitor import paseo_agent_link, paseo_server_id
 from .providers import SUMMARY_EVENT_NAME
 from .models import MODE_PRIORITY, AgentStatus
 from .providers import default_state_dir
+from .usage_monitor import UsageMonitor
 from .title_integrity import (
     humanize_title_text,
     is_readable_session_title,
@@ -1736,6 +1737,7 @@ class LiveActivityDaemon:
         self._task_sources: dict[str, tuple[str, str, float]] = {}
         self._settled_statuses: dict[str, AgentStatus] = {}
         self._published_summaries: dict[str, str] = {}
+        self.usage = UsageMonitor()
 
     # -- snapshot loop -------------------------------------------------
 
@@ -1743,6 +1745,7 @@ class LiveActivityDaemon:
         server = self._build_server()
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
+        self.usage.start()
         # Hooks broadcast every event to the local unix socket as they log
         # it; listening there turns the poll loop event-driven, so a state
         # change reaches the phone in about a second instead of up to a
@@ -1776,6 +1779,7 @@ class LiveActivityDaemon:
                 self._wake.wait(max(0.2, self.config.poll_seconds - elapsed))
                 self._wake.clear()
         finally:
+            self.usage.stop()
             if event_server is not None:
                 event_server.stop()
             server.shutdown()
@@ -3845,6 +3849,8 @@ class LiveActivityDaemon:
                     self._json(200, latest or {})
                 elif parsed.path == "/stream":
                     self._stream(parsed.query)
+                elif parsed.path == "/usage":
+                    self._json(200, daemon.usage.snapshot())
                 else:
                     self._json(404, {"error": "not found"})
 
