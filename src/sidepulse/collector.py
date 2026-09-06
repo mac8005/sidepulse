@@ -2104,6 +2104,12 @@ def truncate_text(text: str, max_len: int) -> str:
     return f"{trimmed}..."
 
 
+# Substrings (lower-cased) that mark a tool's text output as failed. The hook
+# writer names any it drops while compacting long output, so the detector
+# still sees them.
+TOOL_FAILURE_MARKERS = ("exit code: 1", "traceback")
+
+
 def _tool_response_looks_failed(response: object) -> bool:
     if isinstance(response, dict):
         if response.get("interrupted") is True:
@@ -2116,7 +2122,7 @@ def _tool_response_looks_failed(response: object) -> bool:
 
     if isinstance(response, str):
         text = response.lower()
-        return "exit code: 1" in text or "traceback" in text
+        return any(marker in text for marker in TOOL_FAILURE_MARKERS)
 
     return False
 

@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from .battery import BatterySnapshot
 from .lid_sleep import MacSleepSnapshot
+from .log_trim import trim_log_if_needed
 from .models import AgentStatus, HookEvent
 from .providers import default_state_dir
 
@@ -61,6 +62,7 @@ def append_status_audit_record(
                 )
                 + "\n"
             )
+        trim_log_if_needed(target)
     except OSError:
         pass
 
