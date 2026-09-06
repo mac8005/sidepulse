@@ -4396,3 +4396,44 @@ def test_an_ended_report_racing_a_start_push_keeps_the_attempt_count(tmp_path, m
     assert daemon._start_push_attempts == 1
     assert daemon._activity_live is False
     assert daemon._activity_health()["activityClientState"] == "ended"
+
+
+def test_usage_alerts_reach_every_phone_as_plain_notifications(tmp_path, monkeypatch):
+    from sidepulse.live_activity import (
+        USAGE_ALERT_THREAD_ID,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register("device", "phone-token", {"device": "phone"})
+    store.register("update", "activity-token", {"device": "phone", "activity_id": "a"})
+    daemon = LiveActivityDaemon(config, token_store=store)
+    sent = []
+    monkeypatch.setattr(
+        daemon.apns, "send", lambda token, payload, **options: (sent.append((token, payload, options)) or (200, ""))
+    )
+
+    # The usage monitor is wired to this sender and remembers armed windows here.
+    assert daemon.usage._on_alert.__func__ is LiveActivityDaemon._push_usage_alert
+    assert daemon.usage._alert_state_path == tmp_path / "usage_alerts.json"
+
+    daemon._push_usage_alert({"kind": "usage_warning", "title": "Codex usage at 92%", "body": "Weekly at 92%"})
+
+    assert [token for token, _, _ in sent] == ["phone-token"]  # not the Live Activity token
+    _, payload, options = sent[0]
+    assert payload["aps"]["alert"] == {"title": "Codex usage at 92%", "body": "Weekly at 92%"}
+    assert payload["aps"]["sound"] == "default"
+    assert payload["aps"]["thread-id"] == USAGE_ALERT_THREAD_ID
+    assert options["push_type"] == "alert"
+    assert options["topic"] == config.bundle_id
+    assert options["expiration"] > time.time() + 3000

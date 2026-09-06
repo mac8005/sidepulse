@@ -164,6 +164,10 @@ ALERT_SOUNDS = {
     "blocked_error": "AgentBlocked.caf",
 }
 ALERT_COOLDOWN_SECONDS = 90.0
+# Usage warnings and resets are plain notifications: they matter with no
+# activity live, and one sent while the phone is offline should still land.
+USAGE_ALERT_EXPIRY_SECONDS = 3600.0
+USAGE_ALERT_THREAD_ID = "sidepulse-usage"
 FINISHED_ALERT_DEFER_SECONDS = 20.0
 
 
@@ -1740,7 +1744,10 @@ class LiveActivityDaemon:
         self._task_sources: dict[str, tuple[str, str, float]] = {}
         self._settled_statuses: dict[str, AgentStatus] = {}
         self._published_summaries: dict[str, str] = {}
-        self.usage = UsageMonitor()
+        self.usage = UsageMonitor(
+            on_alert=self._push_usage_alert,
+            alert_state_path=default_state_dir() / "usage_alerts.json",
+        )
 
     # -- snapshot loop -------------------------------------------------
 
@@ -3103,6 +3110,22 @@ class LiveActivityDaemon:
             self._activity_live = True
             self._last_pushed_signature = _structure_signature(content_state)
             self._last_pushed_state = content_state
+
+    def _push_usage_alert(self, alert: dict[str, str]) -> None:
+        _log(f"usage alert -> {alert['title']}")
+        self._apns_fanout(
+            "device",
+            {
+                "aps": {
+                    "alert": {"title": alert["title"], "body": alert["body"]},
+                    "sound": "default",
+                    "thread-id": USAGE_ALERT_THREAD_ID,
+                }
+            },
+            push_type="alert",
+            topic=self.config.bundle_id,
+            expiration=int(time.time() + USAGE_ALERT_EXPIRY_SECONDS),
+        )
 
     def _update_push_priority(
         self, *, alert: dict[str, str] | None, important: bool

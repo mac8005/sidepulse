@@ -14,6 +14,7 @@ from sidepulse.usage_monitor import (
     normalise_claude,
     normalise_codex,
     normalise_usage,
+    usage_alerts,
     window_label,
 )
 
@@ -543,3 +544,111 @@ def test_monitor_keeps_fresh_direct_readings_when_only_the_cli_hangs() -> None:
     assert snapshot["error"] == "Command codexbar timed out after 90.0 seconds"
     assert [item["id"] for item in snapshot["providers"]] == ["codex"]
     assert snapshot["providers"][0]["resetCredits"] == 3
+
+
+def _codex_after_reset() -> dict[str, object]:
+    return {
+        "usage": {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1788770515},
+                "secondary_window": {"used_percent": 0, "limit_window_seconds": 604800, "reset_at": 1789357315},
+            },
+            "rate_limit_reset_credits": {"available_count": 3},
+        },
+        "credits": None,
+    }
+
+
+def test_usage_alerts_warn_once_per_window_and_announce_its_reset() -> None:
+    now = 1788752515.0 - 76084  # the payload's reset_after_seconds before its reset_at
+    exhausted = [normalise_codex(CODEX_OAUTH_RESULT, now=now)]
+
+    state, alerts = usage_alerts({}, exhausted, now)
+    assert alerts == [
+        {
+            "kind": "usage_warning",
+            "title": "Codex limit reached",
+            "body": "Weekly limit reached, resets in 21 h 8 min. 3 free resets available",
+        }
+    ]
+    assert state == {"codex:Weekly": {"usedPercent": 100, "resetsAt": 1788752515.0}}
+
+    # The same window again, five minutes later: nothing new to say.
+    state, alerts = usage_alerts(state, exhausted, now + 300)
+    assert alerts == []
+
+    # After the reset the weekly window is back at 0% with a later reset time
+    # (and the 5-hour window reappears, unarmed): one reset alert, disarmed.
+    state, alerts = usage_alerts(state, [normalise_codex(_codex_after_reset(), now=now + 80_000)], now + 80_000)
+    assert alerts == [
+        {"kind": "usage_reset", "title": "Codex usage reset", "body": "Weekly window reset. You can continue."}
+    ]
+    assert state == {}
+
+
+def test_usage_alerts_warn_before_the_limit_and_stay_quiet_otherwise() -> None:
+    def claude(five_hour: int, resets_at: str) -> dict[str, object]:
+        return normalise_claude(
+            {
+                "plan": "max",
+                "usage": {
+                    "five_hour": {"utilization": five_hour, "resets_at": resets_at},
+                    "seven_day": {"utilization": 6.0, "resets_at": "2026-09-10T23:00:00+00:00"},
+                },
+            },
+            now=0.0,
+        )
+
+    now = 1788620400.0  # 2026-09-05T15:00:00Z
+    state, alerts = usage_alerts({}, [claude(91, "2026-09-05T17:00:00+00:00")], now)
+    assert alerts == [
+        {"kind": "usage_warning", "title": "Claude usage at 91%", "body": "5-hour at 91%, resets in 2 h"}
+    ]
+    assert list(state) == ["claude:5-hour"]
+
+    # Creeping up inside the same window is not news; neither is a reading
+    # that wobbles just under the line.
+    assert usage_alerts(state, [claude(97, "2026-09-05T17:00:00+00:00")], now + 600)[1] == []
+    hovering, alerts = usage_alerts(state, [claude(88, "2026-09-05T17:00:00+00:00")], now + 900)
+    assert alerts == [] and hovering == state
+
+    # A reset of a window that never reached the line says nothing.
+    assert usage_alerts({}, [claude(0, "2026-09-05T22:00:00+00:00")], now + 7300) == ({}, [])
+
+    # The armed window resetting does.
+    state, alerts = usage_alerts(state, [claude(0, "2026-09-05T22:00:00+00:00")], now + 7300)
+    assert [a["title"] for a in alerts] == ["Claude usage reset"]
+    assert state == {}
+
+
+def test_monitor_delivers_usage_alerts_once_across_restarts(tmp_path: Path) -> None:
+    readings = [CODEX_OAUTH_RESULT]
+    alerts: list[dict[str, str]] = []
+    state_path = tmp_path / "usage_alerts.json"
+
+    def monitor(clock_value: float) -> UsageMonitor:
+        return UsageMonitor(
+            runner=lambda binary, provider: (_ for _ in ()).throw(RuntimeError("codexbar hung")),
+            claude_fetcher=_failing_claude,
+            codex_fetcher=lambda: readings[-1],
+            binary="/fake/codexbar",
+            clock=lambda: clock_value,
+            on_alert=alerts.append,
+            alert_state_path=state_path,
+        )
+
+    first = monitor(1788676431.0)
+    assert first.refresh()["error"] == "codexbar hung"  # the CLI hanging must not mute the direct reading
+    assert [a["kind"] for a in alerts] == ["usage_warning"]
+    assert state_path.exists()
+
+    # A redeploy restarts the daemon: the armed window is remembered.
+    second = monitor(1788676731.0)
+    second.refresh()
+    assert len(alerts) == 1
+
+    readings.append(_codex_after_reset())
+    second.refresh()
+    assert [a["kind"] for a in alerts] == ["usage_warning", "usage_reset"]
+    assert json.loads(state_path.read_text()) == {}

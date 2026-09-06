@@ -33,6 +33,9 @@ from sidepulse.models import parse_datetime, provider_label
 
 USAGE_PROVIDERS = ("claude", "codex")
 DEFAULT_REFRESH_SECONDS = 300.0
+# Warn once when a window reaches this much, and again when that window
+# resets, so the phone hears "you can continue" without anyone polling.
+USAGE_ALERT_PERCENT = 90
 CLI_TIMEOUT_SECONDS = 90.0
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -416,6 +419,99 @@ def normalise_usage(
     }
 
 
+def _relative_time(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+    days, hours = divmod(hours, 24)
+    return f"{days} d {hours} h" if hours else f"{days} d"
+
+
+def _reset_phrase(window: dict[str, Any], now: float) -> str:
+    resets_at = window.get("resetsAt")
+    if not _is_number(resets_at) or resets_at <= now:
+        return ""
+    return f"resets in {_relative_time(resets_at - now)}"
+
+
+def _warning_alert(
+    provider: dict[str, Any], windows: list[dict[str, Any]], now: float
+) -> dict[str, str]:
+    label = provider.get("label") or provider["id"]
+    parts = []
+    for window in windows:
+        used = window["usedPercent"]
+        head = f"{window['label']} limit reached" if used >= 100 else f"{window['label']} at {used}%"
+        when = _reset_phrase(window, now)
+        parts.append(f"{head}, {when}" if when else head)
+    body = "; ".join(parts)
+    credits = provider.get("resetCredits")
+    if isinstance(credits, int) and credits > 0:
+        body += f". {credits} free reset{'' if credits == 1 else 's'} available"
+    worst = max(window["usedPercent"] for window in windows)
+    title = f"{label} limit reached" if worst >= 100 else f"{label} usage at {worst}%"
+    return {"kind": "usage_warning", "title": title, "body": body}
+
+
+def _reset_alert(provider: dict[str, Any], windows: list[dict[str, Any]]) -> dict[str, str]:
+    label = provider.get("label") or provider["id"]
+    names = " and ".join(window["label"] for window in windows)
+    plural = "s" if len(windows) > 1 else ""
+    return {
+        "kind": "usage_reset",
+        "title": f"{label} usage reset",
+        "body": f"{names} window{plural} reset. You can continue.",
+    }
+
+
+def usage_alerts(
+    state: dict[str, dict[str, Any]], providers: list[dict[str, Any]], now: float
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    """Diff fresh provider readings against the armed-window state.
+
+    ``state`` maps ``"<provider>:<window label>"`` to the reading that armed
+    it. A window arms with one warning when it reaches USAGE_ALERT_PERCENT
+    (once per window instance, told apart by reset time) and disarms with a
+    reset alert once its reset time moves on or its usage collapses. Windows
+    absent from a reading keep their state: Codex drops the 5-hour window
+    while the weekly cap is hit and brings it back at 0% after the reset.
+    """
+    new_state = dict(state)
+    alerts: list[dict[str, str]] = []
+    for provider in providers:
+        warned: list[dict[str, Any]] = []
+        reset: list[dict[str, Any]] = []
+        for window in provider.get("windows") or []:
+            label = window.get("label")
+            used = window.get("usedPercent")
+            resets_at = window.get("resetsAt")
+            if not isinstance(label, str) or not _is_number(used):
+                continue
+            key = f"{provider['id']}:{label}"
+            armed = state.get(key)
+            if used >= USAGE_ALERT_PERCENT:
+                if armed is None or (resets_at is not None and armed.get("resetsAt") != resets_at):
+                    warned.append(window)
+                new_state[key] = {"usedPercent": used, "resetsAt": resets_at}
+            elif armed is not None:
+                moved_on = (
+                    _is_number(resets_at)
+                    and _is_number(armed.get("resetsAt"))
+                    and resets_at > armed["resetsAt"]
+                )
+                if moved_on or used < USAGE_ALERT_PERCENT // 2:
+                    reset.append(window)
+                    new_state.pop(key, None)
+        if warned:
+            alerts.append(_warning_alert(provider, warned, now))
+        if reset:
+            alerts.append(_reset_alert(provider, reset))
+    return new_state, alerts
+
+
 class UsageMonitor:
     """Keeps the newest usage snapshot fresh on a background thread."""
 
@@ -427,6 +523,8 @@ class UsageMonitor:
         codex_fetcher: Callable[[], dict[str, Any]] = fetch_codex_usage,
         binary: str | None = None,
         clock: Callable[[], float] = time.time,
+        on_alert: Callable[[dict[str, str]], None] | None = None,
+        alert_state_path: Path | None = None,
     ) -> None:
         self.refresh_seconds = refresh_seconds
         self._runner = runner
@@ -434,6 +532,9 @@ class UsageMonitor:
         self._codex_fetcher = codex_fetcher
         self._binary = binary
         self._clock = clock
+        self._on_alert = on_alert
+        self._alert_state_path = alert_state_path
+        self._alert_state: dict[str, dict[str, Any]] | None = None
         self._lock = threading.Lock()
         self._snapshot: dict[str, Any] | None = None
         self._stop = threading.Event()
@@ -470,6 +571,9 @@ class UsageMonitor:
                 direct[provider_id] = None
         missing = [provider_id for provider_id in USAGE_PROVIDERS if direct[provider_id] is None]
         binary = self.binary
+        # Only readings taken just now may raise alerts; a failed CLI run
+        # carries the previous providers along, and those were judged already.
+        fresh = [item for item in direct.values() if item is not None]
         if not missing:
             snapshot = normalise_usage([], now=now, **direct)
         elif not binary:
@@ -479,11 +583,50 @@ class UsageMonitor:
             try:
                 payload = self._runner(binary, missing[0] if len(missing) == 1 else "both")
                 snapshot = normalise_usage(payload, now=now, **direct)
+                fresh = list(snapshot["providers"])
             except Exception as exc:  # subprocess, JSON or timeout failures
                 snapshot = self._failed(str(exc) or exc.__class__.__name__, direct)
         with self._lock:
             self._snapshot = snapshot
+        self._notify_usage_alerts(fresh, now)
         return dict(snapshot)
+
+    def _notify_usage_alerts(self, providers: list[dict[str, Any]], now: float) -> None:
+        if self._on_alert is None:
+            return
+        if self._alert_state is None:
+            self._alert_state = self._load_alert_state()
+        new_state, alerts = usage_alerts(self._alert_state, providers, now)
+        if new_state != self._alert_state:
+            self._alert_state = new_state
+            self._save_alert_state()
+        for alert in alerts:
+            try:
+                self._on_alert(alert)
+            except Exception:  # a push failure must not stop the refresh loop
+                pass
+
+    def _load_alert_state(self) -> dict[str, dict[str, Any]]:
+        # Armed windows survive daemon restarts so a deploy cannot repeat a
+        # warning or miss the reset that follows it.
+        if self._alert_state_path is None:
+            return {}
+        try:
+            raw = json.loads(self._alert_state_path.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
+
+    def _save_alert_state(self) -> None:
+        if self._alert_state_path is None:
+            return
+        try:
+            self._alert_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._alert_state_path.write_text(json.dumps(self._alert_state))
+        except OSError:
+            pass
 
     def _failed(
         self, message: str, direct: dict[str, dict[str, Any] | None]
