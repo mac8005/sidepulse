@@ -36,6 +36,10 @@ DEFAULT_REFRESH_SECONDS = 300.0
 # Warn once when a window reaches this much, and again when that window
 # resets, so the phone hears "you can continue" without anyone polling.
 USAGE_ALERT_PERCENT = 90
+# A window is a new instance only when its reset time moves forward by more
+# than this. Codex recomputes reset_at on every call and it drifts by a few
+# seconds, which must not count (2026-09-06: a dozen repeated warnings).
+USAGE_RESET_TOLERANCE_SECONDS = 600.0
 CLI_TIMEOUT_SECONDS = 90.0
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -474,8 +478,9 @@ def usage_alerts(
 
     ``state`` maps ``"<provider>:<window label>"`` to the reading that armed
     it. A window arms with one warning when it reaches USAGE_ALERT_PERCENT
-    (once per window instance, told apart by reset time) and disarms with a
-    reset alert once its reset time moves on or its usage collapses. Windows
+    (once per window instance, told apart by a reset time that moved forward
+    by more than USAGE_RESET_TOLERANCE_SECONDS) and disarms with a reset
+    alert once its reset time moves on or its usage collapses. Windows
     absent from a reading keep their state: Codex drops the 5-hour window
     while the weekly cap is hit and brings it back at 0% after the reset.
     """
@@ -492,16 +497,17 @@ def usage_alerts(
                 continue
             key = f"{provider['id']}:{label}"
             armed = state.get(key)
+            moved_on = (
+                armed is not None
+                and _is_number(resets_at)
+                and _is_number(armed.get("resetsAt"))
+                and resets_at > armed["resetsAt"] + USAGE_RESET_TOLERANCE_SECONDS
+            )
             if used >= USAGE_ALERT_PERCENT:
-                if armed is None or (resets_at is not None and armed.get("resetsAt") != resets_at):
+                if armed is None or moved_on:
                     warned.append(window)
-                new_state[key] = {"usedPercent": used, "resetsAt": resets_at}
+                    new_state[key] = {"usedPercent": used, "resetsAt": resets_at}
             elif armed is not None:
-                moved_on = (
-                    _is_number(resets_at)
-                    and _is_number(armed.get("resetsAt"))
-                    and resets_at > armed["resetsAt"]
-                )
                 if moved_on or used < USAGE_ALERT_PERCENT // 2:
                     reset.append(window)
                     new_state.pop(key, None)

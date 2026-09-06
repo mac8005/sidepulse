@@ -574,9 +574,16 @@ def test_usage_alerts_warn_once_per_window_and_announce_its_reset() -> None:
     ]
     assert state == {"codex:Weekly": {"usedPercent": 100, "resetsAt": 1788752515.0}}
 
-    # The same window again, five minutes later: nothing new to say.
+    # The same window again, five minutes later: nothing new to say. Codex
+    # recomputes reset_at per call and it drifts by seconds; that is the same
+    # window too, and the armed record keeps its original reading.
     state, alerts = usage_alerts(state, exhausted, now + 300)
     assert alerts == []
+    drifted = json.loads(json.dumps(exhausted))
+    drifted[0]["windows"][0]["resetsAt"] += 2
+    state, alerts = usage_alerts(state, drifted, now + 600)
+    assert alerts == []
+    assert state == {"codex:Weekly": {"usedPercent": 100, "resetsAt": 1788752515.0}}
 
     # After the reset the weekly window is back at 0% with a later reset time
     # (and the 5-hour window reappears, unarmed): one reset alert, disarmed.
