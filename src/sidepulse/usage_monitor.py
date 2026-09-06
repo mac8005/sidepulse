@@ -5,13 +5,16 @@ Claude is read straight from the OAuth usage endpoint Claude Code's own
 Keychain. That is the only source that reports the per-model weekly caps
 (e.g. the Fable window) next to the 5-hour and weekly meters.
 
-Codex comes from the CodexBar CLI (github.com/steipete/CodexBar), which knows
-how to read the Codex credentials and the free rate-limit reset credits. When
-the Claude endpoint is unavailable the CLI covers Claude too, minus the
-per-model windows.
+Codex is read the same way from the ChatGPT backend endpoints the ``codex``
+CLI uses for ``/limits``, with the login it keeps in ``~/.codex/auth.json``;
+that also covers the free rate-limit reset credits. The CodexBar CLI
+(github.com/steipete/CodexBar) is the fallback for whichever provider the
+direct read cannot serve (missing login, expired token, network), minus
+Claude's per-model windows.
 
-The CLI takes 10-20 seconds per run, so refreshes only ever happen on their
-own thread; request handlers read the cached snapshot (``GET /usage``).
+The CLI takes 10-20 seconds per run (and hangs outright behind a Gatekeeper
+prompt after a Homebrew upgrade), so refreshes only ever happen on their own
+thread; request handlers read the cached snapshot (``GET /usage``).
 """
 
 from __future__ import annotations
@@ -34,6 +37,9 @@ CLI_TIMEOUT_SECONDS = 90.0
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# The endpoints `codex` itself reads for /limits.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 # The endpoint `codex` itself calls when a free reset is redeemed from /limits.
 CODEX_RESET_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 CODEX_RESET_MESSAGES = {
@@ -116,12 +122,8 @@ def fetch_claude_usage() -> dict[str, Any]:
     return {"usage": usage, "plan": oauth.get("subscriptionType")}
 
 
-def consume_codex_reset(request_id: str, auth_path: Path = CODEX_AUTH_PATH) -> dict[str, Any]:
-    """Redeem one free Codex rate-limit reset with the Codex CLI's login.
-
-    ``request_id`` is the idempotency key the backend uses, so a client that
-    retries the same request cannot burn a second credit.
-    """
+def _codex_headers(auth_path: Path) -> dict[str, str]:
+    """Bearer headers from the Codex CLI's login file."""
     try:
         tokens = json.loads(auth_path.read_text()).get("tokens") or {}
     except (OSError, ValueError, AttributeError):
@@ -129,14 +131,45 @@ def consume_codex_reset(request_id: str, auth_path: Path = CODEX_AUTH_PATH) -> d
     token = tokens.get("access_token") if isinstance(tokens, dict) else None
     if not isinstance(token, str) or not token:
         raise RuntimeError("Codex is not logged in on the Mac")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "User-Agent": "codex-cli",
-    }
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": "codex-cli"}
     account_id = tokens.get("account_id")
     if isinstance(account_id, str) and account_id:
         headers["ChatGPT-Account-Id"] = account_id
+    return headers
+
+
+def _get_json(url: str, headers: dict[str, str]) -> Any:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+def fetch_codex_usage(auth_path: Path = CODEX_AUTH_PATH) -> dict[str, Any]:
+    """Return ``{"usage": <wham/usage payload>, "credits": <reset credits payload>}``.
+
+    ``codex`` refreshes its login file whenever it runs; an expired token
+    surfaces as an HTTP error and the caller falls back to CodexBar. The
+    credits list only adds expiry dates (the count comes with the usage
+    payload), so losing it is not an error.
+    """
+    headers = _codex_headers(auth_path)
+    usage = _get_json(CODEX_USAGE_URL, headers)
+    if not isinstance(usage, dict):
+        raise RuntimeError("Unexpected Codex usage response")
+    try:
+        credits = _get_json(CODEX_RESET_CREDITS_URL, headers)
+    except (OSError, ValueError):
+        credits = None
+    return {"usage": usage, "credits": credits if isinstance(credits, dict) else None}
+
+
+def consume_codex_reset(request_id: str, auth_path: Path = CODEX_AUTH_PATH) -> dict[str, Any]:
+    """Redeem one free Codex rate-limit reset with the Codex CLI's login.
+
+    ``request_id`` is the idempotency key the backend uses, so a client that
+    retries the same request cannot burn a second credit.
+    """
+    headers = {**_codex_headers(auth_path), "Content-Type": "application/json"}
     request = urllib.request.Request(
         CODEX_RESET_URL,
         data=json.dumps({"redeem_request_id": request_id}).encode(),
@@ -180,8 +213,12 @@ def _epoch(value: Any) -> float | None:
     return parse_datetime(value).timestamp()
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _percent(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _is_number(value):
         return None
     return max(0, min(100, int(round(value))))
 
@@ -232,6 +269,58 @@ def normalise_claude(result: dict[str, Any], now: float) -> dict[str, Any]:
         "windows": windows,
         "resetCredits": None,
         "resetCreditsExpireAt": None,
+        "updatedAt": now,
+        "error": None if windows else "No usage windows reported",
+    }
+
+
+def normalise_codex(result: dict[str, Any], now: float) -> dict[str, Any]:
+    """Build the Codex provider entry from the ``wham/usage`` payload.
+
+    Codex reports the 5-hour window as ``primary`` and the weekly one as
+    ``secondary``, but once the weekly cap is hit only the weekly window is
+    left, as ``primary``; each window is labelled by its own length.
+    """
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    limits = usage.get("rate_limit") if isinstance(usage.get("rate_limit"), dict) else {}
+    windows: list[dict[str, Any]] = []
+    for slot in ("primary", "secondary"):
+        window = limits.get(f"{slot}_window")
+        used = _percent(window.get("used_percent")) if isinstance(window, dict) else None
+        if used is None:
+            continue
+        seconds = window.get("limit_window_seconds")
+        minutes = int(seconds // 60) if _is_number(seconds) else None
+        reset_at = window.get("reset_at")
+        windows.append(
+            {
+                "id": slot,
+                "label": window_label(minutes),
+                "usedPercent": used,
+                "resetsAt": float(reset_at) if _is_number(reset_at) else None,
+                "windowMinutes": minutes,
+            }
+        )
+    reset_credits = usage.get("rate_limit_reset_credits")
+    available = reset_credits.get("available_count") if isinstance(reset_credits, dict) else None
+    credits = result.get("credits") if isinstance(result.get("credits"), dict) else {}
+    expires: list[float] = []
+    for credit in credits.get("credits") or []:
+        if not isinstance(credit, dict) or credit.get("status") != "available":
+            continue
+        expiry = _epoch(credit.get("expires_at"))
+        if expiry is not None:
+            expires.append(expiry)
+    plan = usage.get("plan_type")
+    account = usage.get("email")
+    return {
+        "id": "codex",
+        "label": provider_label("codex"),
+        "account": account if isinstance(account, str) else None,
+        "plan": plan if isinstance(plan, str) else None,
+        "windows": windows,
+        "resetCredits": int(available) if _is_number(available) else None,
+        "resetCreditsExpireAt": min(expires) if expires else None,
         "updatedAt": now,
         "error": None if windows else "No usage windows reported",
     }
@@ -290,23 +379,38 @@ def normalise_provider(entry: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
-def normalise_usage(
-    payload: list[dict[str, Any]],
-    now: float | None = None,
-    claude: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    providers = [item for item in map(normalise_provider, payload) if item is not None]
-    if claude is not None:
-        providers = [item for item in providers if item["id"] != "claude"] + [claude]
+def _merge_direct(
+    providers: list[dict[str, Any]], direct: dict[str, dict[str, Any] | None]
+) -> list[dict[str, Any]]:
+    """Entries read straight from a provider replace the CLI's for that provider."""
+    for provider_id, item in direct.items():
+        if item is not None:
+            providers = [entry for entry in providers if entry["id"] != provider_id] + [item]
     providers.sort(
         key=lambda item: (
             USAGE_PROVIDERS.index(item["id"]) if item["id"] in USAGE_PROVIDERS else len(USAGE_PROVIDERS),
             item["id"],
         )
     )
+    return providers
+
+
+def normalise_usage(
+    payload: list[dict[str, Any]],
+    now: float | None = None,
+    claude: dict[str, Any] | None = None,
+    codex: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    direct = {"claude": claude, "codex": codex}
+    providers = _merge_direct(
+        [item for item in map(normalise_provider, payload) if item is not None], direct
+    )
+    sources = [f"{provider_id}-oauth" for provider_id, item in direct.items() if item is not None]
+    if payload or not sources:
+        sources.append("codexbar")
     return {
         "updatedAt": now if now is not None else time.time(),
-        "source": "claude-oauth+codexbar" if claude is not None else "codexbar",
+        "source": "+".join(sources),
         "providers": providers,
         "error": None,
     }
@@ -320,12 +424,14 @@ class UsageMonitor:
         refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
         runner: Callable[[str, str], list[dict[str, Any]]] = run_codexbar,
         claude_fetcher: Callable[[], dict[str, Any]] = fetch_claude_usage,
+        codex_fetcher: Callable[[], dict[str, Any]] = fetch_codex_usage,
         binary: str | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.refresh_seconds = refresh_seconds
         self._runner = runner
         self._claude_fetcher = claude_fetcher
+        self._codex_fetcher = codex_fetcher
         self._binary = binary
         self._clock = clock
         self._lock = threading.Lock()
@@ -353,33 +459,40 @@ class UsageMonitor:
 
     def refresh(self) -> dict[str, Any]:
         now = self._clock()
-        try:
-            claude = normalise_claude(self._claude_fetcher(), now)
-        except Exception:  # Keychain, network or auth failure: CodexBar covers Claude
-            claude = None
+        direct: dict[str, dict[str, Any] | None] = {}
+        for provider_id, fetcher, normalise in (
+            ("claude", self._claude_fetcher, normalise_claude),
+            ("codex", self._codex_fetcher, normalise_codex),
+        ):
+            try:
+                direct[provider_id] = normalise(fetcher(), now)
+            except Exception:  # login, network or auth failure: CodexBar covers it
+                direct[provider_id] = None
+        missing = [provider_id for provider_id in USAGE_PROVIDERS if direct[provider_id] is None]
         binary = self.binary
-        if not binary:
-            snapshot = normalise_usage([], now=now, claude=claude)
+        if not missing:
+            snapshot = normalise_usage([], now=now, **direct)
+        elif not binary:
+            snapshot = normalise_usage([], now=now, **direct)
             snapshot["error"] = "codexbar CLI not installed"
         else:
             try:
-                payload = self._runner(binary, "codex" if claude is not None else "both")
-                snapshot = normalise_usage(payload, now=now, claude=claude)
+                payload = self._runner(binary, missing[0] if len(missing) == 1 else "both")
+                snapshot = normalise_usage(payload, now=now, **direct)
             except Exception as exc:  # subprocess, JSON or timeout failures
-                snapshot = self._failed(str(exc) or exc.__class__.__name__, claude)
+                snapshot = self._failed(str(exc) or exc.__class__.__name__, direct)
         with self._lock:
             self._snapshot = snapshot
         return dict(snapshot)
 
-    def _failed(self, message: str, claude: dict[str, Any] | None) -> dict[str, Any]:
+    def _failed(
+        self, message: str, direct: dict[str, dict[str, Any] | None]
+    ) -> dict[str, Any]:
         # Keep the last good providers so the view degrades to stale numbers
         # with an error banner instead of going blank.
         with self._lock:
             previous = self._snapshot or {}
-        providers = list(previous.get("providers") or [])
-        if claude is not None:
-            providers = [item for item in providers if item["id"] != "claude"] + [claude]
-            providers.sort(key=lambda item: item["id"] != "claude")
+        providers = _merge_direct(list(previous.get("providers") or []), direct)
         return {
             "updatedAt": previous.get("updatedAt"),
             "source": previous.get("source", "codexbar"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timezone
 
 from sidepulse.live_activity import (
@@ -2408,19 +2409,16 @@ def test_push_to_start_retries_until_activity_registers(tmp_path, monkeypatch):
     assert sent == ["push_to_start"]  # inside the cooldown
 
     daemon._maybe_push_to_start(state, 1000.0 + PUSH_TO_START_COOLDOWN_SECONDS + 1)
-    assert sent == ["push_to_start", "push_to_start"]  # keeps retrying
+    assert sent == ["push_to_start", "push_to_start"]  # one retry
 
-    # Backoff doubles: the third attempt waits twice as long.
+    # Unanswered starts stop after the cap: an accepted start on a reachable
+    # phone almost always created the activity, so more would only stack
+    # cards the daemon can never end.
     t2 = 1000.0 + PUSH_TO_START_COOLDOWN_SECONDS + 1
-    daemon._maybe_push_to_start(state, t2 + PUSH_TO_START_COOLDOWN_SECONDS + 1)
-    assert len(sent) == 2
     daemon._maybe_push_to_start(state, t2 + 2 * PUSH_TO_START_COOLDOWN_SECONDS + 1)
-    assert len(sent) == 3
-
-    # Unanswered starts stop after the cap: more would only stack activities
-    # the daemon can never end.
+    assert len(sent) == 2
     daemon._maybe_push_to_start(state, t2 + 10 * PUSH_TO_START_MAX_BACKOFF_SECONDS)
-    assert len(sent) == 3
+    assert len(sent) == 2
 
 
 def test_activitykit_metadata_is_stored_and_terminal_update_is_not_live(
@@ -4358,3 +4356,43 @@ def test_remembered_finished_rows_backfill_deep_links(tmp_path, monkeypatch):
     monkeypatch.setattr(la, "_DEEP_LINKS", Stub())
     daemon._remember_finished([], 2.0)
     assert daemon._recent_finished["claude:session:abc"]["deepLink"] == "https://claude.ai/code/session_01X"
+
+
+def test_an_ended_report_racing_a_start_push_keeps_the_attempt_count(tmp_path, monkeypatch):
+    """A dead update token restarts the activity; the phone's "ended" report
+    for that old activity then lands right after the start push. Treating it
+    as news reopened the burst: four starts in seven minutes, three stacked
+    cards on the Lock Screen (2026-09-06)."""
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8",
+        apns_key_id="X",
+        apns_team_id="Y",
+        port=0,
+        summaries_enabled=False,
+    )
+    store = TokenStore(tmp_path / "tok.json")
+    store.register("push_to_start", "p2s", {"device": "phone"})
+    daemon = LiveActivityDaemon(config, token_store=store)
+    daemon._start_push_attempts = 1
+    daemon._last_start_push_at = time.time()
+    daemon._save_activity_recovery_state()
+
+    status, _ = _post_json(
+        daemon,
+        "/register",
+        {
+            "kind": "reset",
+            "device": "phone",
+            "activity_id": "activity-old",
+            "activity_state": "ended",
+            "activities_enabled": True,
+            "frequent_pushes_enabled": True,
+        },
+    )
+    assert status == 200
+    assert daemon._start_push_attempts == 1
+    assert daemon._activity_live is False
+    assert daemon._activity_health()["activityClientState"] == "ended"

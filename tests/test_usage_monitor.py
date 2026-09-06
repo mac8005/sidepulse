@@ -10,7 +10,9 @@ import pytest
 from sidepulse.usage_monitor import (
     UsageMonitor,
     consume_codex_reset,
+    fetch_codex_usage,
     normalise_claude,
+    normalise_codex,
     normalise_usage,
     window_label,
 )
@@ -88,6 +90,35 @@ CLAUDE_OAUTH_RESULT = {
                 "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
             },
         ],
+    },
+}
+
+# Trimmed from `GET https://chatgpt.com/backend-api/wham/usage` with the weekly
+# cap hit: only the weekly window is left, reported as `primary`, and the free
+# reset count rides along. The credits list is the second endpoint's payload.
+CODEX_OAUTH_RESULT = {
+    "usage": {
+        "email": "massimo@cerqui.ch",
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": False,
+            "limit_reached": True,
+            "primary_window": {
+                "used_percent": 100,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 76084,
+                "reset_at": 1788752515,
+            },
+            "secondary_window": None,
+        },
+        "rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 3},
+    },
+    "credits": {
+        "credits": [
+            {"status": "available", "expires_at": "2026-10-04T02:00:35.680803Z"},
+            {"status": "available", "expires_at": "2026-09-20T23:58:15.701148Z"},
+        ],
+        "available_count": 3,
     },
 }
 
@@ -170,6 +201,10 @@ def _failing_claude() -> dict[str, object]:
     raise RuntimeError("Claude Code credentials not found in the Keychain")
 
 
+def _failing_codex() -> dict[str, object]:
+    raise RuntimeError("Codex is not logged in on the Mac")
+
+
 def test_monitor_asks_codexbar_only_for_codex_when_claude_oauth_works() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -179,7 +214,7 @@ def test_monitor_asks_codexbar_only_for_codex_when_claude_oauth_works() -> None:
 
     monitor = UsageMonitor(
         runner=runner,
-        claude_fetcher=lambda: CLAUDE_OAUTH_RESULT,
+        claude_fetcher=lambda: CLAUDE_OAUTH_RESULT, codex_fetcher=_failing_codex,
         binary="/fake/codexbar",
         clock=lambda: 42.0,
     )
@@ -199,7 +234,7 @@ def test_monitor_falls_back_to_codexbar_for_claude_when_oauth_fails() -> None:
         calls.append(provider)
         return CODEXBAR_PAYLOAD
 
-    monitor = UsageMonitor(runner=runner, claude_fetcher=_failing_claude, binary="/fake/codexbar")
+    monitor = UsageMonitor(runner=runner, claude_fetcher=_failing_claude, codex_fetcher=_failing_codex, binary="/fake/codexbar")
     snapshot = monitor.refresh()
 
     assert calls == ["both"]
@@ -217,7 +252,7 @@ def test_monitor_refresh_keeps_last_reading_when_the_cli_fails() -> None:
         return CODEXBAR_PAYLOAD
 
     monitor = UsageMonitor(
-        runner=runner, claude_fetcher=_failing_claude, binary="/fake/codexbar", clock=lambda: 42.0
+        runner=runner, claude_fetcher=_failing_claude, codex_fetcher=_failing_codex, binary="/fake/codexbar", clock=lambda: 42.0
     )
     assert monitor.snapshot()["error"] == "Waiting for the first usage reading"
 
@@ -237,7 +272,7 @@ def test_monitor_keeps_fresh_claude_reading_when_only_the_cli_fails() -> None:
         raise RuntimeError("codexbar exited 1")
 
     monitor = UsageMonitor(
-        runner=runner, claude_fetcher=lambda: CLAUDE_OAUTH_RESULT, binary="/fake/codexbar"
+        runner=runner, claude_fetcher=lambda: CLAUDE_OAUTH_RESULT, codex_fetcher=_failing_codex, binary="/fake/codexbar"
     )
     snapshot = monitor.refresh()
 
@@ -323,7 +358,7 @@ def test_monitor_request_refresh_wakes_the_loop_early() -> None:
         return CODEXBAR_PAYLOAD
 
     monitor = UsageMonitor(
-        refresh_seconds=3600, runner=runner, claude_fetcher=_failing_claude, binary="/fake/codexbar"
+        refresh_seconds=3600, runner=runner, claude_fetcher=_failing_claude, codex_fetcher=_failing_codex, binary="/fake/codexbar"
     )
     monitor.start()
     try:
@@ -341,7 +376,7 @@ def test_monitor_without_cli_reports_it_instead_of_running(monkeypatch) -> None:
     calls: list[str] = []
     monitor = UsageMonitor(
         runner=lambda binary, provider: calls.append(binary) or [],
-        claude_fetcher=_failing_claude,
+        claude_fetcher=_failing_claude, codex_fetcher=_failing_codex,
     )
 
     assert monitor.snapshot()["error"] == "codexbar CLI not installed"
@@ -349,3 +384,162 @@ def test_monitor_without_cli_reports_it_instead_of_running(monkeypatch) -> None:
     assert snapshot["providers"] == []
     assert snapshot["error"] == "codexbar CLI not installed"
     assert calls == []
+
+
+def test_codex_oauth_labels_windows_by_length_and_carries_reset_credits() -> None:
+    codex = normalise_codex(CODEX_OAUTH_RESULT, now=7.0)
+
+    assert codex["id"] == "codex"
+    assert codex["plan"] == "pro"
+    assert codex["account"] == "massimo@cerqui.ch"
+    assert codex["windows"] == [
+        {
+            "id": "primary",
+            "label": "Weekly",
+            "usedPercent": 100,
+            "resetsAt": 1788752515.0,
+            "windowMinutes": 10080,
+        }
+    ]
+    assert codex["resetCredits"] == 3
+    assert codex["resetCreditsExpireAt"] == pytest.approx(1789948695.701148)  # 2026-09-20
+    assert codex["updatedAt"] == 7.0
+    assert codex["error"] is None
+
+    healthy = normalise_codex(
+        {
+            "usage": {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 12, "limit_window_seconds": 18000, "reset_at": 1},
+                    "secondary_window": {"used_percent": 40, "limit_window_seconds": 604800, "reset_at": 2},
+                }
+            }
+        },
+        now=0.0,
+    )
+    assert [w["label"] for w in healthy["windows"]] == ["5-hour", "Weekly"]
+    assert healthy["resetCredits"] is None
+    assert normalise_codex({"usage": {}}, now=0.0)["error"] == "No usage windows reported"
+
+
+def test_fetch_codex_usage_reads_both_endpoints_with_the_cli_login(tmp_path: Path, monkeypatch) -> None:
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def urlopen(request, timeout):
+        seen.append((request.full_url, {k.lower(): v for k, v in request.header_items()}))
+        if request.full_url.endswith("/wham/usage"):
+            return _FakeResponse(json.dumps(CODEX_OAUTH_RESULT["usage"]).encode())
+        return _FakeResponse(json.dumps(CODEX_OAUTH_RESULT["credits"]).encode())
+
+    monkeypatch.setattr("sidepulse.usage_monitor.urllib.request.urlopen", urlopen)
+    result = fetch_codex_usage(auth_path=_codex_auth(tmp_path))
+
+    assert [url for url, _ in seen] == [
+        "https://chatgpt.com/backend-api/wham/usage",
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+    ]
+    assert seen[0][1]["authorization"] == "Bearer tok-123"
+    assert seen[0][1]["chatgpt-account-id"] == "acct-9"
+    assert result == CODEX_OAUTH_RESULT
+
+
+def test_fetch_codex_usage_survives_a_missing_credits_list(tmp_path: Path, monkeypatch) -> None:
+    def urlopen(request, timeout):
+        if request.full_url.endswith("/wham/usage"):
+            return _FakeResponse(json.dumps(CODEX_OAUTH_RESULT["usage"]).encode())
+        raise urllib.error.HTTPError(request.full_url, 500, "boom", {}, None)
+
+    monkeypatch.setattr("sidepulse.usage_monitor.urllib.request.urlopen", urlopen)
+    result = fetch_codex_usage(auth_path=_codex_auth(tmp_path))
+
+    assert result["credits"] is None
+    codex = normalise_codex(result, now=0.0)
+    assert codex["resetCredits"] == 3
+    assert codex["resetCreditsExpireAt"] is None
+
+
+def test_fetch_codex_usage_fails_without_a_login_or_with_an_expired_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    with pytest.raises(RuntimeError, match="not logged in"):
+        fetch_codex_usage(auth_path=tmp_path / "missing.json")
+
+    def unauthorized(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("sidepulse.usage_monitor.urllib.request.urlopen", unauthorized)
+    with pytest.raises(urllib.error.HTTPError):
+        fetch_codex_usage(auth_path=_codex_auth(tmp_path))
+
+
+def test_monitor_skips_the_cli_when_both_direct_reads_work() -> None:
+    calls: list[str] = []
+    monitor = UsageMonitor(
+        runner=lambda binary, provider: calls.append(provider) or [],
+        claude_fetcher=lambda: CLAUDE_OAUTH_RESULT,
+        codex_fetcher=lambda: CODEX_OAUTH_RESULT,
+        binary="/fake/codexbar",
+        clock=lambda: 42.0,
+    )
+    snapshot = monitor.refresh()
+
+    assert calls == []
+    assert snapshot["source"] == "claude-oauth+codex-oauth"
+    assert snapshot["error"] is None
+    assert snapshot["updatedAt"] == 42.0
+    claude, codex = snapshot["providers"]
+    assert claude["plan"] == "max"
+    assert codex["resetCredits"] == 3
+    assert codex["windows"][0]["usedPercent"] == 100
+
+
+def test_monitor_asks_codexbar_only_for_claude_when_codex_oauth_works() -> None:
+    calls: list[str] = []
+
+    def runner(binary: str, provider: str) -> list[dict[str, object]]:
+        calls.append(provider)
+        return [entry for entry in CODEXBAR_PAYLOAD if entry["provider"] == provider]
+
+    monitor = UsageMonitor(
+        runner=runner,
+        claude_fetcher=_failing_claude,
+        codex_fetcher=lambda: CODEX_OAUTH_RESULT,
+        binary="/fake/codexbar",
+    )
+    snapshot = monitor.refresh()
+
+    assert calls == ["claude"]
+    assert snapshot["source"] == "codex-oauth+codexbar"
+    claude, codex = snapshot["providers"]
+    assert [w["id"] for w in claude["windows"]] == ["primary", "secondary"]
+    assert codex["resetCredits"] == 3
+
+
+def test_monitor_needs_no_cli_when_both_direct_reads_work(monkeypatch) -> None:
+    monkeypatch.setattr("sidepulse.usage_monitor.codexbar_binary", lambda: None)
+    monitor = UsageMonitor(
+        runner=lambda binary, provider: [],
+        claude_fetcher=lambda: CLAUDE_OAUTH_RESULT,
+        codex_fetcher=lambda: CODEX_OAUTH_RESULT,
+    )
+    snapshot = monitor.refresh()
+
+    assert snapshot["error"] is None
+    assert [item["id"] for item in snapshot["providers"]] == ["claude", "codex"]
+
+
+def test_monitor_keeps_fresh_direct_readings_when_only_the_cli_hangs() -> None:
+    def runner(binary: str, provider: str) -> list[dict[str, object]]:
+        raise RuntimeError("Command codexbar timed out after 90.0 seconds")
+
+    monitor = UsageMonitor(
+        runner=runner,
+        claude_fetcher=_failing_claude,
+        codex_fetcher=lambda: CODEX_OAUTH_RESULT,
+        binary="/fake/codexbar",
+    )
+    snapshot = monitor.refresh()
+
+    assert snapshot["error"] == "Command codexbar timed out after 90.0 seconds"
+    assert [item["id"] for item in snapshot["providers"]] == ["codex"]
+    assert snapshot["providers"][0]["resetCredits"] == 3

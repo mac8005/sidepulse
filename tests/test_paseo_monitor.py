@@ -59,13 +59,17 @@ def test_server_id_is_read_from_paseo_home(tmp_path: Path) -> None:
 
 def test_snapshot_status_maps_to_sidepulse_modes() -> None:
     cases = [
-        (agent(status="initializing"), "UserPromptSubmit", "working"),
+        # Reloading a persisted agent passes through "initializing" too; only
+        # "running" is a prompt being worked on.
+        (agent(status="initializing"), "SessionStart", "idle_ready"),
         (agent(status="running"), "UserPromptSubmit", "working"),
         (agent(status="idle"), "SessionStart", "idle_ready"),
         (agent(status="idle", attentionReason="finished"), "Stop", "completed"),
         (agent(status="error", lastError="boom"), "PostToolUseFailure", "blocked_error"),
-        (agent(status="closed"), "SessionEnd", "completed"),
-        (agent(archivedAt="2026-09-04T08:00:00Z"), "SessionEnd", "completed"),
+        # "closed" is an unloaded agent (every one after a daemon restart),
+        # not a finished session: the row goes quiet instead of "Done".
+        (agent(status="closed"), "SessionEnd", "idle_ready"),
+        (agent(archivedAt="2026-09-04T08:00:00Z"), "SessionEnd", "idle_ready"),
         (
             agent(
                 status="running",
@@ -158,16 +162,59 @@ def test_monitor_emits_only_on_signature_change() -> None:
     assert emitted[2][1]["sidepulse_deep_link"] == f"paseo://h/{SERVER_ID}/agent/{AGENT_ID}"
 
 
+def _directory(monitor: PaseoMonitor, request_id: str, *agents: dict[str, object]) -> None:
+    payload = {"requestId": request_id, "entries": [{"agent": snapshot} for snapshot in agents]}
+    monitor.handle_message(
+        json.dumps({"type": "session", "message": {"type": "fetch_agents_response", "payload": payload}})
+    )
+
+
+def _update(monitor: PaseoMonitor, snapshot: dict[str, object]) -> None:
+    monitor.handle_message(
+        json.dumps({"type": "session", "message": {"type": "agent_update", "payload": {"kind": "upsert", "agent": snapshot}}})
+    )
+
+
 def test_monitor_closes_agents_missing_from_a_fresh_directory() -> None:
     emitted: list[dict[str, object]] = []
     monitor = PaseoMonitor(server_id=SERVER_ID, emit=lambda _p, l: emitted.append(l), log=lambda _: None)
-    directory = {"type": "fetch_agents_response", "payload": {"requestId": "r", "entries": [{"agent": agent()}]}}
-    monitor.handle_message(json.dumps({"type": "session", "message": directory}))
-    monitor.handle_message(
-        json.dumps({"type": "session", "message": {"type": "fetch_agents_response", "payload": {"requestId": "r2", "entries": []}}})
-    )
-    assert [l["hook_event_name"] for l in emitted] == ["SessionStart", "SessionEnd"]
+    _directory(monitor, "r", agent(status="running"))
+    _directory(monitor, "r2")
+    assert [l["hook_event_name"] for l in emitted] == ["UserPromptSubmit", "SessionEnd"]
+    assert emitted[1]["sidepulse_mode"] == "idle_ready"
     assert monitor.signatures == {}
+    assert monitor.announced == set()
+
+
+def test_monitor_never_announces_idle_history() -> None:
+    """A (re)connect lists every agent Paseo remembers, and a Paseo restart
+    lists them all as closed, then reloads them as initializing → idle when
+    they are opened. None of that is news: announcing it dated last week's
+    sessions as freshly finished, three at a time, and pushed the Claude
+    rows out of the app's finished list."""
+    emitted: list[dict[str, object]] = []
+    monitor = PaseoMonitor(server_id=SERVER_ID, emit=lambda _p, l: emitted.append(l), log=lambda _: None)
+    old = agent(id="old-agent", title="Hi")
+
+    _directory(monitor, "r1", old, agent(status="running"))
+    _directory(monitor, "r2", {**old, "status": "closed"}, {**agent(status="running"), "status": "closed"})
+    _update(monitor, {**old, "status": "initializing"})
+    _update(monitor, old)
+    _directory(monitor, "r3")
+
+    assert [(l["session_id"], l["hook_event_name"], l["sidepulse_mode"]) for l in emitted] == [
+        (AGENT_ID, "UserPromptSubmit", "working"),
+        (AGENT_ID, "SessionEnd", "idle_ready"),
+    ]
+    assert monitor.signatures == {}
+
+    # Once it does something, the same agent is announced like any other.
+    _update(monitor, {**old, "status": "running"})
+    _update(monitor, {**old, "attentionReason": "finished"})
+    assert [(l["hook_event_name"], l["sidepulse_mode"]) for l in emitted[2:]] == [
+        ("UserPromptSubmit", "working"),
+        ("Stop", "completed"),
+    ]
 
 
 def test_monitor_learns_server_id_from_handshake() -> None:

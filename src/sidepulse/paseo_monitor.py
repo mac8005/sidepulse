@@ -78,7 +78,10 @@ def hook_line_for_agent(agent: dict[str, Any], server_id: str | None) -> dict[st
     tool_name: str | None = None
 
     if status == "closed" or archived:
-        event_name, mode = "SessionEnd", "completed"
+        # Paseo lists every persisted agent as "closed" until it is opened
+        # again (all of them after a daemon restart), so a close is not a
+        # completion: the row just goes quiet.
+        event_name, mode = "SessionEnd", "idle_ready"
     elif pending or attention == "permission":
         event_name, mode = "PermissionRequest", "waiting_for_input"
         if pending:
@@ -87,11 +90,13 @@ def hook_line_for_agent(agent: dict[str, Any], server_id: str | None) -> dict[st
     elif status == "error":
         event_name, mode = "PostToolUseFailure", "blocked_error"
         message = _string(agent.get("lastError"))
-    elif status in {"running", "initializing"}:
+    elif status == "running":
         event_name, mode = "UserPromptSubmit", "working"
     elif attention == "finished":
         event_name, mode = "Stop", "completed"
     else:
+        # "idle", and "initializing" (an agent being reloaded, not a prompt:
+        # a real one goes on to "running" within a second).
         event_name, mode = "SessionStart", "idle_ready"
 
     line: dict[str, Any] = {
@@ -153,6 +158,10 @@ class PaseoMonitor:
         self.emit = emit or emit_hook_line
         self.log = log or (lambda text: print(text, file=sys.stderr, flush=True))
         self.signatures: dict[str, tuple[Any, ...]] = {}
+        # Agents the collector has heard about. A (re)connect lists every
+        # agent Paseo remembers; idle history is tracked without being
+        # announced, since announcing it would re-date old sessions.
+        self.announced: set[str] = set()
 
     def run_forever(self) -> None:
         delay = 1.0
@@ -253,14 +262,22 @@ class PaseoMonitor:
         if line is None:
             return
         self.signatures[agent_id] = signature
-        if line["hook_event_name"] == "SessionEnd":
-            self.signatures.pop(agent_id, None)
+        if line["sidepulse_mode"] == "idle_ready":
+            if agent_id not in self.announced:
+                return
+            if line["hook_event_name"] == "SessionEnd":
+                self.signatures.pop(agent_id, None)
+                self.announced.discard(agent_id)
+        else:
+            self.announced.add(agent_id)
         self.emit(PASEO_PROVIDER, line)
 
     def remove(self, agent_id: str) -> None:
         if self.signatures.pop(agent_id, None) is None:
             return
-        self.emit(PASEO_PROVIDER, closed_line(agent_id, self.server_id))
+        if agent_id in self.announced:
+            self.announced.discard(agent_id)
+            self.emit(PASEO_PROVIDER, closed_line(agent_id, self.server_id))
 
 
 def emit_hook_line(provider: str, line: dict[str, Any]) -> None:

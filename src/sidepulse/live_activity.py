@@ -89,7 +89,10 @@ START_PUSH_MIN_GAP_SECONDS = 45.0
 # started, and the next start push repeats it. Ignore resets this close to
 # a start push — a real "the phone has nothing" reset survives the wait.
 RESET_ECHO_SECONDS = 60.0
-MAX_UNANSWERED_START_PUSHES = 3
+# One retry: an accepted start on a reachable phone almost always created the
+# activity, and the app just never ran to register its token (2026-09-06:
+# three stacked cards from one burst). The reconcile nudge takes it from here.
+MAX_UNANSWERED_START_PUSHES = 2
 # Once an unanswered start burst is exhausted, ask the ordinary app process
 # to reconcile ActivityKit once. This push cannot create a duplicate activity;
 # it only gives the app a chance to report what iOS actually has.
@@ -2829,7 +2832,11 @@ class LiveActivityDaemon:
                     self._retired_activity_ids.add(activity_id)
                 self._retire_update_tokens()
                 self._activity_live = False
-                self._start_push_attempts = 0
+                if not self._is_reset_echo(time.time()):
+                    # The previous activity's end can arrive right after a
+                    # start push (a dead update token already triggered
+                    # one); reopening the burst then stacks another card.
+                    self._start_push_attempts = 0
                 self._save_activity_recovery_state()
                 self._wake.set()
                 _log(f"client confirmed activity {state}; will restart")
