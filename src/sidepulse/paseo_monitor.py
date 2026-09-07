@@ -88,7 +88,8 @@ def hook_line_for_agent(agent: dict[str, Any], server_id: str | None) -> dict[st
             tool_name = _string(pending[0].get("name"))
             message = _string(pending[0].get("title")) or _string(pending[0].get("description"))
     elif status == "error":
-        event_name, mode = "PostToolUseFailure", "blocked_error"
+        # This is the agent's terminal state, not an intermediate tool result.
+        event_name, mode = "StopFailure", "blocked_error"
         message = _string(agent.get("lastError"))
     elif status == "running":
         event_name, mode = "UserPromptSubmit", "working"

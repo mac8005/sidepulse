@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sidepulse.collector import StatusMetadata, status_from_event
+from sidepulse.collector import StatusMetadata, status_for_snapshot, status_from_event
 from sidepulse.live_activity import DeepLinkResolver
 from sidepulse.models import AgentMode, AgentStatus
 from sidepulse.origin import background_session_source
@@ -65,7 +65,7 @@ def test_snapshot_status_maps_to_sidepulse_modes() -> None:
         (agent(status="running"), "UserPromptSubmit", "working"),
         (agent(status="idle"), "SessionStart", "idle_ready"),
         (agent(status="idle", attentionReason="finished"), "Stop", "completed"),
-        (agent(status="error", lastError="boom"), "PostToolUseFailure", "blocked_error"),
+        (agent(status="error", lastError="boom"), "StopFailure", "blocked_error"),
         # "closed" is an unloaded agent (every one after a daemon restart),
         # not a finished session: the row goes quiet instead of "Done".
         (agent(status="closed"), "SessionEnd", "idle_ready"),
@@ -104,6 +104,17 @@ def test_permission_line_names_the_tool_without_its_input() -> None:
     assert line["tool_name"] == "Bash"
     assert line["message"] == "Run tests"
     assert "tool_input" not in line
+
+
+def test_terminal_error_is_blocked_but_a_recovered_agent_is_working() -> None:
+    for state, expected in (("error", AgentMode.BLOCKED_ERROR), ("running", AgentMode.WORKING)):
+        line = hook_line_for_agent(agent(status=state, lastError="earlier failure"), SERVER_ID)
+        record = parse_log_line("paseo", json.dumps(line))
+        assert record is not None
+        status = status_from_event(record)
+        assert status is not None
+        visible = status_for_snapshot(status, datetime.now(timezone.utc), post_tool_working_visible_seconds=0)
+        assert visible.mode == expected
 
 
 def test_snapshot_without_server_id_carries_no_link() -> None:

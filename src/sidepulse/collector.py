@@ -42,10 +42,6 @@ CODEX_SESSION_INDEX_MAX_LINES = 5000
 COMPLETED_VISIBLE_SECONDS = 20 * 60.0
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
-# Tool and script failures are often recoverable intermediate steps: agents
-# commonly adjust the command and continue immediately. Keep them working for
-# a short window; a failure that remains the latest event is still surfaced.
-TOOL_FAILURE_GRACE_SECONDS = 10.0
 # Codex reasons silently for minutes between tool calls (no events at all),
 # so its crash-safety window must be far wider than Claude's — otherwise a
 # thinking session reads as "Done". Real turn ends still arrive as Stop.
@@ -1435,10 +1431,13 @@ def status_for_snapshot(
     *,
     post_tool_working_visible_seconds: float,
 ) -> AgentStatus:
+    # A failed or denied tool is a result for the agent to handle, not proof
+    # that it stopped for human input. Silence while it plans a recovery must
+    # not promote the failure to blocked. Keep the raw event for diagnostics;
+    # real approval requests and terminal failures have separate events.
     if (
         status.mode == AgentMode.BLOCKED_ERROR
-        and status.event_name in {"PostToolUse", "PostToolUseFailure"}
-        and status.age_seconds(now) < TOOL_FAILURE_GRACE_SECONDS
+        and status.event_name in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"}
     ):
         return _replace_mode(status, AgentMode.WORKING)
 
@@ -1580,7 +1579,7 @@ def track_pending_permissions(
         pending_permissions_by_key.setdefault(record.status_key, set()).add(signature)
         return
 
-    if record.event_name == "PostToolUse" and signature:
+    if record.event_name in {"PostToolUse", "PostToolUseFailure", "PermissionDenied"} and signature:
         pending = pending_permissions_by_key.get(record.status_key)
         if pending is not None:
             pending.discard(signature)
