@@ -1736,6 +1736,8 @@ class LiveActivityDaemon:
         self._last_dot_working_ack_at: float | None = None
         self._dot_streams: dict[str, int] = {}
         self._dot_completion_owner: str | None = None
+        self._dot_completion_signature: tuple[str, bool] | None = None
+        self._dot_completion_unread_ids: set[str] = set()
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -3311,13 +3313,31 @@ class LiveActivityDaemon:
     def _maybe_send_dot_completion_alert(
         self, dot_state: str, content_state: dict[str, Any], now: float
     ) -> bool:
-        """One soundless visible alert for newly observed completion generations."""
+        """One soundless notification for a completion or its visible reversal."""
         with self._dot_lock:
             entries = self.tokens.entries("dot_device")
             if not entries:
                 self._dot_completion_owner = None
                 return False
             owner, metadata = next(iter(entries.items()))
+            rows = content_state.get("agents", [])
+            signature = (dot_state, _has_unread_finished(content_state))
+            active_ids = {
+                row["id"] for row in rows
+                if isinstance(row.get("id"), str)
+                and row.get("mode") in {"working", "tool_running", "long_task_progress"}
+            }
+            resumed = (
+                dot_state == "working"
+                and self._dot_completion_signature != signature
+                and bool(self._dot_completion_unread_ids & active_ids)
+            )
+            self._dot_completion_signature = signature
+            self._dot_completion_unread_ids = {
+                row["id"] for row in rows
+                if isinstance(row.get("id"), str)
+                and row.get("mode") == "completed" and row.get("unread") is True
+            }
             previous = metadata.get("dot_completion_seen", {})
             seen = {
                 key: float(value) for key, value in previous.items()
@@ -3356,17 +3376,23 @@ class LiveActivityDaemon:
             # Consume identities even while opted out, in the foreground, or
             # suppressed. Enabling alerts or lifting Focus never replays them.
             if (
-                baseline or not fresh
+                baseline or not (fresh or resumed)
                 or metadata.get("dot_completion_alerts_enabled") is not True
                 or self._dot_completion_unavailability(now) is not None
             ):
                 return False
+            if self._dot_owner_availability(now)[3]:
+                # This new command is already the post-suppression refresh;
+                # the silent path must not replace it again in the same tick.
+                self.tokens.update_metadata("dot_device", owner, {
+                    "dot_unavailable_until": None, "dot_unavailable_reason": None,
+                })
             self._queue_dot_state(dot_state, content_state, now, force=True)
             pending = self._pending_dot
             payload = {
                 "aps": {
                     "alert": {
-                        "title": "Session finished",
+                        "title": "Session finished" if fresh else "Session resumed",
                         "body": "Open SidePulse to view the result.",
                     },
                     "mutable-content": 1,
@@ -3374,7 +3400,11 @@ class LiveActivityDaemon:
                 },
                 "dot": self._dot_payload(pending),
             }
-        _log(f"dot completion alert -> command {pending.command_id[:8]}")
+            if not fresh:
+                payload["aps"]["alert"]["body"] = "Work is continuing. SidePulse is updating your Dot."
+                payload["aps"]["interruption-level"] = "passive"
+        event = "completion" if fresh else "resume"
+        _log(f"dot {event} alert -> command {pending.command_id[:8]}")
         accepted = self._apns_fanout(
             "dot_device", payload, priority=10, push_type="alert",
             topic=self.config.bundle_id,
@@ -3766,6 +3796,13 @@ class LiveActivityDaemon:
                     self._pending_dot.state,
                     self._pending_dot.has_unread_finished,
                 ) != signature:
+                    if self._pending_dot.accepted_attempts:
+                        # The phone may have applied this command and lost
+                        # its ACK. An older ACK is no longer proof of the
+                        # physical LEDs when that in-flight state is replaced.
+                        self._last_dot_state = None
+                        self._last_dot_has_unread_finished = None
+                        self._last_dot_working_ack_at = None
                     self._pending_dot = None
             unread_changed = (
                 previous is not None and previous[1] != signature[1]

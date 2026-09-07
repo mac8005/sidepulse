@@ -79,6 +79,170 @@ def test_completion_identity_not_unread_boolean_controls_new_alerts(tmp_path, mo
     assert len(sent) == 2
 
 
+@pytest.mark.parametrize("all_finished", [False, True])
+def test_resume_rewrites_working_after_unacknowledged_completion(tmp_path, monkeypatch, all_finished):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    observe(daemon, snapshot(110), 110)
+    assert daemon._send_pending_dot_if_due(110)
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+
+    completed = snapshot(120, ("session", 120))
+    if all_finished:
+        completed.update(aggregateMode="completed", activeCount=0)
+    dot_state = "done" if all_finished else "working"
+    daemon._latest = completed
+    daemon._observe_dot_state(dot_state, completed, 120)
+    assert daemon._maybe_send_dot_completion_alert(dot_state, completed, 120)
+    completion_command = daemon._pending_dot.command_id
+
+    # The extension may have written green even if its ACK never reached us.
+    # Returning to the older ACKed blue signature still needs a fresh write.
+    assert not observe(daemon, snapshot(130), 130)
+    assert daemon._pending_dot is not None
+    assert daemon._pending_dot.command_id != completion_command
+    assert daemon._pending_dot.has_unread_finished is False
+    assert daemon._send_pending_dot_if_due(130)
+    assert sent[-1][2]["push_type"] == "background"
+    assert sent[-1][1]["dot"]["aggregateMode"] == "working"
+    assert sent[-1][1]["dot"]["hasUnreadFinished"] is False
+    assert not daemon.ack_dot(completion_command, "written", now=131)
+    assert not daemon._send_pending_dot_if_due(131)
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=132)
+    assert len(sent) == 3
+
+
+def test_unsent_completion_flap_does_not_spend_a_resume_push(tmp_path, monkeypatch):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    observe(daemon, snapshot(110), 110)
+    assert daemon._send_pending_dot_if_due(110)
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+    daemon._dot_stream_connected("phone")
+    assert not observe(daemon, snapshot(120, ("session", 120)), 120)
+    assert not daemon._send_pending_dot_if_due(120)
+    assert not observe(daemon, snapshot(130), 130)
+    daemon._dot_stream_disconnected("phone")
+    assert daemon._pending_dot is None
+    assert not daemon._send_pending_dot_if_due(130)
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("mode", ["working", "tool_running", "long_task_progress", "PreCompact", "PostCompact"])
+@pytest.mark.parametrize("all_finished", [False, True])
+def test_resumed_session_gets_one_passive_current_state_notification(tmp_path, monkeypatch, mode, all_finished):
+    if mode in {"PreCompact", "PostCompact"}:
+        from datetime import datetime, timezone
+        from sidepulse.collector import mode_for_event
+        from sidepulse.models import HookEvent
+        mode = mode_for_event(HookEvent(
+            provider="claude", logged_at=datetime.now(timezone.utc),
+            event_name=mode, raw={}, session_id="session",
+        )).value
+        assert mode == "working"
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    completed = snapshot(110, ("session", 110))
+    if all_finished:
+        completed.update(aggregateMode="completed", activeCount=0)
+    state = "done" if all_finished else "working"
+    daemon._latest = completed
+    daemon._observe_dot_state(state, completed, 110)
+    assert daemon._maybe_send_dot_completion_alert(state, completed, 110)
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+    resumed = {**snapshot(120), "aggregateMode": mode, "agents": [{"id": "session", "mode": mode}]}
+    assert observe(daemon, resumed, 120)
+    token, payload, options = sent[-1]
+    assert token == "phone" and options["push_type"] == "alert"
+    assert payload["aps"]["alert"]["title"] == "Session resumed"
+    assert payload["aps"]["interruption-level"] == "passive"
+    assert payload["aps"]["mutable-content"] == 1
+    assert "sound" not in payload["aps"]
+    assert payload["dot"]["aggregateMode"] == mode
+    assert payload["dot"]["hasUnreadFinished"] is False
+    command_id = daemon._pending_dot.command_id
+    assert not daemon._send_pending_dot_if_due(120)
+    assert not observe(daemon, {**resumed, "updatedAt": 121}, 121)
+    assert not observe(daemon, {**resumed, "aggregateMode": "tool_running", "updatedAt": 122}, 122)
+    assert daemon._pending_dot.command_id == command_id
+    assert len(sent) == 2
+    assert daemon._send_pending_dot_if_due(240)
+    assert sent[-1][2]["push_type"] == "background"
+    assert len(sent) == 3
+
+
+def test_resume_after_expired_suppression_does_not_duplicate_initial_push(tmp_path, monkeypatch):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    observe(daemon, snapshot(110, ("session", 110)), 110)
+    daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+    daemon.report_dot_availability("phone", False, "write_failed", 60, 115, now=115)
+    resumed = {**snapshot(180), "agents": [{"id": "session", "mode": "working"}]}
+    assert observe(daemon, resumed, 180)
+    command_id = daemon._pending_dot.command_id
+    assert not daemon._send_pending_dot_if_due(180)
+    assert daemon._pending_dot.command_id == command_id
+    assert len(sent) == 2
+
+
+@pytest.mark.parametrize("suppression", ["foreground", "dnd", "focus", "disabled", "new_owner", "restart"])
+def test_suppressed_resume_is_not_replayed(tmp_path, monkeypatch, suppression):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    observe(daemon, snapshot(110, ("session", 110)), 110)
+    daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+    if suppression == "foreground":
+        daemon._dot_stream_connected("phone")
+    elif suppression == "dnd":
+        daemon.report_dot_availability("phone", False, "dnd", 600, 115, now=115)
+    elif suppression == "focus":
+        daemon.report_dot_focus("phone", True, 115, now=115)
+    elif suppression == "disabled":
+        daemon.report_dot_completion_alerts("phone", False)
+    elif suppression == "new_owner":
+        daemon.tokens.replace("dot_device", "new-phone", {"dot_completion_alerts_enabled": True})
+    else:
+        daemon, sent = make_daemon(tmp_path, monkeypatch)
+    sent.clear()
+    resumed = {**snapshot(120), "agents": [{"id": "session", "mode": "working"}]}
+    assert not observe(daemon, resumed, 120)
+    if suppression == "foreground":
+        daemon._dot_stream_disconnected("phone")
+    elif suppression == "dnd":
+        daemon.report_dot_availability("phone", True, reported_at=130, now=130)
+    elif suppression == "focus":
+        daemon.report_dot_focus("phone", False, 130, now=130)
+    elif suppression == "disabled":
+        daemon.report_dot_completion_alerts("phone", True)
+    assert not observe(daemon, {**resumed, "updatedAt": 140}, 140)
+    assert sent == []
+
+
+def test_resume_preserves_other_unread_results_and_ignores_read_only_changes(tmp_path, monkeypatch):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    completed = {**snapshot(110, ("first", 110), ("second", 110)), "aggregateMode": "completed", "activeCount": 0}
+    daemon._latest = completed
+    daemon._observe_dot_state("done", completed, 110)
+    assert daemon._maybe_send_dot_completion_alert("done", completed, 110)
+    daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
+    resumed = snapshot(120, ("second", 110))
+    resumed["agents"].append({"id": "first", "mode": "working"})
+    assert observe(daemon, resumed, 120)
+    assert sent[-1][1]["dot"]["hasUnreadFinished"] is True
+    assert daemon.dot_command("phone", now=120)["dot"]["hasUnreadFinished"] is True
+    assert len(sent) == 2
+    read = {**resumed, "updatedAt": 130, "agents": [{**row, "unread": False} for row in resumed["agents"]]}
+    assert not observe(daemon, read, 130)
+    removed = {**snapshot(140), "agents": [{"id": "first", "mode": "working"}]}
+    assert not observe(daemon, removed, 140)
+    assert len(sent) == 2
+    # A later completion supersedes the passive notification's command.
+    observe(daemon, snapshot(150, ("third", 150)), 150)
+    assert daemon.dot_command("phone", now=150)["dot"]["hasUnreadFinished"] is True
+    assert daemon.dot_command("phone", now=150)["dot"]["commandID"] == sent[-1][1]["dot"]["commandID"]
+
+
 def test_restart_never_replays_historical_or_already_alerted_rows(tmp_path, monkeypatch):
     daemon, sent = make_daemon(tmp_path, monkeypatch)
     observe(daemon, snapshot(100), 100)

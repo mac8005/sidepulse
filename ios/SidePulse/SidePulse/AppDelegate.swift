@@ -84,7 +84,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        if notification.request.content.userInfo["dot"] != nil { return [.banner] }
+        if notification.request.content.userInfo["dot"] != nil {
+            return notification.request.content.interruptionLevel == .passive ? [.list] : [.banner]
+        }
         return [.banner, .sound]
     }
 
