@@ -34,7 +34,7 @@ struct ContentView: View {
                     }
 
                     QuickPatternsPanel { pattern in
-                        write(pattern)
+                        Task { await write(pattern) }
                     }
                 }
                 .padding(16)
@@ -117,7 +117,7 @@ struct ContentView: View {
         }
     }
 
-    private func write(_ pattern: LEDPattern) {
+    private func write(_ pattern: LEDPattern) async {
         let pushBase = ReceivedPush(
             source: "Quick Pattern",
             title: pattern.displayName,
@@ -137,7 +137,7 @@ struct ContentView: View {
         }
 
         do {
-            let targetURL = try DriveWriter.shared.write(pattern.ledText)
+            let targetURL = try await DriveWriter.shared.write(pattern.ledText)
             var push = pushBase
             push.body = "Wrote \(targetURL.lastPathComponent)"
             push.writeStatus = .wrote
@@ -485,7 +485,7 @@ private struct SettingsView: View {
                     .frame(minHeight: 140)
 
                 Button {
-                    writeLocalTest()
+                    Task { await writeLocalTest() }
                 } label: {
                     Label("Write to USB", systemImage: "square.and.arrow.down")
                 }
@@ -595,9 +595,9 @@ private struct SettingsView: View {
         }
     }
 
-    private func writeLocalTest() {
+    private func writeLocalTest() async {
         do {
-            let targetURL = try DriveWriter.shared.write(model.ledText)
+            let targetURL = try await DriveWriter.shared.write(model.ledText)
             model.recordWriteSuccess("Wrote \(targetURL.lastPathComponent)")
         } catch {
             model.recordError(error)

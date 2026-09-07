@@ -17,7 +17,7 @@ struct WriteLEDsIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult {
-        _ = try DriveWriter.shared.write(ledsText)
+        _ = try await DriveWriter.shared.write(ledsText)
         await MainActor.run {
             AppModel.shared.recordWriteSuccess("Shortcut wrote LEDS.LED")
         }

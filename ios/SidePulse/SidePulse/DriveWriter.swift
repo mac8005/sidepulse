@@ -54,13 +54,18 @@ enum DotBrightness {
     }
 }
 
-final class DriveWriter {
+// Mutable folder state is protected by folderLock; all USB I/O uses ioQueue.
+final class DriveWriter: @unchecked Sendable {
     static let shared = DriveWriter()
 
     private let bookmarkKey = "usbFolderBookmark"
     private let defaultFileName = "LEDS.LED"
     private let maxLEDBytes = 512
     private let maxLEDLines = 20
+    private let ioQueue = DispatchQueue(label: "sidepulse.dot.usb", qos: .utility)
+    private let folderLock = NSRecursiveLock()
+    private var cachedFolderURL: URL?
+    private var cachedBookmark: Data?
 
     private init() {}
 
@@ -81,6 +86,8 @@ final class DriveWriter {
     }
 
     func saveFolder(_ url: URL) throws {
+        folderLock.lock()
+        defer { folderLock.unlock() }
         EventLog.append("Saving USB folder bookmark: \(url.lastPathComponent)")
         let startedAccess = url.startAccessingSecurityScopedResource()
         defer {
@@ -95,11 +102,13 @@ final class DriveWriter {
             relativeTo: nil
         )
         UserDefaults.standard.set(bookmark, forKey: bookmarkKey)
+        cachedFolderURL = url
+        cachedBookmark = bookmark
         EventLog.append("Saved USB folder bookmark")
     }
 
     @discardableResult
-    func write(_ text: String) throws -> URL {
+    func write(_ text: String) async throws -> URL {
         let normalizedProgram = normalizeLEDText(text)
         let trimmed = normalizedProgram.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -118,55 +127,90 @@ final class DriveWriter {
             throw DriveWriterError.tooManyLines(lineCount)
         }
 
-        let folderURL = try resolveFolderURL()
-        let startedAccess = folderURL.startAccessingSecurityScopedResource()
-        guard startedAccess else {
-            throw DriveWriterError.accessDenied
-        }
-
-        defer {
-            folderURL.stopAccessingSecurityScopedResource()
-        }
-
-        let targetURL = folderURL.appendingPathComponent(fileName, isDirectory: false)
         let data = Data(program.utf8)
-        try data.write(to: targetURL)
-        EventLog.append("Wrote \(data.count) bytes to \(targetURL.lastPathComponent)")
-        return targetURL
+        return try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async {
+                continuation.resume(with: Result {
+                    try self.withFolderAccess { folderURL in
+                        let targetURL = folderURL.appendingPathComponent(self.fileName, isDirectory: false)
+                        try Self.coordinatedWrite(data, to: targetURL)
+                        EventLog.append("Wrote \(data.count) bytes to \(targetURL.lastPathComponent)")
+                        return targetURL
+                    }
+                })
+            }
+        }
     }
 
     /// Verify that the saved security-scoped drive is still mounted without
     /// rewriting LEDS.LED or adding a diagnostics-log entry.
-    func probeAccess() throws {
-        let folderURL = try resolveFolderURL()
-        let startedAccess = folderURL.startAccessingSecurityScopedResource()
-        guard startedAccess else {
-            throw DriveWriterError.accessDenied
-        }
-        defer { folderURL.stopAccessingSecurityScopedResource() }
-
-        var isDirectory: ObjCBool = false
-        guard try folderURL.checkResourceIsReachable(),
-              FileManager.default.fileExists(
-                  atPath: folderURL.path,
-                  isDirectory: &isDirectory
-              ),
-              isDirectory.boolValue
-        else {
-            throw DriveWriterError.accessDenied
-        }
-
-        let targetURL = folderURL.appendingPathComponent(fileName, isDirectory: false)
-        if FileManager.default.fileExists(atPath: targetURL.path),
-           try !targetURL.checkResourceIsReachable() {
-            throw DriveWriterError.accessDenied
+    func probeAccess() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            ioQueue.async {
+                continuation.resume(with: Result {
+                    try self.withFolderAccess { folderURL in
+                        var coordinationError: NSError?
+                        var accessError: Error?
+                        NSFileCoordinator().coordinate(readingItemAt: folderURL, error: &coordinationError) { url in
+                            do {
+                                guard try url.checkResourceIsReachable() else {
+                                    throw DriveWriterError.accessDenied
+                                }
+                            } catch { accessError = error }
+                        }
+                        if let error = coordinationError ?? accessError { throw error }
+                    }
+                })
+            }
         }
     }
 
+    /// The coordinator's URL may differ from the bookmark URL. Write in place:
+    /// the Dot firmware consumes LEDS.LED, not an atomically renamed temp file.
+    static func coordinatedWrite(_ data: Data, to targetURL: URL) throws {
+        var coordinationError: NSError?
+        var writeError: Error?
+        NSFileCoordinator().coordinate(writingItemAt: targetURL, options: [], error: &coordinationError) { url in
+            do { try data.write(to: url) }
+            catch { writeError = error }
+        }
+        if let error = coordinationError ?? writeError { throw error }
+    }
+
+    private func withFolderAccess<T>(_ operation: (URL) throws -> T) throws -> T {
+        folderLock.lock()
+        defer { folderLock.unlock() }
+        // Reuse the resolved security-scoped URL across background wakes. On
+        // failure, discard it and resolve the bookmark once, not indefinitely.
+        for attempt in 0...1 {
+            var stage = "bookmark"
+            do {
+                let folderURL = try resolveFolderURL()
+                stage = "permission"
+                guard folderURL.startAccessingSecurityScopedResource() else {
+                    throw DriveWriterError.accessDenied
+                }
+                defer { folderURL.stopAccessingSecurityScopedResource() }
+                stage = "coordinated access"
+                return try operation(folderURL)
+            } catch {
+                cachedFolderURL = nil
+                cachedBookmark = nil
+                let detail = error as NSError
+                EventLog.append("Dot USB \(stage) failed (\(detail.domain):\(detail.code)); \(attempt == 0 ? "retrying once" : "retry deferred")")
+                if attempt == 1 { throw error }
+            }
+        }
+        throw DriveWriterError.accessDenied
+    }
+
     private func resolveFolderURL() throws -> URL {
+        folderLock.lock()
+        defer { folderLock.unlock() }
         guard let bookmark = UserDefaults.standard.data(forKey: bookmarkKey) else {
             throw DriveWriterError.noFolderSelected
         }
+        if bookmark == cachedBookmark, let cachedFolderURL { return cachedFolderURL }
 
         var isStale = false
         let url = try URL(
@@ -177,9 +221,18 @@ final class DriveWriter {
         )
 
         if isStale {
-            throw DriveWriterError.bookmarkStale
+            guard url.startAccessingSecurityScopedResource() else {
+                throw DriveWriterError.bookmarkStale
+            }
+            defer { url.stopAccessingSecurityScopedResource() }
+            let renewed = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+            UserDefaults.standard.set(renewed, forKey: bookmarkKey)
+            cachedBookmark = renewed
+            EventLog.append("Renewed stale USB folder bookmark")
+        } else {
+            cachedBookmark = bookmark
         }
-
+        cachedFolderURL = url
         return url
     }
 

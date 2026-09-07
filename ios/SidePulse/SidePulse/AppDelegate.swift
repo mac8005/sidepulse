@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         if let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any] {
             if !handleLiveActivityReconcileNotification(userInfo, completion: { _ in }),
                !handleDotNotification(userInfo, completion: { _ in }) {
-                processNotification(userInfo, source: "Launch notification")
+                Task { await processNotification(userInfo, source: "Launch notification") }
             }
         }
 
@@ -61,8 +61,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         if handleDotNotification(userInfo, completion: completionHandler) {
             return
         }
-        let didHandle = processNotification(userInfo, source: "Background push")
-        completionHandler(didHandle ? .newData : .failed)
+        Task {
+            let didHandle = await processNotification(userInfo, source: "Background push")
+            completionHandler(didHandle ? .newData : .failed)
+        }
     }
 
     func application(
@@ -74,7 +76,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             return false
         }
 
-        return processResolvedPayload(resolution, source: "Shortcut URL")
+        Task { await processResolvedPayload(resolution, source: "Shortcut URL") }
+        return true
     }
 
     func userNotificationCenter(
@@ -88,14 +91,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        processNotification(
+        await processNotification(
             response.notification.request.content.userInfo,
             source: "Opened notification"
         )
     }
 
     @discardableResult
-    private func processNotification(_ userInfo: [AnyHashable: Any], source: String) -> Bool {
+    private func processNotification(_ userInfo: [AnyHashable: Any], source: String) async -> Bool {
         // A Dot push that launched the app is delivered to
         // didReceiveRemoteNotification as well; it is not inbox material.
         if userInfo["dot"] != nil {
@@ -105,11 +108,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         EventLog.append("\(source) received; keys=[\(keys)]")
 
         let resolution = PushPayloadResolver.resolve(userInfo: userInfo)
-        return processResolvedPayload(resolution, source: source)
+        return await processResolvedPayload(resolution, source: source)
     }
 
     @discardableResult
-    private func processResolvedPayload(_ resolution: PushPayloadResolution, source: String) -> Bool {
+    private func processResolvedPayload(_ resolution: PushPayloadResolution, source: String) async -> Bool {
         var status: ReceivedPush.WriteStatus = .received
         var errorMessage: String?
 
@@ -119,7 +122,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         } else if let ledText = resolution.resolvedLEDText {
             if DriveWriter.shared.hasSavedFolder {
                 do {
-                    let targetURL = try DriveWriter.shared.write(ledText)
+                    let targetURL = try await DriveWriter.shared.write(ledText)
                     status = .wrote
                     EventLog.append("\(source) wrote \(targetURL.lastPathComponent)")
                 } catch {
@@ -187,8 +190,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let sourceUpdatedAt = (dot["updatedAt"] as? NSNumber)?.doubleValue
         let host = dot["host"] as? String
         let hasUnreadFinished = dot["hasUnreadFinished"] as? Bool ?? false
-        let result = MainActor.assumeIsolated {
-            DotStatusMirror.shared.applyPush(
+        EventLog.append("Dot push received (\(mode)); app state: \(UIApplication.shared.applicationState.rawValue)")
+        Task { @MainActor in
+            let result = await DotStatusMirror.shared.applyPush(
                 aggregateMode: mode,
                 hasUnreadFinished: hasUnreadFinished,
                 commandID: commandID,
@@ -197,31 +201,20 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 host: host,
                 model: AppModel.shared
             )
-        }
-
-        let fetchResult: UIBackgroundFetchResult
-        switch result.result {
-        case .written:
-            fetchResult = .newData
-        case .alreadyCurrent:
-            fetchResult = .noData
-        case .noFolder:
-            fetchResult = .noData
-        case .failed:
-            fetchResult = .failed
-        }
-
-        guard let commandID else {
-            completion(fetchResult)
-            return true
-        }
-        Task { @MainActor in
-            await LiveMonitorManager.shared.acknowledgeDot(
-                commandID: commandID,
-                status: result.acknowledgementStatus,
-                availability: result.availability,
-                model: AppModel.shared
-            )
+            let fetchResult: UIBackgroundFetchResult
+            switch result.result {
+            case .written: fetchResult = .newData
+            case .alreadyCurrent, .noFolder: fetchResult = .noData
+            case .failed: fetchResult = .failed
+            }
+            if let commandID {
+                await LiveMonitorManager.shared.acknowledgeDot(
+                    commandID: commandID,
+                    status: result.acknowledgementStatus,
+                    availability: result.availability,
+                    model: AppModel.shared
+                )
+            }
             completion(fetchResult)
         }
         return true

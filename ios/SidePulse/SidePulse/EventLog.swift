@@ -5,8 +5,11 @@ enum EventLog {
     private static let logger = Logger(subsystem: "io.sidepulse.app", category: "SidePulse")
     private static let defaultsKey = "eventLog"
     private static let maxEntries = 500
+    private static let lock = NSLock()
 
     static func append(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
         let timestamp = ISO8601DateFormatter().string(from: Date())
         let line = "\(timestamp) \(message)"
         logger.info("\(line, privacy: .public)")
@@ -21,10 +24,14 @@ enum EventLog {
     }
 
     static func entries() -> [String] {
-        UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+        lock.lock()
+        defer { lock.unlock() }
+        return UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
     }
 
     static func clear() {
+        lock.lock()
+        defer { lock.unlock() }
         UserDefaults.standard.removeObject(forKey: defaultsKey)
     }
 
