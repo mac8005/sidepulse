@@ -259,99 +259,15 @@ enum DotPrograms {
     }
 }
 
-struct DndScheduleTransition: Equatable {
-    let key: String
-    let enabled: Bool
-}
-
-struct DndScheduleBoundary: Equatable {
-    let date: Date
-    let enabled: Bool
-}
-
 private struct DotWriteSignature: Equatable {
     let program: String
     let brightness: Int
 }
 
-/// Daily DND window, ported from `status_bar.py`. Times are local "HH:MM".
-enum DndSchedule {
-    static let defaultStartTime = "22:00"
-    static let defaultEndTime = "07:00"
-
-    /// The most recent start/end boundary at or before `now`, looking back
-    /// one day so a window that opened yesterday evening is still honoured
-    /// this morning. Its key lets the caller apply each boundary exactly once.
-    static func latestTransition(startTime: String, endTime: String, now: Date = Date()) -> DndScheduleTransition? {
-        guard let start = parse(startTime), let end = parse(endTime) else { return nil }
-        var boundaries = [(label: "start", time: start, enabled: true)]
-        if start != end {
-            boundaries.append((label: "end", time: end, enabled: false))
-        }
-
-        let calendar = Calendar.current
-        var due: [(date: Date, label: String, enabled: Bool)] = []
-        for dayOffset in [-1, 0] {
-            guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now) else { continue }
-            var components = calendar.dateComponents([.year, .month, .day], from: day)
-            for boundary in boundaries {
-                components.hour = boundary.time.hour
-                components.minute = boundary.time.minute
-                components.second = 0
-                guard let date = calendar.date(from: components), date <= now else { continue }
-                due.append((date, boundary.label, boundary.enabled))
-            }
-        }
-        guard let latest = due.max(by: { $0.date < $1.date }) else { return nil }
-
-        let day = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: latest.date)
-        let key = String(
-            format: "%04d-%02d-%02d:%@:%02d:%02d",
-            day.year ?? 0, day.month ?? 0, day.day ?? 0, latest.label, day.hour ?? 0, day.minute ?? 0
-        )
-        return DndScheduleTransition(key: key, enabled: latest.enabled)
-    }
-
-    static func nextTransition(startTime: String, endTime: String, after now: Date = Date()) -> DndScheduleBoundary? {
-        guard let start = parse(startTime), let end = parse(endTime) else { return nil }
-        var boundaries = [(time: start, enabled: true)]
-        if start != end {
-            boundaries.append((time: end, enabled: false))
-        }
-
-        let calendar = Calendar.current
-        var candidates: [DndScheduleBoundary] = []
-        for dayOffset in 0...2 {
-            guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now) else { continue }
-            var components = calendar.dateComponents([.year, .month, .day], from: day)
-            for boundary in boundaries {
-                components.hour = boundary.time.hour
-                components.minute = boundary.time.minute
-                components.second = 0
-                if let date = calendar.date(from: components), date > now {
-                    candidates.append(DndScheduleBoundary(date: date, enabled: boundary.enabled))
-                }
-            }
-        }
-        return candidates.min(by: { $0.date < $1.date })
-    }
-
-    static func nextTransitionDate(startTime: String, endTime: String, after now: Date = Date()) -> Date? {
-        nextTransition(startTime: startTime, endTime: endTime, after: now)?.date
-    }
-
-    static func parse(_ value: String) -> (hour: Int, minute: Int)? {
-        let parts = value.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-        guard parts.count == 2,
-              let hour = Int(parts[0]), let minute = Int(parts[1]),
-              (0...23).contains(hour), (0...59).contains(minute)
-        else { return nil }
-        return (hour, minute)
-    }
-
-    static func format(hour: Int, minute: Int) -> String {
-        String(format: "%02d:%02d", hour, minute)
-    }
+private enum DotWriteOutcome {
+    case confirmed
+    case superseded
+    case failed
 }
 
 /// Keeps a SidePulse Dot plugged into this phone in step with the Mac's
@@ -377,6 +293,7 @@ final class DotStatusMirror: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var scheduleTimer: Timer?
     private var lastWriteSignature: DotWriteSignature?
+    private var lastSharedWriteID: String?
     private var lastError: String?
     private var lastAttempt: Date = .distantPast
     private var lastProgramWrite: Date = .distantPast
@@ -542,7 +459,7 @@ final class DotStatusMirror: ObservableObject {
             duplicateCommand = issuedAt == appliedAt && commandID == appliedID
         }
         if let sourceUpdatedAt,
-           max(lastSuccessfullyAppliedStreamUpdatedAt, lastPushSourceUpdatedAt) > sourceUpdatedAt {
+           latestSourceUpdatedAt(serverURL: model.liveMonitorServerURL) > sourceUpdatedAt {
             staleCommand = true
         }
 
@@ -579,7 +496,7 @@ final class DotStatusMirror: ObservableObject {
                 guard (response as? HTTPURLResponse)?.statusCode == 200,
                       serverURL == model.liveMonitorServerURL else { throw URLError(.badServerResponse) }
                 let snapshot = try JSONDecoder().decode(AgentSnapshot.self, from: data)
-                guard snapshot.updatedAt >= max(lastSuccessfullyAppliedStreamUpdatedAt, lastPushSourceUpdatedAt) else {
+                guard snapshot.updatedAt >= latestSourceUpdatedAt(serverURL: serverURL) else {
                     throw URLError(.badServerResponse)
                 }
                 currentMode = snapshot.aggregateMode
@@ -616,12 +533,14 @@ final class DotStatusMirror: ObservableObject {
         let alreadyCurrent = !refreshWorking
             && signature == lastWriteSignature
             && lastError == nil
-        let written = await write(
+        let outcome = await write(
             program,
             label: label,
-            force: refreshWorking
+            force: refreshWorking,
+            serverURL: model.liveMonitorServerURL,
+            sourceUpdatedAt: suppression == nil ? currentSourceUpdatedAt : nil
         )
-        if written {
+        if outcome == .confirmed {
             if !staleCommand {
                 recordPushCommand(commandID: commandID, issuedAt: issuedAt, scope: scope)
             }
@@ -635,12 +554,15 @@ final class DotStatusMirror: ObservableObject {
                 availability: suppression ?? .ready
             )
         } else {
-            EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError ?? "unknown error")")
+            if outcome == .superseded {
+                EventLog.append("Dot push (\(aggregateMode)): superseded during USB coordination; not acknowledged")
+            } else {
+                EventLog.append("Dot push (\(aggregateMode)) failed: \(lastError ?? "unknown error")")
+            }
             return DotPushApplyOutcome(
                 result: .failed,
-                availability: suppression ?? .unavailable(
-                    reason: "write_failed",
-                    retryAfterSeconds: DotPrograms.writeFailureRetrySeconds
+                availability: suppression ?? availabilityAfterWrite(
+                    outcome == .superseded, model: model, now: Date()
                 )
             )
         }
@@ -772,9 +694,11 @@ final class DotStatusMirror: ObservableObject {
             case "focus": label = "iOS Focus on — Dot off"
             default: label = "Dot unavailable"
             }
-            let written = await write(DotPrograms.off, label: label)
+            let outcome = await write(
+                DotPrograms.off, label: label, serverURL: model.liveMonitorServerURL
+            )
             reportAvailability(
-                availabilityAfterWrite(written, model: model, now: now),
+                availabilityAfterWrite(outcome != .failed, model: model, now: now),
                 model: model
             )
             return
@@ -788,7 +712,7 @@ final class DotStatusMirror: ObservableObject {
         switch stream.state {
         case .live:
             guard let snapshot = stream.snapshot else { return }
-            guard snapshot.updatedAt >= lastPushSourceUpdatedAt else {
+            guard snapshot.updatedAt >= latestSourceUpdatedAt(serverURL: model.liveMonitorServerURL) else {
                 statusText = "Waiting for current Mac state"
                 return
             }
@@ -816,7 +740,7 @@ final class DotStatusMirror: ObservableObject {
             label += focusAccessHint
         }
         let previousProgramWrite = lastProgramWrite
-        let written = await write(
+        let outcome = await write(
             DotPrograms.program(
                 for: resolved.state,
                 appearance: model.dotAppearance,
@@ -828,8 +752,11 @@ final class DotStatusMirror: ObservableObject {
             force: resolved.state == .working
                 && lastError == nil
                 && (now.timeIntervalSince(lastProgramWrite) >= DotPrograms.workingRefreshSeconds
-                    || (streamCommandID != nil && streamCommandID != lastAppliedStreamCommandID))
+                    || (streamCommandID != nil && streamCommandID != lastAppliedStreamCommandID)),
+            serverURL: model.liveMonitorServerURL,
+            sourceUpdatedAt: streamUpdatedAt
         )
+        let written = outcome == .confirmed
         if written, let streamUpdatedAt {
             recordSuccessfulStreamWrite(updatedAt: streamUpdatedAt)
         }
@@ -860,8 +787,15 @@ final class DotStatusMirror: ObservableObject {
             }
         }
         reportAvailability(
-            availabilityAfterWrite(written, model: model, now: now),
+            availabilityAfterWrite(outcome != .failed, model: model, now: now),
             model: model
+        )
+    }
+
+    private func latestSourceUpdatedAt(serverURL: String) -> TimeInterval {
+        max(
+            max(lastSuccessfullyAppliedStreamUpdatedAt, lastPushSourceUpdatedAt),
+            DotNotificationShared.latestWrite(serverURL: serverURL)?.sourceUpdatedAt ?? 0
         )
     }
 
@@ -996,11 +930,34 @@ final class DotStatusMirror: ObservableObject {
         )
     }
 
+    static func sharedWriteInvalidatesCache(
+        _ receipt: DotWriteReceipt,
+        lastWriteID: String?,
+        lastProgramWrite: Date
+    ) -> Bool {
+        if let writeID = receipt.writeID { return writeID != lastWriteID }
+        return receipt.completedAt > lastProgramWrite.timeIntervalSince1970
+    }
+
     /// Writes only when the program or configured brightness changes, or when
     /// retrying a failed write after the back-off. Success confirms file I/O,
     /// not physical LED feedback from the firmware.
     @discardableResult
-    private func write(_ program: String, label: String, force: Bool = false) async -> Bool {
+    private func write(
+        _ program: String,
+        label: String,
+        force: Bool = false,
+        serverURL: String,
+        sourceUpdatedAt: TimeInterval? = nil
+    ) async -> DotWriteOutcome {
+        // An extension write may finish before this process resumes from its
+        // own write, so compare write identities, not async completion times.
+        if let receipt = DotNotificationShared.latestWrite(serverURL: serverURL),
+           Self.sharedWriteInvalidatesCache(
+               receipt, lastWriteID: lastSharedWriteID, lastProgramWrite: lastProgramWrite
+           ) {
+            lastWriteSignature = nil
+        }
         let signature = DotWriteSignature(
             program: program,
             brightness: DotBrightness.configuredValue
@@ -1010,40 +967,51 @@ final class DotStatusMirror: ObservableObject {
             if lastError == nil {
                 if now.timeIntervalSince(lastAttempt) < connectivityProbeSeconds {
                     statusText = label
-                    return true
+                    return .confirmed
                 }
                 lastAttempt = now
                 do {
                     try await DriveWriter.shared.probeAccess()
                     statusText = label
-                    return true
+                    return .confirmed
                 } catch {
                     lastError = error.localizedDescription
                     statusText = "Dot access failed: \(error.localizedDescription)"
-                    return false
+                    return .failed
                 }
             }
             if lastError != nil,
                now.timeIntervalSince(lastAttempt) < errorRetrySeconds {
-                return false
+                return .failed
             }
         }
 
         lastAttempt = now
         lastWriteSignature = signature
+        let context = DotWriteContext(serverURL: serverURL, sourceUpdatedAt: sourceUpdatedAt)
         do {
-            try await DriveWriter.shared.write(program)
+            try await DriveWriter.shared.write(program, context: context)
             lastError = nil
+            lastSharedWriteID = context.writeID
             lastProgramWrite = Date()
             if program.contains("repeat ") {
                 EventLog.append("Dot finite working program refreshed; safety window: 120 minutes")
             }
             statusText = label
-            return true
+            return .confirmed
+        } catch DotNotificationError.superseded {
+            // Another process wrote newer state after this update was queued.
+            // Skip the old command without treating healthy USB access as broken.
+            lastWriteSignature = nil
+            lastSharedWriteID = nil
+            lastError = nil
+            lastAttempt = .distantPast
+            statusText = "Waiting for current Mac state"
+            return .superseded
         } catch {
             lastError = error.localizedDescription
             statusText = "Dot write failed: \(error.localizedDescription)"
-            return false
+            return .failed
         }
     }
 }

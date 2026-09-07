@@ -25,12 +25,16 @@ def swift_binaries(tmp_path_factory):
     for name, sources in {
         "mirror": [
             IOS / "DotStatusMirror.swift",
+            IOS / "DndSchedule.swift",
+            IOS / "DotNotificationShared.swift",
             IOS / "EventLog.swift",
             ROOT / "tests/ios_dot_test_support.swift",
             ROOT / "tests/test_ios_dot_recovery.swift",
         ],
         "writer": [
             IOS / "DriveWriter.swift",
+            IOS / "DndSchedule.swift",
+            IOS / "DotNotificationShared.swift",
             IOS / "EventLog.swift",
             ROOT / "tests/test_ios_drive_writer.swift",
         ],

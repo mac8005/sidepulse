@@ -46,6 +46,36 @@ struct DotRecoveryTests {
         precondition(writer.writes.isEmpty)
         let recovered = await push("working", issued: 100)
         precondition(recovered.result == .written && recovered.availability.available)
+        precondition(writer.contexts.last??.serverURL == model.liveMonitorServerURL)
+        precondition(writer.contexts.last??.sourceUpdatedAt == 100)
+
+        // Main writes A at t1, the extension writes B at t2, and main resumes
+        // at t3. B must invalidate A even though its timestamp is before t3.
+        let mainWriteID = writer.contexts.last!!.writeID
+        let resumedAt = Date(timeIntervalSince1970: 3)
+        let extensionReceipt = DotWriteReceipt(
+            serverURL: model.liveMonitorServerURL, sourceUpdatedAt: 101,
+            completedAt: 2, writeID: "extension-write"
+        )
+        precondition(DotStatusMirror.sharedWriteInvalidatesCache(
+            extensionReceipt, lastWriteID: mainWriteID, lastProgramWrite: resumedAt
+        ), "An extension write before async resumption must invalidate the old program")
+        let ownReceipt = DotWriteReceipt(
+            serverURL: model.liveMonitorServerURL, sourceUpdatedAt: 100,
+            completedAt: 1, writeID: mainWriteID
+        )
+        precondition(!DotStatusMirror.sharedWriteInvalidatesCache(
+            ownReceipt, lastWriteID: mainWriteID, lastProgramWrite: resumedAt
+        ))
+        let legacyReceipt = DotWriteReceipt(
+            serverURL: model.liveMonitorServerURL, sourceUpdatedAt: 100, completedAt: 4
+        )
+        precondition(DotStatusMirror.sharedWriteInvalidatesCache(
+            legacyReceipt, lastWriteID: mainWriteID, lastProgramWrite: resumedAt
+        ), "Old receipts still use timestamp invalidation")
+        precondition(!DotStatusMirror.sharedWriteInvalidatesCache(
+            legacyReceipt, lastWriteID: mainWriteID, lastProgramWrite: Date(timeIntervalSince1970: 5)
+        ))
 
         // Retried working pushes renew the finite program, even if the ACK
         // of the first delivery was lost. Merely probing the folder is not enough.
@@ -61,6 +91,7 @@ struct DotRecoveryTests {
         precondition(refreshed.result == .written && refreshed.availability.available)
         precondition(SnapshotProtocol.requests == 1 && writer.writes.count == beforeStale + 1)
         precondition(writer.writes.last!.contains("repeat "))
+        precondition(writer.contexts.last??.sourceUpdatedAt == 100, "Stale push must use the fetched source revision")
         SnapshotProtocol.snapshot = nil
         let unavailable = await push("completed", issued: 80)
         precondition(unavailable.result == .failed)
@@ -70,6 +101,7 @@ struct DotRecoveryTests {
         SnapshotProtocol.snapshot = AgentSnapshot(aggregateMode: "completed", activeCount: 0, agents: [], updatedAt: 200)
         let allRead = await push("working", issued: 70)
         precondition(allRead.result == .written && writer.writes.last == "off")
+        precondition(writer.contexts.last??.sourceUpdatedAt == 200, "An all-read server state still has a source revision")
 
         // Intentional suppression keeps its lease, even if writing off fails.
         model.dndEnabled = true
@@ -145,6 +177,7 @@ struct DotRecoveryTests {
         precondition(receipts.acknowledgedCommands.contains("mixed"))
         precondition(receipts.programsAtAcknowledgement.last!.contains("0:#39D98A"))
         precondition(receipts.programsAtAcknowledgement.last!.contains("1:#4DA3FF"))
+        precondition(writer.contexts.last??.sourceUpdatedAt == 450)
         mixed.stream.snapshot = AgentSnapshot(aggregateMode: "completed", activeCount: 0, agents: [], updatedAt: 451, dotCommandID: "all-read")
         for _ in 0..<1000 {
             if receipts.acknowledgedCommands.contains("all-read") { break }
@@ -152,6 +185,7 @@ struct DotRecoveryTests {
         }
         precondition(receipts.acknowledgedCommands.contains("all-read"))
         precondition(receipts.programsAtAcknowledgement.last == "off")
+        precondition(writer.contexts.last??.sourceUpdatedAt == 451)
         mixed.suspend()
 
         // A Focus/DND change during USB I/O must not be overwritten by a
@@ -175,6 +209,8 @@ struct DotRecoveryTests {
         }
         for _ in 0..<20 { await Task.yield() }
         precondition(!receipts.acknowledgedCommands.contains("suppressed-during-write"))
+        precondition(writer.contexts.last??.serverURL == model.liveMonitorServerURL)
+        precondition(writer.contexts.last??.sourceUpdatedAt == nil, "Suppression must not reuse the previous session revision")
         suppressedReceipt.suspend()
         model.dndEnabled = false
 
@@ -196,6 +232,59 @@ struct DotRecoveryTests {
         precondition(writer.failuresRemaining == 1, "Repeated snapshots bypassed USB error back-off")
         precondition(!receipts.acknowledgedCommands.contains("failed-write"), "A failed USB write must not be acknowledged")
         failingForeground.suspend()
-        print("Dot recovery tests passed: USB failure, retry, stale refresh, offline ACK, all-read, DND, serialization, finite foreground, retry throttle")
+
+        // A newer extension write can win after the main-app source check but
+        // before coordinated USB access. That is a skipped command, not bad USB.
+        writer.failuresRemaining = 0
+        writer.forcedError = .superseded
+        let racingModel = AppModel()
+        let racingPush = DotStatusMirror()
+        let beforeSupersededPush = writer.writes.count
+        let supersededPush = await racingPush.applyPush(
+            aggregateMode: "completed", hasUnreadFinished: true,
+            commandID: "superseded-push", issuedAt: 700, sourceUpdatedAt: 700,
+            host: host, model: racingModel
+        )
+        precondition(supersededPush.result == .failed && supersededPush.acknowledgementStatus == "failed")
+        precondition(supersededPush.availability == .ready, "A newer extension write must not disable healthy USB delivery")
+        precondition(writer.writes.count == beforeSupersededPush)
+        precondition(UserDefaults.standard.string(forKey: "lastDotPushCommandID.\(host)") != "superseded-push")
+        precondition(racingPush.statusText == "Waiting for current Mac state")
+        writer.forcedError = nil
+        let afterSupersededPush = await racingPush.applyPush(
+            aggregateMode: "completed", hasUnreadFinished: true,
+            commandID: "current-push", issuedAt: 701, sourceUpdatedAt: 701,
+            host: host, model: racingModel
+        )
+        precondition(afterSupersededPush.result == .written && afterSupersededPush.availability == .ready)
+        precondition(writer.writes.count == beforeSupersededPush + 1, "Superseded work must not leave a successful cache entry or error back-off")
+
+        writer.forcedError = .superseded
+        let beforeSupersededStream = writer.writes.count
+        let beforeAvailability = receipts.reportedAvailability.count
+        let beforeSourceRevision = UserDefaults.standard.double(forKey: "lastSuccessfulDotStreamUpdatedAt")
+        let racingStream = DotStatusMirror()
+        racingStream.stream.snapshot = AgentSnapshot(aggregateMode: "completed", activeCount: 0, agents: [], updatedAt: 750, dotCommandID: "superseded-stream")
+        racingStream.stream.state = .live
+        racingStream.start(model: racingModel)
+        for _ in 0..<1000 {
+            if receipts.reportedAvailability.count > beforeAvailability { break }
+            await Task.yield()
+        }
+        precondition(receipts.reportedAvailability.count > beforeAvailability)
+        precondition(receipts.reportedAvailability.dropFirst(beforeAvailability).allSatisfy { $0 == .ready })
+        precondition(!receipts.acknowledgedCommands.contains("superseded-stream"))
+        precondition(writer.writes.count == beforeSupersededStream)
+        precondition(UserDefaults.standard.double(forKey: "lastSuccessfulDotStreamUpdatedAt") == beforeSourceRevision)
+        writer.forcedError = nil
+        racingStream.stream.snapshot = AgentSnapshot(aggregateMode: "completed", activeCount: 0, agents: [], updatedAt: 751, dotCommandID: "current-stream")
+        for _ in 0..<1000 {
+            if receipts.acknowledgedCommands.contains("current-stream") { break }
+            await Task.yield()
+        }
+        precondition(receipts.acknowledgedCommands.contains("current-stream"), "Current state must be writable immediately after a superseded skip")
+        precondition(writer.contexts.last??.sourceUpdatedAt == 751)
+        racingStream.suspend()
+        print("Dot recovery tests passed: USB failure, retry, stale refresh, offline ACK, all-read, DND, serialization, finite foreground, retry throttle, superseded write race, write identity cache")
     }
 }

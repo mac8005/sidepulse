@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import UserNotifications
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -9,6 +10,7 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(pushToken, forKey: Defaults.pushToken)
             mirrorFocusStatusSettings()
+            refreshDotNotificationConfiguration()
         }
     }
 
@@ -28,17 +30,29 @@ final class AppModel: ObservableObject {
     }
 
     @Published var liveMonitorEnabled: Bool {
-        didSet { UserDefaults.standard.set(liveMonitorEnabled, forKey: Defaults.liveMonitorEnabled) }
+        didSet {
+            UserDefaults.standard.set(liveMonitorEnabled, forKey: Defaults.liveMonitorEnabled)
+            refreshDotNotificationConfiguration()
+        }
     }
 
     @Published var liveMonitorServerURL: String {
         didSet {
             UserDefaults.standard.set(liveMonitorServerURL, forKey: Defaults.liveMonitorServerURL)
             mirrorFocusStatusSettings()
+            refreshDotNotificationConfiguration()
         }
     }
 
     // SidePulse Dot behaviour.
+    @Published var dotCompletionAlertsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(dotCompletionAlertsEnabled, forKey: Defaults.dotCompletionAlertsEnabled)
+            refreshDotNotificationConfiguration()
+        }
+    }
+    @Published private(set) var dotCompletionAlertsMessage: String?
+
     @Published var dotBrightness: Int {
         didSet {
             let value = DotBrightness.clamped(dotBrightness)
@@ -46,6 +60,7 @@ final class AppModel: ObservableObject {
                 dotBrightness = value
             }
             DotBrightness.configuredValue = value
+            refreshDotNotificationConfiguration()
         }
     }
 
@@ -56,21 +71,29 @@ final class AppModel: ObservableObject {
                 dotAppearance = value
             }
             persistDotAppearance(value)
+            refreshDotNotificationConfiguration()
         }
     }
 
     @Published var showFinishedEnabled: Bool {
-        didSet { UserDefaults.standard.set(showFinishedEnabled, forKey: Defaults.showFinishedEnabled) }
+        didSet {
+            UserDefaults.standard.set(showFinishedEnabled, forKey: Defaults.showFinishedEnabled)
+            refreshDotNotificationConfiguration()
+        }
     }
 
     @Published var dndEnabled: Bool {
-        didSet { UserDefaults.standard.set(dndEnabled, forKey: Defaults.dndEnabled) }
+        didSet {
+            UserDefaults.standard.set(dndEnabled, forKey: Defaults.dndEnabled)
+            refreshDotNotificationConfiguration()
+        }
     }
 
     @Published var dndScheduleEnabled: Bool {
         didSet {
             UserDefaults.standard.set(dndScheduleEnabled, forKey: Defaults.dndScheduleEnabled)
             rearmDndSchedule()
+            refreshDotNotificationConfiguration()
         }
     }
 
@@ -78,6 +101,7 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(dndStartTime, forKey: Defaults.dndStartTime)
             rearmDndSchedule()
+            refreshDotNotificationConfiguration()
         }
     }
 
@@ -85,11 +109,15 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(dndEndTime, forKey: Defaults.dndEndTime)
             rearmDndSchedule()
+            refreshDotNotificationConfiguration()
         }
     }
 
     @Published var dndLastScheduleTransition: String {
-        didSet { UserDefaults.standard.set(dndLastScheduleTransition, forKey: Defaults.dndLastScheduleTransition) }
+        didSet {
+            UserDefaults.standard.set(dndLastScheduleTransition, forKey: Defaults.dndLastScheduleTransition)
+            refreshDotNotificationConfiguration()
+        }
     }
 
     /// Keep the Dot off while an iOS Focus (Sleep, Do Not Disturb, …) is on.
@@ -97,6 +125,7 @@ final class AppModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(focusDndEnabled, forKey: Defaults.focusDndEnabled)
             mirrorFocusStatusSettings()
+            refreshDotNotificationConfiguration()
         }
     }
 
@@ -106,6 +135,9 @@ final class AppModel: ObservableObject {
         didSet { persistReceivedPushes() }
     }
 
+    private var dotCompletionAlertsAuthorizationRequest: UUID?
+    private var isApplyingDndSchedule = false
+
     private enum Defaults {
         static let pushToken = "pushToken"
         static let ledText = "ledText"
@@ -114,6 +146,7 @@ final class AppModel: ObservableObject {
         static let receivedPushes = "receivedPushes"
         static let liveMonitorEnabled = "liveMonitorEnabled"
         static let liveMonitorServerURL = "liveMonitorServerURL"
+        static let dotCompletionAlertsEnabled = "dotCompletionAlertsEnabled"
         static let dotAnimation = "dotAnimation"
         static let dotWorkingColor = "dotWorkingColor"
         static let dotNeedsInputColor = "dotNeedsInputColor"
@@ -141,6 +174,7 @@ final class AppModel: ObservableObject {
         self.liveMonitorEnabled = defaults.bool(forKey: Defaults.liveMonitorEnabled)
         self.liveMonitorServerURL = defaults.string(forKey: Defaults.liveMonitorServerURL)
             ?? "http://macmini8005:8787"
+        self.dotCompletionAlertsEnabled = defaults.bool(forKey: Defaults.dotCompletionAlertsEnabled)
         self.dotBrightness = DotBrightness.configuredValue
         let savedAnimation = defaults.string(forKey: Defaults.dotAnimation)
             .flatMap(DotAnimation.init(rawValue:))
@@ -164,10 +198,102 @@ final class AppModel: ObservableObject {
         persistDotAppearance(dotAppearance)
         refreshFolderStatus()
         mirrorFocusStatusSettings()
+        if dotCompletionAlertsEnabled {
+            setDotCompletionAlertsEnabled(true)
+        }
     }
 
     func resetDotAppearance() {
         dotAppearance = .defaults
+    }
+
+    func setDotCompletionAlertsEnabled(_ enabled: Bool) {
+        dotCompletionAlertsMessage = nil
+        let requestID = UUID()
+        dotCompletionAlertsAuthorizationRequest = requestID
+        guard enabled else {
+            dotCompletionAlertsEnabled = false
+            return
+        }
+        guard #available(iOS 17.2, *) else {
+            disableDotCompletionAlerts(
+                "Completion notifications are off: this experimental feature requires iOS 17.2 or later."
+            )
+            return
+        }
+        Task {
+            do {
+                let center = UNUserNotificationCenter.current()
+                let granted = try await center.requestAuthorization(options: [.alert])
+                let settings = await center.notificationSettings()
+                guard dotCompletionAlertsAuthorizationRequest == requestID else { return }
+                guard granted, settings.alertSetting == .enabled else {
+                    disableDotCompletionAlerts(
+                        "Completion notifications are off: notification alerts are disabled. Enable alerts for SidePulse in iOS Settings and try again."
+                    )
+                    return
+                }
+                dotCompletionAlertsEnabled = true
+                if dotCompletionAlertsEnabled {
+                    dotCompletionAlertsMessage = nil
+                    UIApplication.shared.registerForRemoteNotifications()
+                }
+            } catch {
+                guard dotCompletionAlertsAuthorizationRequest == requestID else { return }
+                disableDotCompletionAlerts(
+                    "Completion notifications are off: notification permission could not be checked (\(error.localizedDescription)). Try again."
+                )
+            }
+        }
+    }
+
+    func refreshDotNotificationConfiguration() {
+        guard !isApplyingDndSchedule else { return }
+        let modes = [
+            "idle_ready", "working", "tool_running", "long_task_progress",
+            "completed", "waiting_for_input", "blocked_error"
+        ]
+        var programs: [String: String] = [:]
+        for mode in modes {
+            for unread in [false, true] {
+                programs[mode + (unread ? ":unread" : ":read")] = DotPrograms.program(
+                    for: LedDisplayState.forMode(mode),
+                    appearance: dotAppearance,
+                    finiteWorking: true,
+                    showFinished: showFinishedEnabled,
+                    hasUnreadFinished: unread
+                )
+            }
+        }
+        let enabled = dotCompletionAlertsEnabled
+        let configuration = DotNotificationConfiguration(
+            enabled: enabled,
+            serverURL: liveMonitorServerURL,
+            pushToken: pushToken,
+            bookmark: enabled ? DriveWriter.shared.savedBookmark : nil,
+            brightness: dotBrightness,
+            programs: programs,
+            dndEnabled: dndEnabled,
+            scheduleEnabled: dndScheduleEnabled,
+            scheduleStart: dndStartTime,
+            scheduleEnd: dndEndTime,
+            scheduleTransition: dndLastScheduleTransition,
+            focusEnabled: focusDndEnabled
+        )
+        if !DotNotificationShared.store(configuration), dotCompletionAlertsEnabled {
+            disableDotCompletionAlerts(
+                "Completion notifications are off: the background Dot configuration could not be saved. Try enabling the option again."
+            )
+        }
+    }
+
+    private func disableDotCompletionAlerts(_ message: String) {
+        dotCompletionAlertsAuthorizationRequest = nil
+        dotCompletionAlertsEnabled = false
+        dotCompletionAlertsMessage = message
+        EventLog.append(message)
+        lastMessage = message
+        refreshEventLog()
     }
 
     private func persistDotAppearance(_ appearance: DotAppearance) {
@@ -190,6 +316,11 @@ final class AppModel: ObservableObject {
               let transition = DndSchedule.latestTransition(startTime: dndStartTime, endTime: dndEndTime, now: now),
               transition.key != dndLastScheduleTransition
         else { return false }
+        isApplyingDndSchedule = true
+        defer {
+            isApplyingDndSchedule = false
+            refreshDotNotificationConfiguration()
+        }
         dndLastScheduleTransition = transition.key
         if dndEnabled != transition.enabled {
             dndEnabled = transition.enabled
@@ -220,6 +351,7 @@ final class AppModel: ObservableObject {
     func refreshFolderStatus() {
         hasFolderAccess = DriveWriter.shared.hasSavedFolder
         selectedFolderPath = DriveWriter.shared.savedFolderDisplayName
+        refreshDotNotificationConfiguration()
     }
 
     func recordWriteSuccess(_ message: String) {

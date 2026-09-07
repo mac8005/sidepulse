@@ -577,6 +577,7 @@ private struct SettingsView: View {
             "Brightness: \(model.dotBrightness)/\(DotBrightness.maximum)",
             "Animation: \(model.dotAppearance.animation.rawValue)",
             "Show finished: \(model.showFinishedEnabled)",
+            "Completion notifications: \(model.dotCompletionAlertsEnabled)",
             "DND: \(model.dndEnabled)",
             "DND schedule: \(model.dndScheduleEnabled), \(model.dndStartTime)–\(model.dndEndTime)",
             "Off during Focus: \(model.focusDndEnabled)",
@@ -790,6 +791,21 @@ struct DotBehaviorControls: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+
+        Toggle("Completion notifications", isOn: Binding(
+            get: { model.dotCompletionAlertsEnabled },
+            set: { model.setDotCompletionAlertsEnabled($0) }
+        ))
+
+        if let message = model.dotCompletionAlertsMessage {
+            Text(message)
+                .font(.footnote)
+                .foregroundStyle(.orange)
+        }
+
+        Text("Experimental: sends a soundless notification and tries to update the Dot in the background. Requires notification alerts.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
 
         Toggle("DND On", isOn: $model.dndEnabled)
 

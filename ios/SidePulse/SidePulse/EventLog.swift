@@ -26,13 +26,15 @@ enum EventLog {
     static func entries() -> [String] {
         lock.lock()
         defer { lock.unlock() }
-        return UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+        let local = UserDefaults.standard.stringArray(forKey: defaultsKey) ?? []
+        return (local + DotNotificationShared.logEntries()).sorted()
     }
 
     static func clear() {
         lock.lock()
         defer { lock.unlock() }
         UserDefaults.standard.removeObject(forKey: defaultsKey)
+        DotNotificationShared.clearLog()
     }
 
     static func export(

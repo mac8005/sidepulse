@@ -48,6 +48,13 @@
         9F0000010000000000000039 /* FocusStatusShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000138 /* FocusStatusShared.swift */; };
         9F000001000000000000003A /* IntentHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000139 /* IntentHandler.swift */; };
         9F000001000000000000003B /* SidePulseFocusIntent.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F000001000000000000013C /* SidePulseFocusIntent.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+        9F000001000000000000003E /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F000001000000000000013F /* NotificationService.swift */; };
+        9F000001000000000000003F /* DotNotificationShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000140 /* DotNotificationShared.swift */; };
+        9F0000010000000000000040 /* DotNotificationShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000140 /* DotNotificationShared.swift */; };
+        9F0000010000000000000041 /* DriveWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000104 /* DriveWriter.swift */; };
+        9F0000010000000000000042 /* DotNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000143 /* DotNotificationService.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+        9F0000010000000000000043 /* DndSchedule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000144 /* DndSchedule.swift */; };
+        9F0000010000000000000044 /* DndSchedule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000144 /* DndSchedule.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -79,6 +86,13 @@
             remoteGlobalIDString = 9F0000010000000000000405;
             remoteInfo = SidePulseFocusIntent;
         };
+        9F000001000000000000041A /* PBXContainerItemProxy */ = {
+            isa = PBXContainerItemProxy;
+            containerPortal = 9F0000010000000000000701 /* Project object */;
+            proxyType = 1;
+            remoteGlobalIDString = 9F0000010000000000000406;
+            remoteInfo = DotNotificationService;
+        };
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -90,6 +104,7 @@
             files = (
                 9F0000010000000000000016 /* SidePulseWidgets.appex in Embed Foundation Extensions */,
                 9F000001000000000000003B /* SidePulseFocusIntent.appex in Embed Foundation Extensions */,
+                9F0000010000000000000042 /* DotNotificationService.appex in Embed Foundation Extensions */,
             );
             name = "Embed Foundation Extensions";
             runOnlyForDeploymentPostprocessing = 0;
@@ -163,6 +178,12 @@
         9F000001000000000000013A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
         9F000001000000000000013B /* SidePulseFocusIntent.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = SidePulseFocusIntent.entitlements; sourceTree = "<group>"; };
         9F000001000000000000013C /* SidePulseFocusIntent.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SidePulseFocusIntent.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+        9F000001000000000000013F /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+        9F0000010000000000000140 /* DotNotificationShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DotNotificationShared.swift; sourceTree = "<group>"; };
+        9F0000010000000000000141 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+        9F0000010000000000000142 /* DotNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = DotNotificationService.entitlements; sourceTree = "<group>"; };
+        9F0000010000000000000143 /* DotNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = DotNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+        9F0000010000000000000144 /* DndSchedule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DndSchedule.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -201,6 +222,13 @@
             );
             runOnlyForDeploymentPostprocessing = 0;
         };
+        9F0000010000000000000206 /* Frameworks */ = {
+            isa = PBXFrameworksBuildPhase;
+            buildActionMask = 2147483647;
+            files = (
+            );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -212,6 +240,7 @@
                 9F0000010000000000000305 /* SidePulseWatch */,
                 9F0000010000000000000306 /* SidePulseWatchWidgets */,
                 9F0000010000000000000308 /* SidePulseFocusIntent */,
+                9F0000010000000000000309 /* DotNotificationService */,
                 9F0000010000000000000303 /* Products */,
             );
             sourceTree = "<group>";
@@ -235,6 +264,8 @@
                 9F000001000000000000013D /* UsageClient.swift */,
                 9F000001000000000000013E /* UsageSection.swift */,
                 9F0000010000000000000134 /* DotStatusMirror.swift */,
+                9F0000010000000000000140 /* DotNotificationShared.swift */,
+                9F0000010000000000000144 /* DndSchedule.swift */,
                 9F0000010000000000000138 /* FocusStatusShared.swift */,
                 9F0000010000000000000126 /* WatchRelay.swift */,
                 9F0000010000000000000307 /* Sounds */,
@@ -253,6 +284,7 @@
                 9F0000010000000000000123 /* SidePulseWatch.app */,
                 9F0000010000000000000129 /* SidePulseWatchWidgets.appex */,
                 9F000001000000000000013C /* SidePulseFocusIntent.appex */,
+                9F0000010000000000000143 /* DotNotificationService.appex */,
             );
             name = Products;
             sourceTree = "<group>";
@@ -310,6 +342,16 @@
             path = SidePulseFocusIntent;
             sourceTree = "<group>";
         };
+        9F0000010000000000000309 /* DotNotificationService */ = {
+            isa = PBXGroup;
+            children = (
+                9F000001000000000000013F /* NotificationService.swift */,
+                9F0000010000000000000141 /* Info.plist */,
+                9F0000010000000000000142 /* DotNotificationService.entitlements */,
+            );
+            path = DotNotificationService;
+            sourceTree = "<group>";
+        };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -329,6 +371,7 @@
                 9F0000010000000000000411 /* PBXTargetDependency */,
                 9F0000010000000000000413 /* PBXTargetDependency */,
                 9F0000010000000000000417 /* PBXTargetDependency */,
+                9F0000010000000000000419 /* PBXTargetDependency */,
             );
             name = SidePulse;
             productName = SidePulse;
@@ -405,6 +448,23 @@
             productReference = 9F000001000000000000013C /* SidePulseFocusIntent.appex */;
             productType = "com.apple.product-type.app-extension";
         };
+        9F0000010000000000000406 /* DotNotificationService */ = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = 9F0000010000000000000907 /* Build configuration list for PBXNativeTarget "DotNotificationService" */;
+            buildPhases = (
+                9F0000010000000000000506 /* Sources */,
+                9F0000010000000000000206 /* Frameworks */,
+                9F0000010000000000000609 /* Resources */,
+            );
+            buildRules = (
+            );
+            dependencies = (
+            );
+            name = DotNotificationService;
+            productName = DotNotificationService;
+            productReference = 9F0000010000000000000143 /* DotNotificationService.appex */;
+            productType = "com.apple.product-type.app-extension";
+        };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -419,6 +479,9 @@
                         CreatedOnToolsVersion = 15.3;
                     };
                     9F0000010000000000000405 = {
+                        CreatedOnToolsVersion = 15.3;
+                    };
+                    9F0000010000000000000406 = {
                         CreatedOnToolsVersion = 15.3;
                     };
                 };
@@ -441,6 +504,7 @@
                 9F0000010000000000000403 /* SidePulseWatch */,
                 9F0000010000000000000404 /* SidePulseWatchWidgets */,
                 9F0000010000000000000405 /* SidePulseFocusIntent */,
+                9F0000010000000000000406 /* DotNotificationService */,
             );
         };
 /* End PBXProject section */
@@ -486,6 +550,13 @@
             );
             runOnlyForDeploymentPostprocessing = 0;
         };
+        9F0000010000000000000609 /* Resources */ = {
+            isa = PBXResourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = (
+            );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -509,6 +580,8 @@
                 9F000001000000000000003C /* UsageClient.swift in Sources */,
                 9F000001000000000000003D /* UsageSection.swift in Sources */,
                 9F0000010000000000000034 /* DotStatusMirror.swift in Sources */,
+                9F000001000000000000003F /* DotNotificationShared.swift in Sources */,
+                9F0000010000000000000043 /* DndSchedule.swift in Sources */,
                 9F0000010000000000000038 /* FocusStatusShared.swift in Sources */,
                 9F0000010000000000000024 /* WatchRelay.swift in Sources */,
             );
@@ -556,6 +629,17 @@
             );
             runOnlyForDeploymentPostprocessing = 0;
         };
+        9F0000010000000000000506 /* Sources */ = {
+            isa = PBXSourcesBuildPhase;
+            buildActionMask = 2147483647;
+            files = (
+                9F000001000000000000003E /* NotificationService.swift in Sources */,
+                9F0000010000000000000040 /* DotNotificationShared.swift in Sources */,
+                9F0000010000000000000041 /* DriveWriter.swift in Sources */,
+                9F0000010000000000000044 /* DndSchedule.swift in Sources */,
+            );
+            runOnlyForDeploymentPostprocessing = 0;
+        };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -578,6 +662,11 @@
             isa = PBXTargetDependency;
             target = 9F0000010000000000000405 /* SidePulseFocusIntent */;
             targetProxy = 9F0000010000000000000418 /* PBXContainerItemProxy */;
+        };
+        9F0000010000000000000419 /* PBXTargetDependency */ = {
+            isa = PBXTargetDependency;
+            target = 9F0000010000000000000406 /* DotNotificationService */;
+            targetProxy = 9F000001000000000000041A /* PBXContainerItemProxy */;
         };
 /* End PBXTargetDependency section */
 
@@ -989,6 +1078,62 @@
             };
             name = Release;
         };
+        9F000001000000000000080D /* Debug */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                APPLICATION_EXTENSION_API_ONLY = YES;
+                CODE_SIGN_ENTITLEMENTS = DotNotificationService/DotNotificationService.entitlements;
+                CODE_SIGN_STYLE = Automatic;
+                CURRENT_PROJECT_VERSION = 1;
+                DEVELOPMENT_TEAM = "";
+                GENERATE_INFOPLIST_FILE = NO;
+                INFOPLIST_FILE = DotNotificationService/Info.plist;
+                IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+                LD_RUNPATH_SEARCH_PATHS = (
+                    "$(inherited)",
+                    "@executable_path/Frameworks",
+                    "@executable_path/../../Frameworks",
+                );
+                MARKETING_VERSION = 1.0;
+                PRODUCT_BUNDLE_IDENTIFIER = "$(SIDEPULSE_APP_BUNDLE_ID).DotNotificationService";
+                PRODUCT_NAME = DotNotificationService;
+                PROVISIONING_PROFILE_SPECIFIER = "$(SIDEPULSE_NOTIFICATION_PROFILE)";
+                SKIP_INSTALL = YES;
+                SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) SIDEPULSE_NOTIFICATION_EXTENSION";
+                SWIFT_EMIT_LOC_STRINGS = YES;
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+            };
+            name = Debug;
+        };
+        9F000001000000000000080E /* Release */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                APPLICATION_EXTENSION_API_ONLY = YES;
+                CODE_SIGN_ENTITLEMENTS = DotNotificationService/DotNotificationService.entitlements;
+                CODE_SIGN_STYLE = Automatic;
+                CURRENT_PROJECT_VERSION = 1;
+                DEVELOPMENT_TEAM = "";
+                GENERATE_INFOPLIST_FILE = NO;
+                INFOPLIST_FILE = DotNotificationService/Info.plist;
+                IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+                LD_RUNPATH_SEARCH_PATHS = (
+                    "$(inherited)",
+                    "@executable_path/Frameworks",
+                    "@executable_path/../../Frameworks",
+                );
+                MARKETING_VERSION = 1.0;
+                PRODUCT_BUNDLE_IDENTIFIER = "$(SIDEPULSE_APP_BUNDLE_ID).DotNotificationService";
+                PRODUCT_NAME = DotNotificationService;
+                PROVISIONING_PROFILE_SPECIFIER = "$(SIDEPULSE_NOTIFICATION_PROFILE)";
+                SKIP_INSTALL = YES;
+                SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) SIDEPULSE_NOTIFICATION_EXTENSION";
+                SWIFT_EMIT_LOC_STRINGS = YES;
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+            };
+            name = Release;
+        };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1042,6 +1187,15 @@
             buildConfigurations = (
                 9F000001000000000000080B /* Debug */,
                 9F000001000000000000080C /* Release */,
+            );
+            defaultConfigurationIsVisible = 0;
+            defaultConfigurationName = Release;
+        };
+        9F0000010000000000000907 /* Build configuration list for PBXNativeTarget "DotNotificationService" */ = {
+            isa = XCConfigurationList;
+            buildConfigurations = (
+                9F000001000000000000080D /* Debug */,
+                9F000001000000000000080E /* Release */,
             );
             defaultConfigurationIsVisible = 0;
             defaultConfigurationName = Release;

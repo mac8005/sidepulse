@@ -77,6 +77,8 @@ final class DriveWriter: @unchecked Sendable {
         UserDefaults.standard.data(forKey: bookmarkKey) != nil
     }
 
+    var savedBookmark: Data? { UserDefaults.standard.data(forKey: bookmarkKey) }
+
     var savedFolderDisplayName: String {
         guard let url = try? resolveFolderURL() else {
             return "No USB folder selected"
@@ -108,14 +110,19 @@ final class DriveWriter: @unchecked Sendable {
     }
 
     @discardableResult
-    func write(_ text: String) async throws -> URL {
+    func write(
+        _ text: String,
+        brightness: Int? = nil,
+        context: DotWriteContext? = nil,
+        bookmark: Data? = nil
+    ) async throws -> URL {
         let normalizedProgram = normalizeLEDText(text)
         let trimmed = normalizedProgram.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw DriveWriterError.missingText
         }
 
-        let program = DotBrightness.apply(to: normalizedProgram)
+        let program = DotBrightness.apply(to: normalizedProgram, brightness: brightness)
 
         let byteCount = program.data(using: .utf8)?.count ?? 0
         guard byteCount <= maxLEDBytes else {
@@ -128,12 +135,15 @@ final class DriveWriter: @unchecked Sendable {
         }
 
         let data = Data(program.utf8)
+        let writeContext = context ?? DotNotificationShared.settings.map {
+            DotWriteContext(serverURL: $0.configuration.serverURL)
+        }
         return try await withCheckedThrowingContinuation { continuation in
             ioQueue.async {
                 continuation.resume(with: Result {
-                    try self.withFolderAccess { folderURL in
+                    try self.withFolderAccess(bookmark: bookmark) { folderURL in
                         let targetURL = folderURL.appendingPathComponent(self.fileName, isDirectory: false)
-                        try Self.coordinatedWrite(data, to: targetURL)
+                        try Self.coordinatedWrite(data, to: targetURL, context: writeContext)
                         EventLog.append("Wrote \(data.count) bytes to \(targetURL.lastPathComponent)")
                         return targetURL
                     }
@@ -167,17 +177,21 @@ final class DriveWriter: @unchecked Sendable {
 
     /// The coordinator's URL may differ from the bookmark URL. Write in place:
     /// the Dot firmware consumes LEDS.LED, not an atomically renamed temp file.
-    static func coordinatedWrite(_ data: Data, to targetURL: URL) throws {
+    static func coordinatedWrite(_ data: Data, to targetURL: URL, context: DotWriteContext? = nil) throws {
         var coordinationError: NSError?
         var writeError: Error?
         NSFileCoordinator().coordinate(writingItemAt: targetURL, options: [], error: &coordinationError) { url in
-            do { try data.write(to: url) }
+            do {
+                if let context { try DotNotificationShared.validateWrite(context) }
+                try data.write(to: url)
+                if let context { try DotNotificationShared.recordWrite(context) }
+            }
             catch { writeError = error }
         }
         if let error = coordinationError ?? writeError { throw error }
     }
 
-    private func withFolderAccess<T>(_ operation: (URL) throws -> T) throws -> T {
+    private func withFolderAccess<T>(bookmark: Data? = nil, _ operation: (URL) throws -> T) throws -> T {
         folderLock.lock()
         defer { folderLock.unlock() }
         // Reuse the resolved security-scoped URL across background wakes. On
@@ -185,7 +199,7 @@ final class DriveWriter: @unchecked Sendable {
         for attempt in 0...1 {
             var stage = "bookmark"
             do {
-                let folderURL = try resolveFolderURL()
+                let folderURL = try resolveFolderURL(bookmark: bookmark)
                 stage = "permission"
                 guard folderURL.startAccessingSecurityScopedResource() else {
                     throw DriveWriterError.accessDenied
@@ -194,6 +208,7 @@ final class DriveWriter: @unchecked Sendable {
                 stage = "coordinated access"
                 return try operation(folderURL)
             } catch {
+                if error is DotNotificationError { throw error }
                 cachedFolderURL = nil
                 cachedBookmark = nil
                 let detail = error as NSError
@@ -204,10 +219,10 @@ final class DriveWriter: @unchecked Sendable {
         throw DriveWriterError.accessDenied
     }
 
-    private func resolveFolderURL() throws -> URL {
+    private func resolveFolderURL(bookmark explicitBookmark: Data? = nil) throws -> URL {
         folderLock.lock()
         defer { folderLock.unlock() }
-        guard let bookmark = UserDefaults.standard.data(forKey: bookmarkKey) else {
+        guard let bookmark = explicitBookmark ?? UserDefaults.standard.data(forKey: bookmarkKey) else {
             throw DriveWriterError.noFolderSelected
         }
         if bookmark == cachedBookmark, let cachedFolderURL { return cachedFolderURL }
@@ -226,7 +241,7 @@ final class DriveWriter: @unchecked Sendable {
             }
             defer { url.stopAccessingSecurityScopedResource() }
             let renewed = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
-            UserDefaults.standard.set(renewed, forKey: bookmarkKey)
+            if explicitBookmark == nil { UserDefaults.standard.set(renewed, forKey: bookmarkKey) }
             cachedBookmark = renewed
             EventLog.append("Renewed stale USB folder bookmark")
         } else {

@@ -45,8 +45,11 @@ final class LiveMonitorManager {
     static let shared = LiveMonitorManager()
     var acknowledgedCommands: [String] = []
     var programsAtAcknowledgement: [String] = []
+    var reportedAvailability: [DotAvailability] = []
     func ensureDotDeviceRegistration(model: AppModel) {}
-    func reportDotAvailability(_ availability: DotAvailability, model: AppModel) {}
+    func reportDotAvailability(_ availability: DotAvailability, model: AppModel) {
+        reportedAvailability.append(availability)
+    }
     func acknowledgeDot(commandID: String, status: String, availability: DotAvailability, model: AppModel) async {
         precondition(availability.available)
         acknowledgedCommands.append(commandID)
@@ -62,13 +65,15 @@ enum DotBrightness {
 final class DriveWriter {
     static let shared = DriveWriter()
     var writes: [String] = []
+    var contexts: [DotWriteContext?] = []
     var failuresRemaining = 0
+    var forcedError: DotNotificationError?
     var paused = false
     var continuation: CheckedContinuation<Void, Never>?
     var activeWrites = 0
     var maxConcurrentWrites = 0
 
-    func write(_ program: String) async throws {
+    func write(_ program: String, brightness: Int? = nil, context: DotWriteContext? = nil) async throws {
         activeWrites += 1
         maxConcurrentWrites = max(maxConcurrentWrites, activeWrites)
         defer { activeWrites -= 1 }
@@ -80,7 +85,11 @@ final class DriveWriter {
             failuresRemaining -= 1
             throw CocoaError(.fileWriteNoPermission)
         }
+        if let forcedError {
+            throw forcedError
+        }
         writes.append(program)
+        contexts.append(context)
     }
     func probeAccess() async throws {}
 }

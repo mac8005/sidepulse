@@ -8,8 +8,8 @@ struct FocusStatusReportingConfiguration: Codable {
 }
 
 /// The Focus intent runs outside the app process. Keep only the three values
-/// it needs in a shared Keychain item; the Dot folder bookmark remains
-/// private to the main app.
+/// it needs in a dedicated shared Keychain item. The optional Dot notification
+/// extension has its own separate configuration item.
 enum FocusStatusShared {
     private static let accessGroupInfoKey = "SidePulseFocusKeychainAccessGroup"
     private static let service = "io.sidepulse.focus-status"

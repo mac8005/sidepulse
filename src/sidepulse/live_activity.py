@@ -125,6 +125,8 @@ DOT_PUSH_RETRY_OFFSETS_SECONDS = (0.0, 2 * 60.0, 20 * 60.0)
 DOT_RESYNC_COOLDOWN_SECONDS = 60.0
 DOT_WORKING_REFRESH_SECONDS = 20 * 60.0
 DOT_COLLAPSE_ID = "sidepulse-dot-state"
+DOT_COMPLETION_COLLAPSE_ID = "sidepulse-dot-completion"
+DOT_COMPLETION_HISTORY_LIMIT = 256
 DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
 DOT_UNAVAILABLE_MIN_SECONDS = 60.0
 DOT_UNAVAILABLE_MAX_SECONDS = 24 * 60 * 60.0
@@ -150,6 +152,13 @@ DOT_UNAVAILABLE_METADATA_KEYS = (
     "dot_schedule_reported_at",
     "dot_focus_active",
     "dot_focus_reported_at",
+    "dot_dnd_active",
+)
+DOT_COMPLETION_METADATA_KEYS = (
+    "dot_completion_alerts_enabled",
+    "dot_completion_alerts_reported_at",
+    "dot_completion_seen",
+    "dot_completion_seen_cutoff",
 )
 
 # Modes worth interrupting the user for, and their notification titles.
@@ -365,6 +374,21 @@ def _parse_dot_focus(body: dict[str, Any]) -> tuple[bool, float]:
     if reported_at > time.time() + DOT_REPORTED_AT_MAX_FUTURE_SECONDS:
         raise ValueError("reportedAt is too far in the future")
     return focused, float(reported_at)
+
+
+def _parse_dot_completion_alerts(body: dict[str, Any]) -> bool | None:
+    value = body.get("dotCompletionAlertsEnabled")
+    if "dotCompletionAlertsEnabled" in body and not isinstance(value, bool):
+        raise ValueError("dotCompletionAlertsEnabled must be a boolean")
+    reported_at = body.get("reportedAt")
+    if value is not None and reported_at is not None and (
+        isinstance(reported_at, bool)
+        or not isinstance(reported_at, (int, float))
+        or not math.isfinite(reported_at)
+        or reported_at > time.time() + DOT_REPORTED_AT_MAX_FUTURE_SECONDS
+    ):
+        raise ValueError("invalid completion preference reportedAt")
+    return value
 
 
 def _log(message: str) -> None:
@@ -1711,6 +1735,7 @@ class LiveActivityDaemon:
         self._last_dot_resync_at = 0.0
         self._last_dot_working_ack_at: float | None = None
         self._dot_streams: dict[str, int] = {}
+        self._dot_completion_owner: str | None = None
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -1874,6 +1899,7 @@ class LiveActivityDaemon:
         dot_state = display_state_for_mode(snapshot.aggregate.mode).value
         dot_state, dot_content_state = _normalize_dot_state(dot_state, content_state)
         self._observe_dot_state(dot_state, dot_content_state, now)
+        self._maybe_send_dot_completion_alert(dot_state, dot_content_state, now)
         self._send_pending_dot_if_due(now)
 
         if active:
@@ -3183,6 +3209,186 @@ class LiveActivityDaemon:
             self._condition.notify_all()
         return True
 
+    def report_dot_completion_alerts(
+        self, token: str, enabled: bool, reported_at: float | None = None
+    ) -> bool:
+        """Only an explicit owner preference enables visible completion alerts."""
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries or next(iter(entries)) != token:
+                return False
+            previous_time = entries[token].get("dot_completion_alerts_reported_at")
+            if isinstance(previous_time, (int, float)) and (
+                reported_at is None or reported_at < previous_time
+            ):
+                return False
+            previous = entries[token].get("dot_completion_alerts_enabled") is True
+            if previous != enabled:
+                self._dot_completion_owner = None
+            values = {"dot_completion_alerts_enabled": enabled}
+            if reported_at is not None:
+                values["dot_completion_alerts_reported_at"] = reported_at
+            return self.tokens.update_metadata("dot_device", token, values)
+
+    def _dot_completion_unavailability(self, now: float) -> str | None:
+        owner, unavailable_until, reason, _ = self._dot_owner_availability(now)
+        if owner is None:
+            return "no_device"
+        if unavailable_until is not None:
+            return reason
+        metadata = self.tokens.entries("dot_device").get(owner, {})
+        if metadata.get("dot_focus_active") is True and (
+            metadata.get("dot_focus_reported_at", 0)
+            >= metadata.get("dot_client_reported_at", 0)
+        ):
+            return "focus"
+        transition_at = metadata.get("dot_next_dnd_transition_at")
+        if metadata.get("dot_dnd_active") is True or (
+            metadata.get("dot_dnd_schedule_enabled") is True
+            and metadata.get("dot_next_dnd_transition_enabled") is True
+            and isinstance(transition_at, (int, float))
+            and transition_at <= now
+        ):
+            return "dnd"
+        if self._dot_owner_stream_count() > 0:
+            return "foreground"
+        return None
+
+    def _dot_payload(
+        self, pending: PendingDotPush, content_state: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        content = pending.content_state if content_state is None else content_state
+        return {
+            "aggregateMode": content["aggregateMode"],
+            "activeCount": content["activeCount"],
+            "hasUnreadFinished": pending.has_unread_finished,
+            "host": self.config.host_label,
+            "updatedAt": content["updatedAt"],
+            "commandID": pending.command_id,
+            "issuedAt": pending.issued_at,
+        }
+
+    def dot_command(
+        self, token: str | None, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Read the current command without reviving or sending an old push."""
+        moment = time.time() if now is None else now
+        with self._condition:
+            latest = self._latest
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if (
+                not token or len(token) > DOT_STREAM_TOKEN_MAX_CHARS
+                or not entries or next(iter(entries)) != token
+            ):
+                return None
+            enabled = entries[token].get("dot_completion_alerts_enabled") is True
+            reason = self._dot_completion_unavailability(moment)
+            pending = self._pending_dot
+            dot = None
+            if (
+                enabled and reason is None and latest is not None
+                and pending is not None
+                and moment < pending.created_at + DOT_PUSH_EXPIRY_SECONDS
+            ):
+                state, content = _normalize_dot_state(
+                    display_state_for_mode(AgentMode(latest["aggregateMode"])).value,
+                    latest,
+                )
+                if (
+                    (state, _has_unread_finished(content))
+                    == (pending.state, pending.has_unread_finished)
+                    and content["updatedAt"] >= pending.content_state["updatedAt"]
+                ):
+                    dot = self._dot_payload(pending, content)
+            return {
+                "dot": dot,
+                "available": reason is None,
+                "unavailableReason": reason,
+                "completionAlertsEnabled": enabled,
+            }
+
+    def _maybe_send_dot_completion_alert(
+        self, dot_state: str, content_state: dict[str, Any], now: float
+    ) -> bool:
+        """One soundless visible alert for newly observed completion generations."""
+        with self._dot_lock:
+            entries = self.tokens.entries("dot_device")
+            if not entries:
+                self._dot_completion_owner = None
+                return False
+            owner, metadata = next(iter(entries.items()))
+            previous = metadata.get("dot_completion_seen", {})
+            seen = {
+                key: float(value) for key, value in previous.items()
+                if isinstance(key, str) and isinstance(value, (int, float))
+                and not isinstance(value, bool) and math.isfinite(value)
+            } if isinstance(previous, dict) else {}
+            cutoff = metadata.get("dot_completion_seen_cutoff", 0.0)
+            if not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff):
+                cutoff = 0.0
+            fresh = False
+            for row in content_state.get("agents", []):
+                finished_at = row.get("finishedAt")
+                agent_id = row.get("id")
+                if (
+                    row.get("mode") != "completed"
+                    or not isinstance(agent_id, str)
+                    or isinstance(finished_at, bool)
+                    or not isinstance(finished_at, (int, float))
+                    or not math.isfinite(finished_at)
+                ):
+                    continue
+                if finished_at > max(seen.get(agent_id, cutoff), cutoff):
+                    fresh = fresh or row.get("unread") is True
+                    seen[agent_id] = float(finished_at)
+            ordered = sorted(seen.items(), key=lambda item: item[1], reverse=True)
+            if len(ordered) > DOT_COMPLETION_HISTORY_LIMIT:
+                cutoff = max(cutoff, ordered[DOT_COMPLETION_HISTORY_LIMIT][1])
+            seen = dict(ordered[:DOT_COMPLETION_HISTORY_LIMIT])
+            if seen != previous or cutoff != metadata.get("dot_completion_seen_cutoff", 0):
+                self.tokens.update_metadata("dot_device", owner, {
+                    "dot_completion_seen": seen,
+                    "dot_completion_seen_cutoff": cutoff,
+                })
+            baseline = self._dot_completion_owner != owner
+            self._dot_completion_owner = owner
+            # Consume identities even while opted out, in the foreground, or
+            # suppressed. Enabling alerts or lifting Focus never replays them.
+            if (
+                baseline or not fresh
+                or metadata.get("dot_completion_alerts_enabled") is not True
+                or self._dot_completion_unavailability(now) is not None
+            ):
+                return False
+            self._queue_dot_state(dot_state, content_state, now, force=True)
+            pending = self._pending_dot
+            payload = {
+                "aps": {
+                    "alert": {
+                        "title": "Session finished",
+                        "body": "Open SidePulse to view the result.",
+                    },
+                    "mutable-content": 1,
+                    "thread-id": DOT_COMPLETION_COLLAPSE_ID,
+                },
+                "dot": self._dot_payload(pending),
+            }
+        _log(f"dot completion alert -> command {pending.command_id[:8]}")
+        accepted = self._apns_fanout(
+            "dot_device", payload, priority=10, push_type="alert",
+            topic=self.config.bundle_id,
+            expiration=int(pending.created_at + DOT_PUSH_EXPIRY_SECONDS),
+            collapse_id=DOT_COMPLETION_COLLAPSE_ID, target_tokens=[owner],
+        )
+        with self._dot_lock:
+            if accepted and self._pending_dot is pending:
+                # The visible delivery replaces the initial silent attempt;
+                # only the existing bounded silent retries remain eligible.
+                pending.accepted_attempts = 1
+                pending.next_attempt_at = now + DOT_PUSH_RETRY_OFFSETS_SECONDS[1]
+        return accepted
+
     def _dot_stream_snapshot(
         self, snapshot: dict[str, Any], token: str | None
     ) -> dict[str, Any]:
@@ -3270,6 +3476,7 @@ class LiveActivityDaemon:
         *,
         now: float | None = None,
         force_resync: bool = True,
+        completion_alerts_enabled: bool | None = None,
     ) -> bool:
         """Persist a bounded suppression lease for the elected Dot owner."""
         moment = time.time() if now is None else now
@@ -3292,6 +3499,8 @@ class LiveActivityDaemon:
                     dnd_schedule,
                     now=moment,
                 )
+            if owner_matched and applied and completion_alerts_enabled is not None:
+                self.report_dot_completion_alerts(token, completion_alerts_enabled, reported_at)
 
             should_wake = False
             if owner_matched and applied and available and force_resync:
@@ -3377,9 +3586,12 @@ class LiveActivityDaemon:
                     {
                         "dot_unavailable_until": None,
                         "dot_unavailable_reason": None,
+                        "dot_dnd_active": False,
                     }
                 )
             else:
+                if reason == "dnd":
+                    values["dot_dnd_active"] = True
                 lease_seconds = max(
                     DOT_UNAVAILABLE_MIN_SECONDS,
                     min(
@@ -3470,6 +3682,7 @@ class LiveActivityDaemon:
             values: dict[str, Any] = {
                 "dot_next_dnd_transition_at": None,
                 "dot_next_dnd_transition_enabled": None,
+                "dot_dnd_active": transition_enabled,
             }
             if (
                 transition_enabled is False
@@ -3716,15 +3929,7 @@ class LiveActivityDaemon:
                 return False
             payload = {
                 "aps": {"content-available": 1},
-                "dot": {
-                    "aggregateMode": pending.content_state["aggregateMode"],
-                    "activeCount": pending.content_state["activeCount"],
-                    "hasUnreadFinished": pending.has_unread_finished,
-                    "host": self.config.host_label,
-                    "updatedAt": pending.content_state["updatedAt"],
-                    "commandID": pending.command_id,
-                    "issuedAt": pending.issued_at,
-                },
+                "dot": self._dot_payload(pending),
             }
             command_id = pending.command_id
             state = pending.state
@@ -3783,6 +3988,8 @@ class LiveActivityDaemon:
             pending = self._pending_dot
             return {
                 "dotOutputAvailable": owner is not None and unavailable_until is None,
+                "dotCompletionAlertsEnabled": self.tokens.entries("dot_device")
+                .get(owner or "", {}).get("dot_completion_alerts_enabled") is True,
                 "dotUnavailableReason": (
                     "no_device" if owner is None else reason
                 ),
@@ -3873,11 +4080,13 @@ class LiveActivityDaemon:
             def log_message(self, format: str, *args: Any) -> None:
                 pass
 
-            def _json(self, status: int, body: dict[str, Any]) -> None:
+            def _json(self, status: int, body: dict[str, Any], *, no_store: bool = False) -> None:
                 data = json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                if no_store:
+                    self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -3915,6 +4124,12 @@ class LiveActivityDaemon:
                     with daemon._condition:
                         latest = daemon._latest
                     self._json(200, latest or {})
+                elif parsed.path == "/dot-command":
+                    command = daemon.dot_command(self.headers.get("X-SidePulse-Dot-Token"))
+                    if command is None:
+                        self._json(403, {"error": "not_dot_owner"}, no_store=True)
+                    else:
+                        self._json(200, command, no_store=True)
                 elif parsed.path == "/stream":
                     self._stream(parsed.query)
                 elif parsed.path == "/usage":
@@ -3931,7 +4146,9 @@ class LiveActivityDaemon:
                     ).get("dotToken", [])
                 except ValueError:
                     values = []
-                token = values[0] if len(values) == 1 else None
+                token = self.headers.get("X-SidePulse-Dot-Token")
+                if token is None:
+                    token = values[0] if len(values) == 1 else None
                 tracked = daemon._dot_stream_connected(token)
                 try:
                     self.send_response(200)
@@ -4012,6 +4229,7 @@ class LiveActivityDaemon:
                     try:
                         availability = _parse_dot_availability(body)
                         dnd_schedule = _parse_dot_dnd_schedule(body)
+                        completion_alerts_enabled = _parse_dot_completion_alerts(body)
                     except ValueError as exc:
                         self._json(400, {"error": str(exc)})
                         return
@@ -4030,6 +4248,7 @@ class LiveActivityDaemon:
                         availability[2],
                         availability[3],
                         dnd_schedule,
+                        completion_alerts_enabled=completion_alerts_enabled,
                     )
                     if not updated:
                         self._json(409, {"ok": False, "error": "not_dot_owner"})
@@ -4132,6 +4351,7 @@ class LiveActivityDaemon:
                 token = body.get("token", "")
                 try:
                     activity_metadata = _parse_live_activity_metadata(body)
+                    completion_alerts_enabled = _parse_dot_completion_alerts(body)
                 except ValueError as exc:
                     self._json(400, {"error": str(exc)})
                     return
@@ -4212,12 +4432,15 @@ class LiveActivityDaemon:
                 elif kind == "dot_device":
                     # Alert pushes may target several phones, but only the
                     # most recently registered Dot owner receives LED writes.
-                    previous = daemon.tokens.entries(kind)
-                    if list(previous) == [token]:
-                        for key in DOT_UNAVAILABLE_METADATA_KEYS:
-                            if key in previous[token]:
-                                meta[key] = previous[token][key]
-                    dot_owner_changed = daemon.tokens.replace(kind, token, meta)
+                    with daemon._dot_lock:
+                        previous = daemon.tokens.entries(kind)
+                        if list(previous) == [token]:
+                            for key in (*DOT_UNAVAILABLE_METADATA_KEYS, *DOT_COMPLETION_METADATA_KEYS):
+                                if key in previous[token]:
+                                    meta[key] = previous[token][key]
+                        dot_owner_changed = daemon.tokens.replace(kind, token, meta)
+                        if completion_alerts_enabled is not None:
+                            daemon.report_dot_completion_alerts(token, completion_alerts_enabled, body.get("reportedAt"))
                     daemon._record_activity_report(
                         meta, kind, persist_for_device=True
                     )

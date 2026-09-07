@@ -10,6 +10,7 @@ private struct DotAvailabilityReportSignature: Equatable {
     let token: String
     let availability: DotAvailability
     let dndSchedule: DotDndScheduleMetadata
+    let dotCompletionAlertsEnabled: Bool
 }
 
 private struct DotDndScheduleMetadata: Equatable {
@@ -58,6 +59,8 @@ private struct DotDeviceRegistrationRequest {
     let serverURL: String
     let token: Data
     let tokenHex: String
+    let dotCompletionAlertsEnabled: Bool
+    let reportedAt: TimeInterval
     let model: AppModel
 }
 
@@ -100,6 +103,7 @@ final class LiveMonitorManager: ObservableObject {
     private var pendingDotDeviceRegistration: DotDeviceRegistrationRequest?
     private var dotDeviceRegistrationRunning = false
     private var dotRegistrationCancellable: AnyCancellable?
+    private var dotCompletionAlertsCancellable: AnyCancellable?
     private var latestDotAvailabilityReport: DotAvailabilityReport?
     private var pendingDotAvailabilityReport: QueuedDotAvailabilityReport?
     private var lastSubmittedDotAvailability: DotAvailabilityReportSignature?
@@ -230,6 +234,23 @@ final class LiveMonitorManager: ObservableObject {
                     self?.ensureDotDeviceRegistration(model: model)
                 }
             }
+        dotCompletionAlertsCancellable = model.$dotCompletionAlertsEnabled
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    // The toggle can return to the last registered value
+                    // while the opposite registration is still in flight.
+                    self.registeredDotDeviceKey = nil
+                    self.ensureDotDeviceRegistration(model: model)
+                    if let latest = self.latestDotAvailabilityReport,
+                       latest.signature.serverURL == model.liveMonitorServerURL,
+                       latest.signature.token == model.pushToken {
+                        self.reportDotAvailability(latest.signature.availability, model: model)
+                    }
+                }
+            }
     }
 
     /// Selecting the Dot folder can happen long after APNs supplied its
@@ -246,7 +267,12 @@ final class LiveMonitorManager: ObservableObject {
     private func ensureDotDeviceRegistration(token: Data, model: AppModel) {
         let tokenHex = token.map { String(format: "%02x", $0) }.joined()
         let serverURL = model.liveMonitorServerURL
-        let key = dotDeviceKey(serverURL: serverURL, token: tokenHex)
+        let dotCompletionAlertsEnabled = model.dotCompletionAlertsEnabled
+        let key = dotDeviceKey(
+            serverURL: serverURL,
+            token: tokenHex,
+            dotCompletionAlertsEnabled: dotCompletionAlertsEnabled
+        )
         guard registeredDotDeviceKey != key else { return }
         if pendingDotDeviceRegistration?.key != key {
             pendingDotDeviceRegistration = DotDeviceRegistrationRequest(
@@ -254,6 +280,8 @@ final class LiveMonitorManager: ObservableObject {
                 serverURL: serverURL,
                 token: token,
                 tokenHex: tokenHex,
+                dotCompletionAlertsEnabled: dotCompletionAlertsEnabled,
+                reportedAt: Date().timeIntervalSince1970,
                 model: model
             )
         }
@@ -271,6 +299,8 @@ final class LiveMonitorManager: ObservableObject {
                 token: registration.token,
                 model: registration.model,
                 serverURL: registration.serverURL,
+                dotCompletionAlertsEnabled: registration.dotCompletionAlertsEnabled,
+                reportedAt: registration.reportedAt,
                 isStillCurrent: { self.isCurrent(registration) },
                 updatesStatus: false
             )
@@ -286,7 +316,8 @@ final class LiveMonitorManager: ObservableObject {
             if let latestDotAvailabilityReport,
                dotDeviceKey(
                    serverURL: latestDotAvailabilityReport.signature.serverURL,
-                   token: latestDotAvailabilityReport.signature.token
+                   token: latestDotAvailabilityReport.signature.token,
+                   dotCompletionAlertsEnabled: latestDotAvailabilityReport.signature.dotCompletionAlertsEnabled
                ) == registration.key
             {
                 enqueueDotAvailability(
@@ -305,6 +336,7 @@ final class LiveMonitorManager: ObservableObject {
         registration.model.hasFolderAccess
             && registration.model.pushToken == registration.tokenHex
             && registration.model.liveMonitorServerURL == registration.serverURL
+            && registration.model.dotCompletionAlertsEnabled == registration.dotCompletionAlertsEnabled
     }
 
     /// Keep exactly one reusable activity: the freshest. Terminal ActivityKit
@@ -722,6 +754,7 @@ final class LiveMonitorManager: ObservableObject {
             availability,
             reportedAt: now.timeIntervalSince1970,
             dndSchedule: DotDndScheduleMetadata(model: model, now: now),
+            dotCompletionAlertsEnabled: model.dotCompletionAlertsEnabled,
             to: &payload
         )
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
@@ -766,7 +799,8 @@ final class LiveMonitorManager: ObservableObject {
                 serverURL: model.liveMonitorServerURL,
                 token: token,
                 availability: availability,
-                dndSchedule: DotDndScheduleMetadata(model: model, now: now)
+                dndSchedule: DotDndScheduleMetadata(model: model, now: now),
+                dotCompletionAlertsEnabled: model.dotCompletionAlertsEnabled
             ),
             reportedAt: now.timeIntervalSince1970
         )
@@ -819,6 +853,7 @@ final class LiveMonitorManager: ObservableObject {
             report.signature.availability,
             reportedAt: report.reportedAt,
             dndSchedule: report.signature.dndSchedule,
+            dotCompletionAlertsEnabled: report.signature.dotCompletionAlertsEnabled,
             to: &payload
         )
 
@@ -852,11 +887,13 @@ final class LiveMonitorManager: ObservableObject {
         _ availability: DotAvailability,
         reportedAt: TimeInterval,
         dndSchedule: DotDndScheduleMetadata,
+        dotCompletionAlertsEnabled: Bool,
         to payload: inout [String: Any]
     ) {
         payload["available"] = availability.available
         payload["reportedAt"] = reportedAt
         payload["dndScheduleEnabled"] = dndSchedule.enabled
+        payload["dotCompletionAlertsEnabled"] = dotCompletionAlertsEnabled
         if let nextTransitionAt = dndSchedule.nextTransitionAt,
            let nextTransitionEnabled = dndSchedule.nextTransitionEnabled {
             payload["nextDndTransitionAt"] = nextTransitionAt
@@ -869,8 +906,8 @@ final class LiveMonitorManager: ObservableObject {
         payload["retryAfterSeconds"] = availability.retryAfterSeconds
     }
 
-    private func dotDeviceKey(serverURL: String, token: String) -> String {
-        "\(serverURL)|\(token)"
+    private func dotDeviceKey(serverURL: String, token: String, dotCompletionAlertsEnabled: Bool) -> String {
+        "\(serverURL)|\(token)|\(dotCompletionAlertsEnabled)"
     }
 
     @available(iOS 17.2, *)
@@ -979,6 +1016,8 @@ final class LiveMonitorManager: ObservableObject {
         tokenObservedAt: TimeInterval? = nil,
         activityState: String? = nil,
         serverURL: String? = nil,
+        dotCompletionAlertsEnabled: Bool? = nil,
+        reportedAt: TimeInterval? = nil,
         isStillCurrent: (() -> Bool)? = nil,
         updatesStatus: Bool = true,
         attemptLimit: Int = 5
@@ -1003,6 +1042,10 @@ final class LiveMonitorManager: ObservableObject {
         if let activityID { payload["activity_id"] = activityID }
         if let activityObservedAt { payload["activity_observed_at"] = activityObservedAt }
         if let tokenObservedAt { payload["token_observed_at"] = tokenObservedAt }
+        if let dotCompletionAlertsEnabled {
+            payload["dotCompletionAlertsEnabled"] = dotCompletionAlertsEnabled
+        }
+        if let reportedAt { payload["reportedAt"] = reportedAt }
         if #available(iOS 17.2, *) {
             addActivityContext(
                 activityState: activityState ?? currentActivityStateName(activityID: activityID),
