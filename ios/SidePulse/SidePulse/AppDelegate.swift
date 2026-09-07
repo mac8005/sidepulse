@@ -191,6 +191,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let host = dot["host"] as? String
         let hasUnreadFinished = dot["hasUnreadFinished"] as? Bool ?? false
         EventLog.append("Dot push received (\(mode)); app state: \(UIApplication.shared.applicationState.rawValue)")
+        if let issuedAt, issuedAt.isFinite {
+            let age = String(format: "%.1f", max(0, Date().timeIntervalSince1970 - issuedAt))
+            EventLog.append("Dot command \(commandID?.prefix(8) ?? "unknown"): age \(age)s; unread finished: \(hasUnreadFinished)")
+        }
         Task { @MainActor in
             let result = await DotStatusMirror.shared.applyPush(
                 aggregateMode: mode,

@@ -28,6 +28,7 @@ struct AgentSnapshot: Codable {
     var activeCount: Int
     var agents: [Agent]
     var updatedAt: Double
+    var dotCommandID: String? = nil
 }
 
 @MainActor
@@ -42,8 +43,15 @@ final class AgentStreamClient: ObservableObject {
 @MainActor
 final class LiveMonitorManager {
     static let shared = LiveMonitorManager()
+    var acknowledgedCommands: [String] = []
+    var programsAtAcknowledgement: [String] = []
     func ensureDotDeviceRegistration(model: AppModel) {}
     func reportDotAvailability(_ availability: DotAvailability, model: AppModel) {}
+    func acknowledgeDot(commandID: String, status: String, availability: DotAvailability, model: AppModel) async {
+        precondition(availability.available)
+        acknowledgedCommands.append(commandID)
+        programsAtAcknowledgement.append(DriveWriter.shared.writes.last ?? "")
+    }
 }
 
 enum DotBrightness {

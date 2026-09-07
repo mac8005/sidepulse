@@ -42,7 +42,7 @@ from .hook import write_hook_line
 from .led_status import display_state_for_mode
 from .paseo_monitor import paseo_agent_link, paseo_server_id
 from .providers import SUMMARY_EVENT_NAME
-from .models import MODE_PRIORITY, AgentStatus
+from .models import MODE_PRIORITY, AgentMode, AgentStatus
 from .providers import default_state_dir
 from .usage_monitor import UsageMonitor, consume_codex_reset
 from .title_integrity import (
@@ -1684,6 +1684,7 @@ class LiveActivityDaemon:
         self.apns = APNsLiveActivityClient(config)
         self.monitor = AgentMonitor.from_default_sources()
         self._condition = threading.Condition()
+        self._dot_stream_revision = 0
         self._latest: dict[str, Any] | None = None
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -3175,7 +3176,36 @@ class LiveActivityDaemon:
                 issued_at=issued_at,
                 next_attempt_at=now,
             )
+        # A foreground phone can apply and acknowledge this command over SSE
+        # without spending a background push when its stream disconnects.
+        with self._condition:
+            self._dot_stream_revision += 1
+            self._condition.notify_all()
         return True
+
+    def _dot_stream_snapshot(
+        self, snapshot: dict[str, Any], token: str | None
+    ) -> dict[str, Any]:
+        """Attach a write receipt only to the owner's matching current frame."""
+        with self._dot_lock:
+            pending = self._pending_dot
+            if (
+                not token
+                or next(iter(self.tokens.entries("dot_device")), None) != token
+                or pending is None
+            ):
+                return snapshot
+            state, content = _normalize_dot_state(
+                display_state_for_mode(AgentMode(snapshot["aggregateMode"])).value,
+                snapshot,
+            )
+            if (
+                (state, _has_unread_finished(content))
+                != (pending.state, pending.has_unread_finished)
+                or snapshot["updatedAt"] < pending.content_state["updatedAt"]
+            ):
+                return snapshot
+            return {**snapshot, "dotCommandID": pending.command_id}
 
     def _dot_owner_availability(
         self, now: float
@@ -3703,7 +3733,7 @@ class LiveActivityDaemon:
 
         _log(
             f"dot -> {state} (attempt {attempt}/{len(DOT_PUSH_RETRY_OFFSETS_SECONDS)}, "
-            f"command {command_id[:8]})"
+            f"command {command_id[:8]}, unread={pending.has_unread_finished})"
         )
         accepted = self._apns_fanout(
             "dot_device",
@@ -3762,7 +3792,15 @@ class LiveActivityDaemon:
                     else 0
                 ),
                 "dotState": self._last_dot_state,
+                "dotUnreadFinished": self._last_dot_has_unread_finished,
                 "dotPendingState": pending.state if pending is not None else None,
+                "dotPendingUnreadFinished": (
+                    pending.has_unread_finished if pending is not None else None
+                ),
+                "dotPendingAgeSeconds": (
+                    max(0, round(moment - pending.created_at, 1))
+                    if pending is not None else None
+                ),
                 "dotPendingAttempts": (
                     pending.accepted_attempts if pending is not None else 0
                 ),
@@ -3902,26 +3940,31 @@ class LiveActivityDaemon:
                     self.send_header("Connection", "keep-alive")
                     self.end_headers()
                     last_sent: object = object()
+                    last_receipt_revision = -1
                     while not daemon._stop.is_set():
                         with daemon._condition:
-                            if daemon._latest is last_sent:
-                                daemon._condition.wait_for(
-                                    lambda: (
-                                        daemon._stop.is_set()
-                                        or daemon._latest is not last_sent
-                                    ),
-                                    SSE_HEARTBEAT_SECONDS,
-                                )
+                            daemon._condition.wait_for(
+                                lambda: (
+                                    daemon._stop.is_set()
+                                    or daemon._latest is not last_sent
+                                    or daemon._dot_stream_revision != last_receipt_revision
+                                ),
+                                SSE_HEARTBEAT_SECONDS,
+                            )
                             if daemon._stop.is_set():
                                 return
                             latest = daemon._latest
-                            if latest is not None:
-                                data = json.dumps(latest)
-                            else:
-                                data = "{}"
+                            receipt_revision = daemon._dot_stream_revision
+                        # Keep the condition and Dot locks unnested here.
+                        frame = (
+                            daemon._dot_stream_snapshot(latest, token)
+                            if latest is not None and tracked else latest
+                        )
+                        data = json.dumps(frame or {})
                         self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                         last_sent = latest
+                        last_receipt_revision = receipt_revision
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
                 finally:

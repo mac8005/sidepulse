@@ -19,6 +19,8 @@ struct AgentSnapshot: Codable, Equatable {
     var activeCount: Int
     var agents: [Agent]
     var updatedAt: Double
+    // Only the elected Dot owner's SSE stream carries a write receipt.
+    var dotCommandID: String? = nil
 }
 
 /// Streams live agent snapshots from the daemon's `/stream` SSE endpoint.

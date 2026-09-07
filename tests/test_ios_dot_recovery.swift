@@ -130,11 +130,59 @@ struct DotRecoveryTests {
         precondition(writer.writes.count > beforeSuspend, "Reopening must rewrite after a USB reconnect")
         foreground.suspend()
 
+        // Foreground completion receipts confirm the green/blue USB program,
+        // not just reception of the snapshot. No new silent push is needed.
+        model.showFinishedEnabled = true
+        let receipts = LiveMonitorManager.shared
+        let mixed = DotStatusMirror()
+        mixed.stream.snapshot = AgentSnapshot(aggregateMode: "working", activeCount: 1, agents: [.init(mode: "completed", unread: true)], updatedAt: 450, dotCommandID: "mixed")
+        mixed.stream.state = .live
+        mixed.start(model: model)
+        for _ in 0..<1000 {
+            if receipts.acknowledgedCommands.contains("mixed") { break }
+            await Task.yield()
+        }
+        precondition(receipts.acknowledgedCommands.contains("mixed"))
+        precondition(receipts.programsAtAcknowledgement.last!.contains("0:#39D98A"))
+        precondition(receipts.programsAtAcknowledgement.last!.contains("1:#4DA3FF"))
+        mixed.stream.snapshot = AgentSnapshot(aggregateMode: "completed", activeCount: 0, agents: [], updatedAt: 451, dotCommandID: "all-read")
+        for _ in 0..<1000 {
+            if receipts.acknowledgedCommands.contains("all-read") { break }
+            await Task.yield()
+        }
+        precondition(receipts.acknowledgedCommands.contains("all-read"))
+        precondition(receipts.programsAtAcknowledgement.last == "off")
+        mixed.suspend()
+
+        // A Focus/DND change during USB I/O must not be overwritten by a
+        // later ready acknowledgement for the foreground snapshot.
+        let suppressedReceipt = DotStatusMirror()
+        suppressedReceipt.stream.snapshot = AgentSnapshot(aggregateMode: "working", activeCount: 1, agents: [], updatedAt: 460, dotCommandID: "suppressed-during-write")
+        suppressedReceipt.stream.state = .live
+        writer.paused = true
+        suppressedReceipt.start(model: model)
+        for _ in 0..<1000 {
+            if writer.continuation != nil { break }
+            await Task.yield()
+        }
+        precondition(writer.continuation != nil)
+        model.dndEnabled = true
+        writer.continuation?.resume()
+        writer.continuation = nil
+        for _ in 0..<1000 {
+            if writer.writes.last == "off" { break }
+            await Task.yield()
+        }
+        for _ in 0..<20 { await Task.yield() }
+        precondition(!receipts.acknowledgedCommands.contains("suppressed-during-write"))
+        suppressedReceipt.suspend()
+        model.dndEnabled = false
+
         // A due refresh with no successful write must still respect the local
         // error back-off. Frequent SSE events must not hammer an absent drive.
         writer.failuresRemaining = 2
         let failingForeground = DotStatusMirror()
-        failingForeground.stream.snapshot = AgentSnapshot(aggregateMode: "working", activeCount: 1, agents: [], updatedAt: 500)
+        failingForeground.stream.snapshot = AgentSnapshot(aggregateMode: "working", activeCount: 1, agents: [], updatedAt: 500, dotCommandID: "failed-write")
         failingForeground.stream.state = .live
         failingForeground.start(model: model)
         for _ in 0..<1000 {
@@ -146,6 +194,7 @@ struct DotRecoveryTests {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
         precondition(writer.failuresRemaining == 1, "Repeated snapshots bypassed USB error back-off")
+        precondition(!receipts.acknowledgedCommands.contains("failed-write"), "A failed USB write must not be acknowledged")
         failingForeground.suspend()
         print("Dot recovery tests passed: USB failure, retry, stale refresh, offline ACK, all-read, DND, serialization, finite foreground, retry throttle")
     }

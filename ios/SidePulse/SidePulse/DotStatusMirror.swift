@@ -382,6 +382,8 @@ final class DotStatusMirror: ObservableObject {
     private var lastProgramWrite: Date = .distantPast
     private var pendingUpdate: Task<Void, Never>?
     private var syncQueued = false
+    private var lastAppliedStreamCommandID: String?
+    private var streamAcknowledgementsInFlight: Set<String> = []
     private let lastPushCommandIDKey = "lastDotPushCommandID"
     private let lastPushIssuedAtKey = "lastDotPushIssuedAt"
     private let lastStreamUpdatedAtKey = "lastSuccessfulDotStreamUpdatedAt"
@@ -627,7 +629,7 @@ final class DotStatusMirror: ObservableObject {
                 lastPushSourceUpdatedAt = max(lastPushSourceUpdatedAt, currentSourceUpdatedAt)
             }
             let suffix = duplicateCommand && alreadyCurrent ? "already current" : label
-            EventLog.append("Dot push (\(aggregateMode)): \(suffix)")
+            EventLog.append("Dot push (\(aggregateMode)): \(suffix); unread finished: \(currentUnread), show finished: \(model.showFinishedEnabled)")
             return DotPushApplyOutcome(
                 result: alreadyCurrent ? .alreadyCurrent : .written,
                 availability: suppression ?? .ready
@@ -782,6 +784,7 @@ final class DotStatusMirror: ObservableObject {
         let unreachable: Bool
         var hasUnreadFinished = false
         var streamUpdatedAt: TimeInterval?
+        var streamCommandID: String?
         switch stream.state {
         case .live:
             guard let snapshot = stream.snapshot else { return }
@@ -794,6 +797,7 @@ final class DotStatusMirror: ObservableObject {
                 $0.mode == "completed" && $0.unread == true
             }
             streamUpdatedAt = snapshot.updatedAt
+            streamCommandID = snapshot.dotCommandID
             unreachable = false
         case .failed:
             mode = nil
@@ -811,6 +815,7 @@ final class DotStatusMirror: ObservableObject {
         if let focusAccessHint {
             label += focusAccessHint
         }
+        let previousProgramWrite = lastProgramWrite
         let written = await write(
             DotPrograms.program(
                 for: resolved.state,
@@ -822,10 +827,37 @@ final class DotStatusMirror: ObservableObject {
             label: label,
             force: resolved.state == .working
                 && lastError == nil
-                && now.timeIntervalSince(lastProgramWrite) >= DotPrograms.workingRefreshSeconds
+                && (now.timeIntervalSince(lastProgramWrite) >= DotPrograms.workingRefreshSeconds
+                    || (streamCommandID != nil && streamCommandID != lastAppliedStreamCommandID))
         )
         if written, let streamUpdatedAt {
             recordSuccessfulStreamWrite(updatedAt: streamUpdatedAt)
+        }
+        if written, let commandID = streamCommandID,
+           !streamAcknowledgementsInFlight.contains(commandID) {
+            lastAppliedStreamCommandID = commandID
+            streamAcknowledgementsInFlight.insert(commandID)
+            let status = previousProgramWrite == lastProgramWrite ? "alreadyCurrent" : "written"
+            let serverURL = model.liveMonitorServerURL
+            EventLog.append("Dot foreground receipt \(commandID.prefix(8)): \(label); unread finished: \(hasUnreadFinished)")
+            // A slow HTTP acknowledgement must not hold up the next USB write.
+            Task { @MainActor in
+                defer { self.streamAcknowledgementsInFlight.remove(commandID) }
+                guard model.liveMonitorServerURL == serverURL else { return }
+                model.applyDueDndSchedule()
+                self.refreshFocusStatus(model: model, allowPrompt: false)
+                let availability = self.availabilityAfterWrite(true, model: model, now: Date())
+                guard availability.available else {
+                    self.reportAvailability(availability, model: model)
+                    return
+                }
+                await LiveMonitorManager.shared.acknowledgeDot(
+                    commandID: commandID,
+                    status: status,
+                    availability: availability,
+                    model: model
+                )
+            }
         }
         reportAvailability(
             availabilityAfterWrite(written, model: model, now: now),
@@ -861,6 +893,7 @@ final class DotStatusMirror: ObservableObject {
         let defaults = UserDefaults.standard
         let storedURL = defaults.string(forKey: streamServerURLKey)
         lastPushSourceUpdatedAt = 0
+        lastAppliedStreamCommandID = nil
         lastSuccessfullyAppliedStreamUpdatedAt = storedURL == serverURL
             ? defaults.double(forKey: lastStreamUpdatedAtKey)
             : 0
