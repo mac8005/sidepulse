@@ -391,6 +391,8 @@ private struct SettingsView: View {
     @ObservedObject var model: AppModel
     let requestPushToken: () -> Void
     let showFolderPicker: () -> Void
+    @State private var diagnosticsExport: DiagnosticsExport?
+    @State private var isShowingDiagnosticsError = false
 
     var body: some View {
         Form {
@@ -500,6 +502,20 @@ private struct SettingsView: View {
 
             Section("Diagnostics") {
                 Button {
+                    shareDiagnostics()
+                } label: {
+                    Label("Share Diagnostics Log", systemImage: "square.and.arrow.up")
+                }
+                .accessibilityHint("Share a text file with recent events and current Dot settings")
+                .popover(item: $diagnosticsExport) { export in
+                    DiagnosticsShareSheet(url: export.url)
+                }
+
+                Text("Includes recent events and current settings. Review the file before sharing.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Button {
                     model.refreshEventLog()
                 } label: {
                     Label("Refresh Log", systemImage: "arrow.clockwise")
@@ -532,6 +548,51 @@ private struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .alert("Couldn’t Prepare Log", isPresented: $isShowingDiagnosticsError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Please try again. You can also select and copy individual log entries below.")
+        }
+    }
+
+    private func shareDiagnostics() {
+        model.refreshEventLog()
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        let backgroundRefresh: String
+        switch UIApplication.shared.backgroundRefreshStatus {
+        case .available: backgroundRefresh = "available"
+        case .denied: backgroundRefresh = "denied"
+        case .restricted: backgroundRefresh = "restricted"
+        @unknown default: backgroundRefresh = "unknown"
+        }
+        let details = [
+            "App: \(version) (\(build))",
+            "Device: \(UIDevice.current.model), iOS \(UIDevice.current.systemVersion)",
+            "Time zone: \(TimeZone.current.identifier)",
+            "Background App Refresh: \(backgroundRefresh)",
+            "Low Power Mode: \(ProcessInfo.processInfo.isLowPowerModeEnabled)",
+            "Dot folder saved: \(model.hasFolderAccess)",
+            "Dot status: \(DotStatusMirror.shared.statusText)",
+            "Brightness: \(model.dotBrightness)/\(DotBrightness.maximum)",
+            "Animation: \(model.dotAppearance.animation.rawValue)",
+            "Show finished: \(model.showFinishedEnabled)",
+            "DND: \(model.dndEnabled)",
+            "DND schedule: \(model.dndScheduleEnabled), \(model.dndStartTime)–\(model.dndEndTime)",
+            "Off during Focus: \(model.focusDndEnabled)",
+            "Live Activity enabled: \(model.liveMonitorEnabled)"
+        ]
+        do {
+            let url = try EventLog.export(
+                entries: model.eventLog,
+                details: details,
+                redacting: [model.pushToken, model.sharedSecret, model.selectedFolderPath]
+            )
+            diagnosticsExport = DiagnosticsExport(url: url)
+        } catch {
+            model.recordError(error)
+            isShowingDiagnosticsError = true
+        }
     }
 
     private func writeLocalTest() {
@@ -542,6 +603,27 @@ private struct SettingsView: View {
             model.recordError(error)
         }
     }
+}
+
+private struct DiagnosticsExport: Identifiable {
+    let url: URL
+    var id: URL { url }
+}
+
+private struct DiagnosticsShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in
+            try? FileManager.default.removeItem(at: url)
+            dismiss()
+        }
+        return controller
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 private struct Panel<Content: View>: View {
