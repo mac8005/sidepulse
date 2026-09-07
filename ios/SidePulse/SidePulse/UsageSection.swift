@@ -24,6 +24,9 @@ struct UsageSection: View {
 
     @ViewBuilder
     private var footer: some View {
+        if usage.snapshot?.providers.contains(where: { $0.tokenCost != nil }) == true {
+            Text("CodexBar API-price estimates from local logs on the monitored Mac, across accounts. Not your subscription bill.")
+        }
         if let message = usage.snapshot?.error ?? usage.failure, usage.snapshot?.providers.isEmpty == false {
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
@@ -62,6 +65,14 @@ private struct UsageProviderRow: View {
 
             ForEach(provider.windows) { window in
                 UsageWindowRow(window: window)
+            }
+
+            if let cost = provider.tokenCost {
+                UsageTokenCostRows(cost: cost)
+            } else if let error = provider.tokenCostError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let credits = provider.resetCredits {
@@ -128,6 +139,56 @@ private struct UsageProviderRow: View {
                 .font(.caption)
                 .foregroundStyle(outcome.ok ? .green : .orange)
         }
+    }
+}
+
+private struct UsageTokenCostRows: View {
+    let cost: UsageSnapshot.TokenCost
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Est. API cost · USD")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            period(cost.todayLabel, value: cost.today)
+            period("Last 30 days", value: cost.last30Days)
+            if cost.partial {
+                Text("Partial estimate: some history or model prices are missing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if cost.stale {
+                Text("Refresh unavailable. Last estimate: \(Date(timeIntervalSince1970: cost.updatedAt), format: .dateTime.month().day().hour().minute())")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func period(_ label: String, value: UsageSnapshot.TokenCost.Period) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                if let tokens = value.tokens {
+                    Text("\(tokens, format: .number.notation(.compactName).precision(.significantDigits(1...3))) tokens")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            if let amount = value.costUSD {
+                Text("≈ \(amount, format: .currency(code: "USD"))")
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
+                    .fixedSize()
+            } else {
+                Text("Not priced")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+        .accessibilityElement(children: .combine)
     }
 }
 

@@ -20,6 +20,7 @@ thread; request handlers read the cached snapshot (``GET /usage``).
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import threading
@@ -41,6 +42,7 @@ USAGE_ALERT_PERCENT = 90
 # seconds, which must not count (2026-09-06: a dozen repeated warnings).
 USAGE_RESET_TOLERANCE_SECONDS = 600.0
 CLI_TIMEOUT_SECONDS = 90.0
+COST_TIMEOUT_SECONDS = 20.0
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
@@ -92,6 +94,59 @@ def run_codexbar(binary: str, provider: str = "both") -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         payload = [payload]
     return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def run_codexbar_cost(binary: str) -> list[dict[str, Any]]:
+    """Reuse CodexBar's cached local-token accounting and pricing, not quota percentages."""
+    completed = subprocess.run(
+        [binary, "cost", "--provider", "both", "--json", "--no-color", "--days", "30"],
+        capture_output=True, text=True, timeout=COST_TIMEOUT_SECONDS, check=False,
+    )
+    payload = json.loads(completed.stdout)
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected CodexBar cost response")
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def normalise_token_cost(entry: dict[str, Any], now: float) -> dict[str, Any] | None:
+    if entry.get("error") or entry.get("source") != "local":
+        return None
+    if entry.get("currencyCode", "USD") != "USD":
+        return None
+
+    def period(token_key: str, cost_key: str) -> dict[str, Any]:
+        tokens, cost = entry.get(token_key), entry.get(cost_key)
+        return {
+            "tokens": tokens if type(tokens) is int and 0 <= tokens <= 2**63 - 1 else None,
+            "costUSD": cost if _is_number(cost) and math.isfinite(cost) and cost >= 0 else None,
+        }
+
+    # CodexBar calls today's local-log totals "session", independently of
+    # the provider's rolling five-hour quota window. Cached/reasoning tokens
+    # are already accounted for: never add them to these totals again.
+    today = period("sessionTokens", "sessionCostUSD")
+    month = period("last30DaysTokens", "last30DaysCostUSD")
+    if all(value is None for part in (today, month) for value in part.values()):
+        return None
+    coverage = entry.get("coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    unpriced = any(
+        _is_number(coverage.get(key)) and coverage[key] > 0
+        for key in ("unpriced", "unmetered")
+    )
+    if unpriced:
+        for part in (today, month):
+            if part["costUSD"] == 0 and part["tokens"]:
+                part["costUSD"] = None
+    return {
+        "today": today,
+        "last30Days": month,
+        "updatedAt": _epoch(entry.get("updatedAt")) or now,
+        "partial": unpriced or entry.get("historyCoverageIsEstablished") is False,
+        "stale": False,
+    }
 
 
 def fetch_claude_usage() -> dict[str, Any]:
@@ -531,11 +586,13 @@ class UsageMonitor:
         clock: Callable[[], float] = time.time,
         on_alert: Callable[[dict[str, str]], None] | None = None,
         alert_state_path: Path | None = None,
+        cost_runner: Callable[[str], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.refresh_seconds = refresh_seconds
         self._runner = runner
         self._claude_fetcher = claude_fetcher
         self._codex_fetcher = codex_fetcher
+        self._cost_runner = cost_runner or run_codexbar_cost
         self._binary = binary
         self._clock = clock
         self._on_alert = on_alert
@@ -592,10 +649,44 @@ class UsageMonitor:
                 fresh = list(snapshot["providers"])
             except Exception as exc:  # subprocess, JSON or timeout failures
                 snapshot = self._failed(str(exc) or exc.__class__.__name__, direct)
+        # Token-history scans must not delay rate-limit/reset notifications.
+        self._notify_usage_alerts(fresh, now)
+        self._attach_token_costs(snapshot, now)
         with self._lock:
             self._snapshot = snapshot
-        self._notify_usage_alerts(fresh, now)
         return dict(snapshot)
+
+    def _attach_token_costs(self, snapshot: dict[str, Any], now: float) -> None:
+        costs: dict[str, dict[str, Any]] = {}
+        if self.binary:
+            try:
+                for entry in self._cost_runner(self.binary):
+                    provider_id = entry.get("provider")
+                    if provider_id in USAGE_PROVIDERS:
+                        cost = normalise_token_cost(entry, now)
+                        if cost is not None:
+                            costs[provider_id] = cost
+            except Exception:  # An optional cost reading must not hide quota data.
+                pass
+        with self._lock:
+            previous = {
+                item["id"]: item.get("tokenCost")
+                for item in (self._snapshot or {}).get("providers", [])
+            }
+        providers = {item["id"]: dict(item) for item in snapshot["providers"]}
+        for provider_id in costs.keys() | {key for key, cost in previous.items() if cost is not None}:
+            if provider_id not in providers:
+                providers[provider_id] = normalise_provider({"provider": provider_id})
+        for provider_id, provider in providers.items():
+            cost = costs.get(provider_id)
+            if cost is None and previous.get(provider_id):
+                cost = {**previous[provider_id], "stale": True}
+            provider["tokenCost"] = cost
+            provider["tokenCostError"] = None if cost is not None else "Token cost unavailable"
+        snapshot["providers"] = sorted(
+            providers.values(), key=lambda item: USAGE_PROVIDERS.index(item["id"])
+            if item["id"] in USAGE_PROVIDERS else len(USAGE_PROVIDERS),
+        )
 
     def _notify_usage_alerts(self, providers: list[dict[str, Any]], now: float) -> None:
         if self._on_alert is None:

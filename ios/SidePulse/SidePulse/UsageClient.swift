@@ -1,10 +1,29 @@
 import Foundation
+import Combine
 
 /// Rate-limit usage of the coding agents on the monitored Mac. The daemon
 /// reads it every few minutes (Claude from its OAuth usage endpoint, Codex
 /// from the CodexBar CLI) and serves the latest reading on `/usage`; this
 /// is that wire format.
 struct UsageSnapshot: Codable, Equatable {
+    struct TokenCost: Codable, Equatable {
+        struct Period: Codable, Equatable {
+            var tokens: Int64?
+            var costUSD: Double?
+        }
+
+        var today: Period
+        var last30Days: Period
+        var updatedAt: Double
+        var partial: Bool
+        var stale: Bool
+
+        var todayLabel: String {
+            let date = Date(timeIntervalSince1970: updatedAt)
+            return Calendar.current.isDateInToday(date) ? "Today" : date.formatted(.dateTime.month().day())
+        }
+    }
+
     struct Window: Codable, Equatable, Identifiable {
         var id: String
         var label: String
@@ -26,6 +45,8 @@ struct UsageSnapshot: Codable, Equatable {
         var resetCreditsExpireAt: Double?
         var updatedAt: Double?
         var error: String?
+        var tokenCost: TokenCost?
+        var tokenCostError: String?
     }
 
     var updatedAt: Double?

@@ -18,6 +18,11 @@ from sidepulse.usage_monitor import (
     window_label,
 )
 
+
+@pytest.fixture(autouse=True)
+def no_local_cost_scans(monkeypatch):
+    monkeypatch.setattr("sidepulse.usage_monitor.run_codexbar_cost", lambda binary: [])
+
 # Trimmed from a real `codexbar usage --provider both --json` run: Codex has no
 # 5-hour window and carries reset credits, Claude has both windows and no
 # account identity.
