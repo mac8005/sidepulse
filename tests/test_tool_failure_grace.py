@@ -170,7 +170,7 @@ def test_resolved_permission_does_not_hide_recovery_or_completion(resolution, pr
     ):
         monitor.ingest_record(HookEvent(
             provider=provider,
-            logged_at=datetime.now(timezone.utc),
+            logged_at=datetime.now(timezone.utc) - timedelta(seconds=11 if event_name == "Stop" else 0),
             event_name=event_name,
             raw={"tool_name": "Bash", "tool_input": {"command": "git fetch"}},
             session_id="test-session",

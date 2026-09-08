@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .codex_goals import goal_states
 from .models import (
     MODE_PRIORITY,
     AgentMode,
@@ -40,6 +41,7 @@ TRANSCRIPT_FILE_LIST_CACHE_SECONDS = 5.0
 CLAUDE_TRANSCRIPT_MTIME_HEARTBEAT_SKEW_SECONDS = 30.0
 CODEX_SESSION_INDEX_MAX_LINES = 5000
 COMPLETED_VISIBLE_SECONDS = 20 * 60.0
+COMPLETION_CONFIRM_SECONDS = 10.0
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
 # Codex reasons silently for minutes between tool calls (no events at all),
@@ -743,12 +745,13 @@ def codex_transcript_event(
             )
         if role == "assistant":
             message = message_text_from_content(payload.get("content"))
+            event_name = "Stop" if payload.get("channel") in {None, "final"} else "AgentProgress"
             return HookEvent(
                 provider="codex",
                 logged_at=timestamp,
-                event_name="Stop",
+                event_name=event_name,
                 raw={
-                    "hook_event_name": "Stop",
+                    "hook_event_name": event_name,
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "cwd": cwd,
@@ -805,14 +808,15 @@ def codex_transcript_event(
             cwd=cwd,
         )
 
-    if payload_type == "task_complete":
+    if payload_type in {"task_complete", "task_started"}:
         message = _string_or_none(payload.get("last_agent_message")) or ""
+        event_name = "Stop" if payload_type == "task_complete" else "AgentProgress"
         return HookEvent(
             provider="codex",
             logged_at=timestamp,
-            event_name="Stop",
+            event_name=event_name,
             raw={
-                "hook_event_name": "Stop",
+                "hook_event_name": event_name,
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "cwd": cwd,
@@ -1158,6 +1162,7 @@ def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None)
         message=record.message,
         origin=record.origin or metadata.origin or origin_label_from_payload(record.provider, record.raw),
         deep_link=_string_or_none(record.raw.get("sidepulse_deep_link")),
+        goal_status=_string_or_none(record.raw.get("sidepulse_goal_status")),
     )
 
 
@@ -1190,7 +1195,7 @@ def mode_for_event(record: HookEvent) -> AgentMode | None:
         if _tool_response_looks_failed(raw.get("tool_response")):
             return AgentMode.BLOCKED_ERROR
         return AgentMode.WORKING
-    if event in {"UserPromptSubmit", "PreCompact", "PostCompact", "SubagentStart"}:
+    if event in {"UserPromptSubmit", "PreCompact", "PostCompact", "SubagentStart", "AgentProgress"}:
         return AgentMode.WORKING
     if event in {"Stop", "SubagentStop"}:
         if _assistant_message_asks_question(raw.get("last_assistant_message")):
@@ -1431,6 +1436,24 @@ def status_for_snapshot(
     *,
     post_tool_working_visible_seconds: float,
 ) -> AgentStatus:
+    if status.provider == "codex" and ":agent:" not in status.agent_id:
+        goal_status = (
+            status.goal_status if (status.session_id or "").startswith("remote:")
+            else goal_states().get(status.session_id or "")
+        )
+        if goal_status == "active" and status.mode in {AgentMode.COMPLETED, AgentMode.WORKING}:
+            # A final response ends a turn, not an active goal. Re-read local
+            # lifecycle state so pausing/completing a goal releases this hold.
+            return _replace_mode(status, AgentMode.WORKING)
+
+    if (
+        status.mode == AgentMode.COMPLETED
+        and ":agent:" not in status.agent_id
+        and status.event_name != "SessionEnd"
+        and status.age_seconds(now) < COMPLETION_CONFIRM_SECONDS
+    ):
+        return _replace_mode(status, AgentMode.WORKING)
+
     # A failed or denied tool is a result for the agent to handle, not proof
     # that it stopped for human input. Silence while it plans a recovery must
     # not promote the failure to blocked. Keep the raw event for diagnostics;
@@ -1493,6 +1516,7 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             origin=_string_or_none(data.get("origin")),
             deep_link=_string_or_none(data.get("deep_link")),
             stale=bool(data.get("stale", False)),
+            goal_status=_string_or_none(data.get("goal_status")),
         )
     except Exception:
         return None
@@ -1929,6 +1953,7 @@ def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
         origin=status.origin,
         deep_link=status.deep_link,
         stale=stale,
+        goal_status=status.goal_status,
     )
 
 
@@ -1949,6 +1974,7 @@ def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
         origin=status.origin,
         deep_link=status.deep_link,
         stale=status.stale,
+        goal_status=status.goal_status,
     )
 
 

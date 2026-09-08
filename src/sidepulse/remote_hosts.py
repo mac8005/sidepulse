@@ -8,16 +8,17 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, TextIO
 from urllib.parse import urlparse
 
 from .hook import write_hook_line
+from .codex_goals import goal_states
 from .ipc import send_hook_event
 from .models import provider_label
-from .providers import EVENT_PROVIDERS, default_state_dir, detect_log_path
+from .providers import EVENT_PROVIDERS, SUMMARY_EVENT_NAME, default_state_dir, detect_log_path
 
 
 REMOTE_CONFIG_VERSION = 1
@@ -343,6 +344,9 @@ def _emit_envelope(provider: str, line: str, output: TextIO) -> None:
         return
     payload = parsed.get("event") if provider == "codex" else parsed
     if isinstance(payload, dict):
+        if provider == "codex":
+            session_id = payload.get("session_id") or payload.get("sessionId")
+            payload["sidepulse_goal_status"] = goal_states().get(session_id) if isinstance(session_id, str) else None
         payload.pop("sidepulse_deep_link", None)
         deep_link = remote_session_web_link(provider, parsed)
         if deep_link:
@@ -385,6 +389,26 @@ def stream_remote_events(
     selected = tuple(dict.fromkeys(providers))
     paths = {provider: detect_log_path(provider) for provider in selected}
     offsets: dict[str, int] = {}
+    latest_codex: OrderedDict[str, str] = OrderedDict()
+    previous_goals = goal_states() if "codex" in selected else {}
+
+    def emit(provider: str, line: str) -> None:
+        if provider == "codex":
+            try:
+                payload = json.loads(line).get("event", {})
+                session_id = payload.get("session_id") or payload.get("sessionId")
+                if (
+                    isinstance(session_id, str) and session_id
+                    and not (payload.get("agent_id") or payload.get("agentId"))
+                    and payload.get("hook_event_name") != SUMMARY_EVENT_NAME
+                ):
+                    latest_codex[session_id] = line
+                    latest_codex.move_to_end(session_id)
+                    if len(latest_codex) > max(300, replay_lines):
+                        latest_codex.popitem(last=False)
+            except (ValueError, AttributeError, TypeError):
+                pass
+        _emit_envelope(provider, line, output)
 
     for provider, path in paths.items():
         try:
@@ -397,7 +421,7 @@ def stream_remote_events(
                     recent.append(line)
                 offsets[provider] = handle.tell()
             for line in recent:
-                _emit_envelope(provider, line, output)
+                emit(provider, line)
         except BrokenPipeError:
             return 0
         except OSError:
@@ -419,12 +443,19 @@ def stream_remote_events(
                             line = handle.readline()
                             if not line:
                                 break
-                            _emit_envelope(provider, line, output)
+                            emit(provider, line)
                         offsets[provider] = handle.tell()
                 except BrokenPipeError:
                     return 0
                 except OSError:
                     continue
+            current_goals = goal_states() if "codex" in selected else {}
+            for session_id, line in tuple(latest_codex.items()):
+                if current_goals.get(session_id) != previous_goals.get(session_id):
+                    # Refresh source-host goal metadata without inventing a
+                    # new turn or changing the original event timestamp.
+                    _emit_envelope("codex", line, output)
+            previous_goals = current_goals
             time.sleep(max(0.05, poll_interval))
     except (BrokenPipeError, KeyboardInterrupt):
         return 0

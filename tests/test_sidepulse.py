@@ -853,7 +853,7 @@ class AgentMonitorTests(unittest.TestCase):
             latest = base / "latest.json"
             codex_log = base / "codex.jsonl"
             session_id = "codex-session"
-            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=20)
             stop_at = prompt_at + timedelta(seconds=5)
             latest.write_text(
                 json.dumps(
@@ -910,7 +910,7 @@ class AgentMonitorTests(unittest.TestCase):
             latest = base / "latest.json"
             codex_log = base / "codex.jsonl"
             session_id = "codex-session"
-            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+            prompt_at = datetime.now(timezone.utc) - timedelta(seconds=20)
             stop_at = prompt_at + timedelta(seconds=5)
             latest.write_text(
                 json.dumps(
@@ -5747,7 +5747,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_completed_status_is_hidden_when_active_work_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 "\n".join(
                     [
@@ -6406,7 +6406,7 @@ class AgentMonitorTests(unittest.TestCase):
             root = Path(tmp)
             session_id = "019f179b-7fdc-7eb0-a3af-1ca3eb128eee"
             path = root / f"rollout-2026-06-30T01-18-14-{session_id}.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             path.write_text(
                 "\n".join(
                     [
@@ -6622,7 +6622,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_anything_else_prompt_maps_to_completed_before_recaps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 json.dumps(
                     {
@@ -6683,7 +6683,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_question_examples_in_inline_code_do_not_map_to_waiting_for_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 json.dumps(
                     {
@@ -6742,7 +6742,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_answer_heading_does_not_map_to_waiting_for_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 json.dumps(
                     {
@@ -6802,7 +6802,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_explicit_sidepulse_marker_overrides_question_heuristic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 json.dumps(
                     {
@@ -6854,7 +6854,7 @@ class AgentMonitorTests(unittest.TestCase):
     def test_explicit_marker_inside_code_block_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            now = datetime.now(timezone.utc).isoformat()
+            now = (datetime.now(timezone.utc) - timedelta(seconds=11)).isoformat()
             log.write_text(
                 json.dumps(
                     {

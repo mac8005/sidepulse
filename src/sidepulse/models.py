@@ -79,6 +79,7 @@ class AgentStatus:
     origin: str | None = None
     deep_link: str | None = None
     stale: bool = False
+    goal_status: str | None = None
 
     @property
     def priority(self) -> int:
@@ -110,6 +111,7 @@ class AgentStatus:
             "origin": self.origin,
             "deep_link": self.deep_link,
             "stale": self.stale,
+            "goal_status": self.goal_status,
         }
 
 
