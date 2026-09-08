@@ -30,8 +30,6 @@ struct UsageSection: View {
         if let message = usage.snapshot?.error ?? usage.failure, usage.snapshot?.providers.isEmpty == false {
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
-        } else if let updatedAt = usage.snapshot?.updatedAt {
-            Text("Updated ") + Text(Date(timeIntervalSince1970: updatedAt), style: .relative) + Text(" ago")
         }
     }
 }
@@ -55,6 +53,13 @@ private struct UsageProviderRow: View {
                         .clipShape(Capsule())
                 }
                 Spacer()
+            }
+
+            if let updatedAt = provider.usageUpdatedDate {
+                Text("Usage updated \(updatedAt, format: .dateTime.month().day().hour().minute())")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if let error = provider.error, provider.windows.isEmpty {

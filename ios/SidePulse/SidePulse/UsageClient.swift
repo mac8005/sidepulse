@@ -47,6 +47,11 @@ struct UsageSnapshot: Codable, Equatable {
         var error: String?
         var tokenCost: TokenCost?
         var tokenCostError: String?
+
+        var usageUpdatedDate: Date? {
+            guard let updatedAt, updatedAt.isFinite, updatedAt > 0 else { return nil }
+            return Date(timeIntervalSince1970: updatedAt)
+        }
     }
 
     var updatedAt: Double?
