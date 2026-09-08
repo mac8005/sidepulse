@@ -422,7 +422,19 @@ class WindowBuildTests(StatusBarTestCase):
             self.assertIn(key, self.controller.settings_fields)
         self.assertIn("dnd_enabled", self.controller.settings_buttons)
         self.assertIn("dnd_schedule", self.controller.settings_buttons)
-        self.assertIn("kitt_mode", self.controller.settings_buttons)
+        self.assertIn("led_animation", self.controller.settings_fields)
+        self.assertIn("led_palette", self.controller.settings_fields)
+        animation = self.controller.settings_fields["led_animation"]
+        palette = self.controller.settings_fields["led_palette"]
+        self.assertEqual(6, animation.numberOfItems())
+        self.assertEqual(3, palette.numberOfItems())
+        animation.selectItemAtIndex_(3)
+        palette.selectItemAtIndex_(1)
+        with patch.object(sb.StatusBarController, "set_led_appearance") as setter:
+            self.controller.setLedAnimation_(animation)
+            setter.assert_called_with(animation="tide")
+            self.controller.setLedPalette_(palette)
+            setter.assert_called_with(palette="dusk")
         self.assertIn("show_finished", self.controller.settings_buttons)
         self.assertTrue(self.controller.settings_buttons["dnd_enabled"].isEnabled())
 

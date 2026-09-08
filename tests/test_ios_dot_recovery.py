@@ -105,8 +105,13 @@ def test_all_animations_survive_missed_refresh_and_still_expire(swift_binaries):
         capture_output=True, text=True, timeout=30,
     )
     programs = json.loads(result.stdout)
-    assert len(programs) == 6
+    assert len(programs) == 12
     for case in programs:
+        from sidepulse.led_appearance import working_program
+        assert case["program"] == working_program(
+            case["animation"], "#4DA3FF", "#39D98A", led_count=2,
+            show_finished=case["unread"] == "true", lifetime_seconds=7200,
+        )
         validate_led_text("brightness 3\n" + case["program"])
         observed = _firmware_window(case["program"], 7215)
         assert observed["moving"], case

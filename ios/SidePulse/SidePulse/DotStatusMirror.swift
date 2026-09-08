@@ -98,6 +98,9 @@ enum DotAnimation: String, CaseIterable, Identifiable {
     case gentle
     case flow
     case kitt
+    case tide
+    case glow
+    case steady
 
     var id: String { rawValue }
 
@@ -106,6 +109,33 @@ enum DotAnimation: String, CaseIterable, Identifiable {
         case .gentle: return "Gentle"
         case .flow: return "Flow"
         case .kitt: return "KITT"
+        case .tide: return "Tide"
+        case .glow: return "Glow"
+        case .steady: return "Steady"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .gentle: return "Soft breathing, with a quiet pause."
+        case .flow: return "A slow traveling wave."
+        case .kitt: return "A relaxed return sweep, about three seconds per cycle."
+        case .tide: return "Alternating crossfade, like a slowly turning tide."
+        case .glow: return "Softly brightens and dims without going dark."
+        case .steady: return "Constant light, without movement."
+        }
+    }
+}
+
+enum DotPalette: String, CaseIterable, Identifiable {
+    case ocean, dusk, ice
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var colors: [String] {
+        switch self {
+        case .ocean: return ["#4DA3FF", "#FFB020", "#39D98A"]
+        case .dusk: return ["#AC8CFF", "#FFBE70", "#65D99A"]
+        case .ice: return ["#65CCFF", "#FFC16E", "#56D99B"]
         }
     }
 }
@@ -151,6 +181,16 @@ struct DotAppearance: Equatable {
         )
     }
 
+    var palette: DotPalette? {
+        DotPalette.allCases.first { $0.colors == [workingColor, needsInputColor, finishedColor] }
+    }
+
+    mutating func apply(_ palette: DotPalette) {
+        workingColor = palette.colors[0]
+        needsInputColor = palette.colors[1]
+        finishedColor = palette.colors[2]
+    }
+
     static func normalizedHex(_ value: String?, fallback: String) -> String {
         let candidate = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let body = candidate.hasPrefix("#") ? String(candidate.dropFirst()) : candidate
@@ -168,11 +208,6 @@ enum DotPrograms {
     static let workingLifetimeSeconds: TimeInterval = 2 * 60 * 60
     static let workingRefreshSeconds: TimeInterval = 20 * 60
     static let writeFailureRetrySeconds = 5 * 60
-    private static let finiteGentleRepeats = Int(ceil(workingLifetimeSeconds / 2.8))
-    private static let finiteRollingRepeats = Int(ceil(workingLifetimeSeconds / 1.18))
-    private static let finiteKittRepeats = Int(ceil(workingLifetimeSeconds / 0.96))
-    private static let finiteFinishedRollingRepeats = Int(ceil(workingLifetimeSeconds / 0.92))
-    private static let finiteFinishedKittRepeats = Int(ceil(workingLifetimeSeconds / 0.4))
 
     static func program(
         for state: LedDisplayState,
@@ -186,30 +221,18 @@ enum DotPrograms {
         case .idle:
             return off
         case .ask:
-            if appearance.animation == .gentle {
-                return gentleAttention(appearance.needsInputColor)
-            }
-            return "off\n\(appearance.needsInputColor) 1.6s pulse\nrepeat"
+            return appearance.animation == .steady
+                ? appearance.needsInputColor : gentleAttention(appearance.needsInputColor)
         case .done:
             return hasUnreadFinished ? appearance.finishedColor : off
         case .working:
-            if showFinished && hasUnreadFinished {
-                return workingWithFinished(appearance: appearance, finite: finiteWorking)
-            }
-            switch appearance.animation {
-            case .gentle:
-                return gentleBreath(appearance.workingColor, finite: finiteWorking)
-            case .flow:
-                return rolling(appearance.workingColor, finite: finiteWorking)
-            case .kitt:
-                return kittScanner(appearance.workingColor, finite: finiteWorking)
-            }
+            return workingProgram(appearance: appearance, finite: finiteWorking,
+                                  finished: showFinished && hasUnreadFinished)
         }
     }
 
     static func gentleBreath(_ color: String, finite: Bool = false) -> String {
-        let ending = finite ? "repeat \(finiteGentleRepeats)\noff" : "repeat"
-        return "off 400ms cosine\n\(color) 2.4s pulse\n\(ending)"
+        workingProgram(appearance: DotAppearance(animation: .gentle, workingColor: color), finite: finite)
     }
 
     static func gentleAttention(_ color: String) -> String {
@@ -218,14 +241,12 @@ enum DotPrograms {
 
     /// `rolling_program(color, led_count=2)`.
     static func rolling(_ color: String, finite: Bool = false) -> String {
-        let ending = finite ? "repeat \(finiteRollingRepeats)\noff" : "repeat"
-        return "off 160ms cosine\n0:\(color) 760ms pulse 0ms; 1:\(color) 760ms pulse 260ms\n\(ending)"
+        workingProgram(appearance: DotAppearance(animation: .flow, workingColor: color), finite: finite)
     }
 
     /// `kitt_scanner_program(color, led_count=2)`: scan out, then back.
     static func kittScanner(_ color: String, finite: Bool = false) -> String {
-        let ending = finite ? "repeat \(finiteKittRepeats)\noff" : "repeat"
-        return "off 80ms cosine\n0:\(color) 320ms pulse 0ms; 1:\(color) 320ms pulse 240ms\n0:\(color) 320ms pulse 0ms\n\(ending)"
+        workingProgram(appearance: DotAppearance(animation: .kitt, workingColor: color), finite: finite)
     }
 
     /// Keep LED 0 in the finished color while LED 1 continues the selected
@@ -235,27 +256,56 @@ enum DotPrograms {
         appearance: DotAppearance,
         finite: Bool = false
     ) -> String {
-        let resetDuration: String
-        let pulseDuration: String
-        let repeatCount: Int
-        switch appearance.animation {
-        case .gentle:
-            resetDuration = "400ms"
-            pulseDuration = "2.4s"
-            repeatCount = finiteGentleRepeats
-        case .flow:
-            resetDuration = "160ms"
-            pulseDuration = "760ms"
-            repeatCount = finiteFinishedRollingRepeats
-        case .kitt:
-            resetDuration = "80ms"
-            pulseDuration = "320ms"
-            repeatCount = finiteFinishedKittRepeats
+        workingProgram(appearance: appearance, finite: finite, finished: true)
+    }
+
+    private static func workingProgram(
+        appearance: DotAppearance, finite: Bool, finished: Bool = false
+    ) -> String {
+        let color = appearance.workingColor
+        let indexes = finished ? [1] : [0, 1]
+        let held = finished ? "0:\(appearance.finishedColor); " : ""
+        func frame(_ colors: [String], _ duration: Int, _ easing: String = "cosine") -> String {
+            held + zip(indexes, colors).map { "\($0):\($1)" }.joined(separator: " ")
+                + " \(duration)ms \(easing)"
         }
-        let ending = finite
-            ? "repeat \(repeatCount)\n0:\(appearance.finishedColor); 1:#000000"
-            : "repeat"
-        return "0:\(appearance.finishedColor); 1:#000000 \(resetDuration) cosine\n1:\(appearance.workingColor) \(pulseDuration) pulse 0ms\n\(ending)"
+        let full = indexes.map { _ in color }
+        var lines = [finished ? frame(["#000000"], 400) : "off 400ms cosine"]
+        var cycle = 2800
+        switch appearance.animation {
+        case .steady:
+            lines = [frame(full, 60000, "none")]
+            cycle = 60000
+        case .tide, .glow:
+            let rgb = Int(color.dropFirst(), radix: 16) ?? 0
+            let low = "#" + [16, 8, 0].map {
+                String(format: "%02X", Int((Double((rgb >> $0) & 255) * 0.35).rounded(.toNearestOrEven)))
+            }.joined()
+            let first = finished || appearance.animation == .glow ? full : [color, low]
+            let second = finished || appearance.animation == .glow ? indexes.map { _ in low } : [low, color]
+            lines = [frame(second, 400), frame(first, 2200), frame(second, 2200)]
+            cycle = 4800
+        case .gentle:
+            lines.append(frame(full, 2400, "pulse"))
+        case .flow, .kitt:
+            if finished {
+                lines.append(frame(full, 2400, "pulse"))
+            } else if appearance.animation == .flow {
+                lines.append("0:\(color) 1800ms pulse 0ms; 1:\(color) 1800ms pulse 800ms")
+                cycle = 3000
+            } else {
+                lines += ["0:\(color) 1000ms pulse 0ms; 1:\(color) 1000ms pulse 800ms",
+                          "0:\(color) 1000ms pulse 0ms"]
+                cycle = 3200
+            }
+        }
+        if finite {
+            lines += ["repeat \(Int(ceil(workingLifetimeSeconds * 1000 / Double(cycle))))",
+                      held + indexes.map { "\($0):#000000" }.joined(separator: " ")]
+        } else {
+            lines.append("repeat")
+        }
+        return lines.joined(separator: "\n")
     }
 }
 

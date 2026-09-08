@@ -158,6 +158,8 @@ class AgentMonitorSettings:
     recent_session_retention_seconds: float = DEFAULT_RECENT_SESSION_RETENTION_SECONDS
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     kitt_mode_enabled: bool = False
+    led_animation: str = "gentle"
+    led_palette: str = "ocean"
     show_finished_enabled: bool = False
     dnd_enabled: bool = False
     dnd_schedule_enabled: bool = False
@@ -458,7 +460,17 @@ class AgentMonitorSettings:
         )
 
     def with_kitt_mode(self, enabled: bool) -> "AgentMonitorSettings":
-        return replace(self, kitt_mode_enabled=bool(enabled))
+        return self.with_led_appearance(animation="kitt" if enabled else "gentle")
+
+    def with_led_appearance(self, *, animation: str | None = None,
+                            palette: str | None = None) -> "AgentMonitorSettings":
+        from .led_appearance import ANIMATIONS, PALETTES
+        animation = self.led_animation if animation is None else animation
+        palette = self.led_palette if palette is None else palette
+        if animation not in ANIMATIONS or palette not in PALETTES:
+            raise ValueError("Unknown LED appearance")
+        return replace(self, led_animation=animation, led_palette=palette,
+                       kitt_mode_enabled=animation == "kitt")
 
     def with_show_finished(self, enabled: bool) -> "AgentMonitorSettings":
         return replace(self, show_finished_enabled=bool(enabled))
@@ -539,6 +551,8 @@ class AgentMonitorSettings:
                 "idle_timeout_seconds": self.idle_timeout_seconds,
             },
             "kitt_mode_enabled": self.kitt_mode_enabled,
+            "led_animation": self.led_animation,
+            "led_palette": self.led_palette,
             "show_finished_enabled": self.show_finished_enabled,
             "do_not_disturb": {
                 "enabled": self.dnd_enabled,
@@ -673,6 +687,11 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             DEFAULT_IDLE_TIMEOUT_SECONDS,
         ),
         kitt_mode_enabled=_bool_setting(data.get("kitt_mode_enabled"), False),
+        led_animation=(data["led_animation"] if data.get("led_animation") in
+                       ("gentle", "flow", "kitt", "tide", "glow", "steady") else
+                       "kitt" if _bool_setting(data.get("kitt_mode_enabled"), False) else "gentle"),
+        led_palette=(data["led_palette"] if data.get("led_palette") in
+                     ("ocean", "dusk", "ice") else "ocean"),
         show_finished_enabled=_bool_setting(data.get("show_finished_enabled"), False),
         dnd_enabled=_bool_setting(
             dnd.get("enabled"),

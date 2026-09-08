@@ -12,6 +12,7 @@ from .device_writer import (
     write_led_program,
 )
 from .models import AgentMode
+from .led_appearance import PALETTES, working_program
 
 
 class LedDisplayState(str, Enum):
@@ -72,7 +73,25 @@ def program_for_display_state(
     brightness: int | float = 255,
     kitt_mode: bool = False,
     show_finished: bool = False,
+    animation: str | None = None,
+    palette: str = "ocean",
 ) -> str:
+    if animation is not None:
+        _, working, attention, finished = PALETTES.get(palette, PALETTES["ocean"])
+        if state == LedDisplayState.WORKING:
+            program = working_program(animation, working, finished,
+                                      led_count=led_count, show_finished=show_finished)
+        elif state == LedDisplayState.DONE:
+            program = finished
+        elif state == LedDisplayState.ASK:
+            program = working_program("steady" if animation == "steady" else "gentle",
+                                      attention, finished, led_count=led_count,
+                                      show_finished=show_finished)
+        elif show_finished:
+            program = idle_with_finished_program(led_count=led_count).replace(DONE_GREEN, finished)
+        else:
+            return "off"
+        return apply_brightness(program, brightness)
     if state == LedDisplayState.IDLE:
         if show_finished:
             return apply_brightness(
@@ -245,6 +264,8 @@ def write_mode_to_leds(
     brightness: int | float = 255,
     kitt_mode: bool = False,
     show_finished: bool = False,
+    animation: str | None = None,
+    palette: str = "ocean",
 ) -> LedStatusWrite:
     target = resolve_target_path(device_path=device_path, file_name=file_name)
     state = display_state_for_mode(mode)
@@ -254,6 +275,8 @@ def write_mode_to_leds(
         brightness=brightness,
         kitt_mode=kitt_mode,
         show_finished=show_finished,
+        animation=animation,
+        palette=palette,
     )
     written_target = write_led_program(
         program,
@@ -316,6 +339,7 @@ class AgentLedController:
         self.last_state: LedDisplayState | None = None
         self.last_brightness: int | None = None
         self.last_kitt_mode: bool | None = None
+        self.last_appearance: tuple[str | None, str] | None = None
         self.last_show_finished: bool | None = None
         self.last_error: str | None = None
         self.last_target: Path | None = None
@@ -325,6 +349,7 @@ class AgentLedController:
         self.last_state = None
         self.last_brightness = None
         self.last_kitt_mode = None
+        self.last_appearance = None
         self.last_show_finished = None
         self.last_error = None
         self.last_target = None
@@ -336,6 +361,8 @@ class AgentLedController:
         *,
         kitt_mode: bool = False,
         show_finished: bool = False,
+        animation: str | None = None,
+        palette: str = "ocean",
     ) -> LedStatusWrite:
         state = display_state_for_mode(mode)
         brightness = normalize_brightness(self.brightness)
@@ -346,6 +373,7 @@ class AgentLedController:
             state == self.last_state
             and brightness == self.last_brightness
             and kitt_mode == self.last_kitt_mode
+            and (animation, palette) == self.last_appearance
             and show_finished == self.last_show_finished
             and self.last_error is None
         ):
@@ -359,6 +387,7 @@ class AgentLedController:
             state == self.last_state
             and brightness == self.last_brightness
             and kitt_mode == self.last_kitt_mode
+            and (animation, palette) == self.last_appearance
             and show_finished == self.last_show_finished
             and self.last_error is not None
             and now - self.last_attempt_monotonic < self.error_retry_seconds
@@ -381,11 +410,14 @@ class AgentLedController:
                 brightness=brightness,
                 kitt_mode=kitt_mode,
                 show_finished=show_finished,
+                animation=animation,
+                palette=palette,
             )
         except (DeviceWriteError, OSError) as exc:
             self.last_state = state
             self.last_brightness = brightness
             self.last_kitt_mode = kitt_mode
+            self.last_appearance = (animation, palette)
             self.last_show_finished = show_finished
             self.last_error = str(exc)
             return LedStatusWrite(
@@ -399,6 +431,7 @@ class AgentLedController:
         self.last_state = state
         self.last_brightness = brightness
         self.last_kitt_mode = kitt_mode
+        self.last_appearance = (animation, palette)
         self.last_show_finished = show_finished
         self.last_error = None
         self.last_target = result.target

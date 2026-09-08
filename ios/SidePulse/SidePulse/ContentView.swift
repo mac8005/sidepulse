@@ -752,6 +752,20 @@ struct DotBehaviorControls: View {
             }
             .pickerStyle(.menu)
 
+            Text(model.dotAppearance.animation.detail)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            Picker("Color palette", selection: palette) {
+                ForEach(DotPalette.allCases) { palette in
+                    Text(palette.label).tag(palette.rawValue)
+                }
+                if model.dotAppearance.palette == nil {
+                    Text("Custom").tag("custom")
+                }
+            }
+            .pickerStyle(.menu)
+
             ColorPicker(
                 "Working",
                 selection: appearanceColor(
@@ -845,6 +859,17 @@ struct DotBehaviorControls: View {
         } set: { animation in
             var appearance = model.dotAppearance
             appearance.animation = animation
+            model.dotAppearance = appearance
+        }
+    }
+
+    private var palette: Binding<String> {
+        Binding {
+            model.dotAppearance.palette?.rawValue ?? "custom"
+        } set: { value in
+            guard let palette = DotPalette(rawValue: value) else { return }
+            var appearance = model.dotAppearance
+            appearance.apply(palette)
             model.dotAppearance = appearance
         }
     }

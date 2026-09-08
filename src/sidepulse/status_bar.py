@@ -99,6 +99,7 @@ from .install import (
     uninstall_codex_hooks,
     uninstall_grok_hooks,
 )
+from .led_appearance import ANIMATIONS, PALETTES
 from .led_status import (
     AgentLedController,
     apply_brightness,
@@ -886,6 +887,16 @@ class StatusBarController(NSObject):
         self.set_kitt_mode(sender.state() == NSOnState)
 
     @objc.IBAction
+    def setLedAnimation_(self, sender):
+        item = sender.selectedItem() if hasattr(sender, "selectedItem") else sender
+        self.set_led_appearance(animation=str(item.representedObject()))
+
+    @objc.IBAction
+    def setLedPalette_(self, sender):
+        item = sender.selectedItem() if hasattr(sender, "selectedItem") else sender
+        self.set_led_appearance(palette=str(item.representedObject()))
+
+    @objc.IBAction
     def toggleShowFinished_(self, _sender):
         self.set_show_finished(not self.settings.show_finished_enabled)
 
@@ -1422,10 +1433,12 @@ class StatusBarController(NSObject):
             self.settings_buttons.get("battery_power_preview"),
             self.settings.battery_show_on_power_change,
         )
-        set_checkbox_state(
-            self.settings_buttons.get("kitt_mode"),
-            self.settings.kitt_mode_enabled,
-        )
+        for key in ("led_animation", "led_palette"):
+            popup = self.settings_fields.get(key)
+            if popup is not None:
+                for index, item in enumerate(popup.itemArray()):
+                    if item.representedObject() == getattr(self.settings, key):
+                        popup.selectItemAtIndex_(index)
         set_checkbox_state(
             self.settings_buttons.get("show_finished"),
             self.settings.show_finished_enabled,
@@ -2186,6 +2199,20 @@ class StatusBarController(NSObject):
         self.refresh_settings_window()
         self.refresh_(None)
 
+    def set_led_appearance(self, *, animation=None, palette=None) -> None:
+        try:
+            self.settings = self.settings.with_led_appearance(animation=animation, palette=palette)
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save LED appearance: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+        self.reset_led_controllers_for_display_change()
+        self.set_settings_message("LED appearance updated for Pulse and Dot.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
     def set_show_finished(self, enabled: bool) -> None:
         try:
             self.settings = self.settings.with_show_finished(enabled)
@@ -2721,6 +2748,8 @@ class StatusBarController(NSObject):
                     led_count=8,
                     brightness=device.brightness,
                     kitt_mode=self.settings.kitt_mode_enabled,
+                    animation=self.settings.led_animation,
+                    palette=self.settings.led_palette,
                     show_finished=show_finished,
                 )
             )
@@ -2786,6 +2815,8 @@ class StatusBarController(NSObject):
                 result = self.agent_controller_for_device(device).sync_mode(
                     mode,
                     kitt_mode=self.settings.kitt_mode_enabled,
+                    animation=self.settings.led_animation,
+                    palette=self.settings.led_palette,
                     show_finished=show_finished,
                 )
                 label = f"{device.name} {result.label}"
@@ -3190,14 +3221,22 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
         virtual_toggle.setTarget_(target)
         menu.addItem_(virtual_toggle)
 
-    kitt_mode = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "KITT Scanner While Working",
-        "toggleKittMode:",
-        "",
-    )
-    kitt_mode.setTarget_(target)
-    kitt_mode.setState_(1 if target.settings.kitt_mode_enabled else 0)
-    menu.addItem_(kitt_mode)
+    appearance = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("LED Appearance", None, "")
+    appearance_menu = NSMenu.alloc().init()
+    for values, selected, action in (
+        (ANIMATIONS, target.settings.led_animation, "setLedAnimation:"),
+        ({key: value[0] for key, value in PALETTES.items()}, target.settings.led_palette, "setLedPalette:"),
+    ):
+        if appearance_menu.numberOfItems():
+            appearance_menu.addItem_(NSMenuItem.separatorItem())
+        for value, label in values.items():
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, action, "")
+            item.setTarget_(target)
+            item.setRepresentedObject_(value)
+            item.setState_(1 if value == selected else 0)
+            appearance_menu.addItem_(item)
+    appearance.setSubmenu_(appearance_menu)
+    menu.addItem_(appearance)
 
     show_finished = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Show finished",
@@ -4231,15 +4270,10 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         target,
         "setBatteryPowerPreviewFromCheckbox:",
     )
-    kitt_mode = add_checkbox(
-        devices_tab,
-        "KITT scanner while working",
-        344,
-        356,
-        280,
-        24,
-        target,
-        "setKittModeFromCheckbox:",
+    led_animation = add_led_appearance_popup(devices_tab, 356, ANIMATIONS, target, "setLedAnimation:")
+    led_palette = add_led_appearance_popup(
+        devices_tab, 394, {key: f"Colors: {value[0]}" for key, value in PALETTES.items()},
+        target, "setLedPalette:",
     )
     show_finished = add_checkbox(
         devices_tab,
@@ -4413,6 +4447,8 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     message = add_label(content, "", 24, 22, width - 48, 22)
 
     target.settings_fields = {
+        "led_animation": led_animation,
+        "led_palette": led_palette,
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
@@ -4449,7 +4485,6 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "claude_transcripts": claude_transcripts,
         "battery_leds": battery_leds,
         "battery_power_preview": battery_power_preview,
-        "kitt_mode": kitt_mode,
         "show_finished": show_finished,
         "dnd_enabled": dnd_enabled,
         "dnd_schedule": dnd_schedule,
@@ -4465,6 +4500,17 @@ def remote_hosts_status_text(hosts: tuple[RemoteHost, ...]) -> str:
     if remote_launch_agent_path().exists():
         return f"{count} remote {host_label} configured. Automatic monitor installed."
     return f"{count} remote {host_label} configured. Automatic monitor not installed."
+
+
+def add_led_appearance_popup(view, y, choices, target, action):
+    popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(((344, y), (280, 26)), False)
+    for value, label in choices.items():
+        popup.addItemWithTitle_(label)
+        popup.lastItem().setRepresentedObject_(value)
+    popup.setTarget_(target)
+    popup.setAction_(action)
+    view.addSubview_(popup)
+    return popup
 
 
 def add_settings_tab(tab_view, identifier: str, title: str, width: int, height: int):
