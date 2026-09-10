@@ -13,10 +13,11 @@ Updated: 2026-09-10
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Air (`mac8005-airm3-swisslife`) was offline 2026-09-10 05:30: pull this branch there and `launchctl kickstart -k gui/$(id -u)/io.sidepulse.agentstatus` (+ remotehosts) for the unread-click fix and log trimming. M1 is done.
+1. Air (`mac8005-airm3-swisslife`) was offline 2026-09-10: pull this branch there, reinstall into its venv if it is a copied install, and kickstart `io.sidepulse.agentstatus` (+ remotehosts) for the unread-click fix and log trimming. M1 is done (venv reinstalled 16:48).
 2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
 
 ## Gotchas
+- M1 menu-bar app also runs a COPIED venv (`~/.local/share/sidepulse/venv`, launcher execs its python): `git pull` there is inert until `venv/bin/pip install --no-deps --force-reinstall ~/Git/sidepulse` + kickstart agentstatus/remotehosts. Cost a day on the unread-click fix.
 - Mini venv is a COPIED install: deploy = `~/.local/share/sidepulse/venv/bin/pip install --no-deps --force-reinstall .` then `launchctl kickstart -k gui/501/io.sidepulse.live-activity` (and `io.sidepulse.paseo-monitor` when paseo_monitor.py changed). Hooks run from the source tree by path.
 - "Dynamic Island gone but Lock Screen card still there" with `/health` reporting `activityLive: true` and a fresh `activityReportAgeSeconds` = the island entry was swiped away or displaced; pushes never re-attach it. The daemon replaces the activity at 7.5 h (`ACTIVITY_MAX_AGE_SECONDS`), which brings it back.
 - `AgentStatus.updated_at` keeps microseconds only; never compare it by equality to a daemon `finishedAt` float (that bug left clicked sessions unread in the Mac app).
@@ -25,6 +26,7 @@ Updated: 2026-09-10
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
 - 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.
 - 2026-09-07: Usage-alert repeat storm fixed (reset_at jitter → 10-min tolerance), 1566d70.
