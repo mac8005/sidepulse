@@ -1,0 +1,29 @@
+# Status
+Updated: 2026-09-10
+
+## In flight
+- Nothing mid-change. Mini daemon (`io.sidepulse.live-activity`) and Paseo monitor run the venv copy of the current tree (deploy recipe in Gotchas).
+
+## Decisions
+- Usage meters read Claude (Keychain OAuth) and Codex (`~/.codex/auth.json`, wham endpoints) directly; CodexBar CLI is fallback only — it hung for hours behind a Gatekeeper prompt after a cask upgrade (2026-09-06).
+- Usage alerts: one warning per window at 90%, one reset alert when an armed window comes back; a window is "new" only when its reset time moves >10 min (Codex `reset_at` jitters ±1 s).
+- Paseo "closed"/"initializing" are quiet states (daemon restart lists every agent as closed); idle history from a directory listing is never announced.
+- Push-to-start bursts stop after one retry (MAX_UNANSWERED_START_PUSHES=2): unanswered starts stacked three cards on 2026-09-06.
+- Hook logs self-trim to 64 MB at 96 MB; tool_response/tool_input compacted to head 1 KB + tail 2 KB at write time (was 2.2 GB, 100 MB/day).
+- Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
+
+## Next
+1. Pull this branch on the M1 and the Air and restart their agents so their hook logs get the trimming too.
+2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
+
+## Gotchas
+- Mini venv is a COPIED install: deploy = `~/.local/share/sidepulse/venv/bin/pip install --no-deps --force-reinstall .` then `launchctl kickstart -k gui/501/io.sidepulse.live-activity` (and `io.sidepulse.paseo-monitor` when paseo_monitor.py changed). Hooks run from the source tree by path.
+- "Dynamic Island gone but Lock Screen card still there" with `/health` reporting `activityLive: true` and a fresh `activityReportAgeSeconds` = the island entry was swiped away or displaced; pushes never re-attach it. The daemon replaces the activity at 7.5 h (`ACTIVITY_MAX_AGE_SECONDS`), which brings it back.
+- `ignoring retired activity token <current id>` in the log is benign: the app re-sent an older observation of the same activity.
+- Full suite: `.venv/bin/python -m pytest -q tests` (not the repo root: `ios/SidePulse/tools/tests` needs fastapi). ruff is not installed; `uvx ruff check` works, the tree has pre-existing findings.
+- Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
+
+## Log
+- 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.
+- 2026-09-07: Usage-alert repeat storm fixed (reset_at jitter → 10-min tolerance), 1566d70.
+- 2026-09-06: Usage alerts (5079930), hook-log trimming+compaction (24cb9a7), direct Codex usage + Paseo quiet states + start-push guard (783ecd4); CodexBar Gatekeeper hang unblocked; maintenance casks now `--no-quarantine`.
