@@ -15,9 +15,10 @@ Updated: 2026-09-10
 
 ## Next
 1. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
+2. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
 ## Gotchas
-- Air has no `~/Git/sidepulse` checkout: build a wheel on Mini, copy it over SSH, force-reinstall it into `~/.local/share/sidepulse/venv`, then kickstart agentstatus/remotehosts. Installed from the same 041333d wheel as Mini/M1 on 2026-09-10, including the earlier unread-click fix.
+- Air has no `~/Git/sidepulse` checkout: build a wheel on Mini, copy it over SSH, force-reinstall it into `~/.local/share/sidepulse/venv`, then kickstart agentstatus/remotehosts. Installed from the same 041333d wheel as Mini/M1 on 2026-09-10, including the earlier unread-click fix. The Air's hooks are separate: they run from the editable pipx venv → `~/Git/sidepulse-feature` (remote `origin`, same branch), so hook-side changes (log trimming/compaction) need `git pull --ff-only origin mac8005/remote-host-monitoring` there; done 2026-09-10 20:05 (f428de4→d4ee412).
 - M1 menu-bar app also runs a COPIED venv (`~/.local/share/sidepulse/venv`, launcher execs its python): `git pull` there is inert until `venv/bin/pip install --no-deps --force-reinstall ~/Git/sidepulse` + kickstart agentstatus/remotehosts. Cost a day on the unread-click fix.
 - Mini venv is a COPIED install: deploy = `~/.local/share/sidepulse/venv/bin/pip install --no-deps --force-reinstall .` then `launchctl kickstart -k gui/501/io.sidepulse.live-activity` (and `io.sidepulse.paseo-monitor` when paseo_monitor.py changed). Hooks run from the source tree by path.
 - "Dynamic Island gone but Lock Screen card still there" with `/health` reporting `activityLive: true` and a fresh `activityReportAgeSeconds` = the island entry was swiped away or displaced; pushes never re-attach it. The daemon replaces the activity at 7.5 h (`ACTIVITY_MAX_AGE_SECONDS`), which brings it back.
@@ -27,6 +28,7 @@ Updated: 2026-09-10
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-10 20:05: Air verified for the unread-click fix (launcher venv hashes match d4ee412, agents up since 19:57); hook checkout ~/Git/sidepulse-feature fast-forwarded, hook smoke test exit 0.
 - 2026-09-10: 041333d pushed and deployed to Mini/M1/Air; phantom absent in live snapshot, all installed collector hashes match. Full suite: 804 tests + 519 subtests passed (33 existing warnings); no iOS rebuild required.
 - 2026-09-10: Added title-helper filter and eight regression cases; focused tests and real log replay passed, rollout in progress.
 - 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
