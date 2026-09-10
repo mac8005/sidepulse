@@ -2,10 +2,10 @@
 Updated: 2026-09-10
 
 ## In flight
-- Nothing mid-change. Mini daemon (`io.sidepulse.live-activity`) and Paseo monitor run the venv copy of the current tree (deploy recipe in Gotchas).
-- Diagnosis only: false Working row `01a08c4c-a7ef-7ea1-89ab-1154f09390e8` is an ephemeral title-generation helper, not the repair task. Its 17:10:30Z start/prompt hooks have no terminal hook or transcript; no goal record. `should_ignore_record` excludes suggestion/safety helpers but not this title prompt. No application change made; filtering repair awaits authorization.
+- Title-helper filter implemented; 164 focused tests + 209 subtests passed, real hook replay removes the phantom and retains the interactive session. Full suite running; deployment to Mini/M1/Air next.
 
 ## Decisions
+- Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
 - Usage meters read Claude (Keychain OAuth) and Codex (`~/.codex/auth.json`, wham endpoints) directly; CodexBar CLI is fallback only — it hung for hours behind a Gatekeeper prompt after a cask upgrade (2026-09-06).
 - Usage alerts: one warning per window at 90%, one reset alert when an armed window comes back; a window is "new" only when its reset time moves >10 min (Codex `reset_at` jitters ±1 s).
 - Paseo "closed"/"initializing" are quiet states (daemon restart lists every agent as closed); idle history from a directory listing is never announced.
@@ -27,6 +27,7 @@ Updated: 2026-09-10
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-10: Added title-helper filter and eight regression cases; focused tests and real log replay passed, rollout in progress.
 - 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.

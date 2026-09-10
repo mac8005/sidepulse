@@ -65,6 +65,7 @@ class StatusMetadata:
     title: str | None = None
     origin: str | None = None
     summary: str | None = None
+    internal_title_helper: bool = False
 
 
 @dataclass(frozen=True)
@@ -1095,10 +1096,15 @@ def metadata_for_record(
         title=status_metadata.title or session_metadata.title,
         origin=status_metadata.origin or session_metadata.origin,
         summary=status_metadata.summary or session_metadata.summary,
+        internal_title_helper=(
+            status_metadata.internal_title_helper or session_metadata.internal_title_helper
+        ),
     )
 
 
 def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
+    if is_internal_title_helper(record):
+        metadata.internal_title_helper = True
     if record.cwd:
         metadata.cwd = record.cwd
 
@@ -1674,7 +1680,22 @@ def is_ignored_display_name(display_name: str) -> bool:
     return any(display_name.startswith(f"{name}:") for name in ignored_cwd_names())
 
 
+def is_internal_title_helper(record: HookEvent) -> bool:
+    if record.provider != "codex" or record.event_name != "UserPromptSubmit":
+        return False
+    if record.raw.get("transcript_path") or record.raw.get("transcriptPath"):
+        return False
+    prompt = " ".join(str(record.raw.get("prompt") or "").lower().split())
+    return prompt.startswith(
+        "you are a helpful assistant. you will be presented with a user prompt, "
+        "and your job is to provide a short title for a task that will be created "
+        "from that prompt."
+    ) and "do not answer the user or attempt the task." in prompt
+
+
 def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
+    if metadata.internal_title_helper or is_internal_title_helper(record):
+        return True
     if record.raw.get("sidepulse_background_session") is True:
         return True
     if aura_headless_entrypoint(record.raw) == "sdk-cli":
