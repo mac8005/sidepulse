@@ -2,7 +2,7 @@
 Updated: 2026-09-10
 
 ## In flight
-- Title-helper filter implemented; 164 focused tests + 209 subtests passed, real hook replay removes the phantom and retains the interactive session. Full suite running; deployment to Mini/M1/Air next.
+- Nothing mid-change. Title-helper filter 041333d is installed on Mini, M1, and Air; running services and identical installed collector hashes verified. Mini snapshot no longer contains the phantom helper.
 
 ## Decisions
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
@@ -14,10 +14,10 @@ Updated: 2026-09-10
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Air (`mac8005-airm3-swisslife`) was offline 2026-09-10: pull this branch there, reinstall into its venv if it is a copied install, and kickstart `io.sidepulse.agentstatus` (+ remotehosts) for the unread-click fix and log trimming. M1 is done (venv reinstalled 16:48).
-2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
+1. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
 
 ## Gotchas
+- Air has no `~/Git/sidepulse` checkout: build a wheel on Mini, copy it over SSH, force-reinstall it into `~/.local/share/sidepulse/venv`, then kickstart agentstatus/remotehosts. Installed from the same 041333d wheel as Mini/M1 on 2026-09-10, including the earlier unread-click fix.
 - M1 menu-bar app also runs a COPIED venv (`~/.local/share/sidepulse/venv`, launcher execs its python): `git pull` there is inert until `venv/bin/pip install --no-deps --force-reinstall ~/Git/sidepulse` + kickstart agentstatus/remotehosts. Cost a day on the unread-click fix.
 - Mini venv is a COPIED install: deploy = `~/.local/share/sidepulse/venv/bin/pip install --no-deps --force-reinstall .` then `launchctl kickstart -k gui/501/io.sidepulse.live-activity` (and `io.sidepulse.paseo-monitor` when paseo_monitor.py changed). Hooks run from the source tree by path.
 - "Dynamic Island gone but Lock Screen card still there" with `/health` reporting `activityLive: true` and a fresh `activityReportAgeSeconds` = the island entry was swiped away or displaced; pushes never re-attach it. The daemon replaces the activity at 7.5 h (`ACTIVITY_MAX_AGE_SECONDS`), which brings it back.
@@ -27,6 +27,7 @@ Updated: 2026-09-10
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-10: 041333d pushed and deployed to Mini/M1/Air; phantom absent in live snapshot, all installed collector hashes match. Full suite: 804 tests + 519 subtests passed (33 existing warnings); no iOS rebuild required.
 - 2026-09-10: Added title-helper filter and eight regression cases; focused tests and real log replay passed, rollout in progress.
 - 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
