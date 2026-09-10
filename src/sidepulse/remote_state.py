@@ -14,6 +14,9 @@ from .session_actions import external_session_id, remote_session_parts
 
 
 REMOTE_STATE_TIMEOUT_SECONDS = 3.0
+# A generation is asked for via AgentStatus.updated_at, which only keeps
+# microseconds of the daemon's finishedAt float; compare within that.
+FINISHED_AT_TOLERANCE_SECONDS = 1e-3
 
 
 @dataclass(frozen=True)
@@ -139,7 +142,10 @@ class RemoteUnreadStore:
                 if row.host_name == host_name
                 and row.server_id in candidates
                 and (monitor_url is None or row.monitor_url == monitor_url)
-                and (finished_at is None or row.finished_at == finished_at)
+                and (
+                    finished_at is None
+                    or abs(row.finished_at - finished_at) < FINISHED_AT_TOLERANCE_SECONDS
+                )
             ]
         return max(matches, key=lambda row: row.finished_at, default=None)
 

@@ -259,6 +259,26 @@ def test_exact_menu_generation_never_resolves_to_a_newer_completion() -> None:
     ) == newer
 
 
+def test_exact_generation_match_survives_the_datetime_round_trip() -> None:
+    """The daemon's finishedAt has up to seven decimals; the menu row built
+    from it carries microseconds. Clicking such a row must still find its
+    generation, or the session stays unread (seen on the Mac app)."""
+    host = RemoteHost("macmini", "mini", monitor_url=MONITOR_URL)
+    row = CanonicalUnread(host.name, MONITOR_URL, f"codex:session:{SESSION_ID}", 1788675295.2368262)
+    later = CanonicalUnread(host.name, MONITOR_URL, f"codex:session:{SESSION_ID}", 1788675302.0)
+    status = canonical_status_for_unread(row)
+    assert status is not None
+    assert status.updated_at.timestamp() != row.finished_at  # the precision loss itself
+    store = RemoteUnreadStore()
+    store.retain_routes({host.name: MONITOR_URL})
+    store.replace_host(host.name, (row, later), monitor_url=MONITOR_URL)
+
+    generation = status.updated_at.timestamp()
+    assert store.match_status(host.name, status, monitor_url=MONITOR_URL, finished_at=generation) == row
+    assert store.optimistically_clear(row) is not None
+    assert store.match_status(host.name, status, monitor_url=MONITOR_URL, finished_at=generation) is None
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires AppKit")
 def test_canonical_completion_survives_missing_ssh_row_and_replaces_old_collision() -> None:
     from sidepulse import status_bar
