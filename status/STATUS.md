@@ -3,6 +3,7 @@ Updated: 2026-09-10
 
 ## In flight
 - Nothing mid-change. Mini daemon (`io.sidepulse.live-activity`) and Paseo monitor run the venv copy of the current tree (deploy recipe in Gotchas).
+- Diagnosis only: false Working row `01a08c4c-a7ef-7ea1-89ab-1154f09390e8` is an ephemeral title-generation helper, not the repair task. Its 17:10:30Z start/prompt hooks have no terminal hook or transcript; no goal record. `should_ignore_record` excludes suggestion/safety helpers but not this title prompt. No application change made; filtering repair awaits authorization.
 
 ## Decisions
 - Usage meters read Claude (Keychain OAuth) and Codex (`~/.codex/auth.json`, wham endpoints) directly; CodexBar CLI is fallback only — it hung for hours behind a Gatekeeper prompt after a cask upgrade (2026-09-06).
@@ -26,6 +27,7 @@ Updated: 2026-09-10
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
 - 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.
