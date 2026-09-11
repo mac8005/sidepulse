@@ -2,7 +2,8 @@
 Updated: 2026-09-11
 
 ## In flight
-- LED-impact-only visible notifications and immediate iOS stale-state reporting implemented; regression suite and TestFlight/backend deployment in progress. Combined the stopped worker's logical LED-change gate with phone-rendered program fingerprints and an already-ACKed output check.
+- 88b1297 pushed; Mini backend installed and source hash verified. Full suite: 811 tests + 519 subtests passed; unsigned Release iOS build succeeded (one job, external DerivedData). Replacement Live Activity registered active; actual Island visibility needs phone confirmation.
+- TestFlight blocked: retained distribution certificate A746ULFPFZ returns Apple 404 and SidePulse profiles are INVALID. Existing same-team IOS_DISTRIBUTION identity 4STRQLBTSW is retained under ~/.local/share/aura/ios-signing/identity-ou99a6vp (password referenced through Keychain metadata). Await authority to reuse it and create only replacement SidePulse profiles; do not revoke certificates. Current .testflight/deploy-persistent.sh assumes DISTRIBUTION, not IOS_DISTRIBUTION. No new upload occurred.
 
 ## Decisions
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
@@ -16,8 +17,9 @@ Updated: 2026-09-11
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
-2. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
+1. Resolve the signing blocker, upload to existing Personal Testing, verify VALID/group membership. Install/open once so the server receives the phone's rendered LED-state hashes. Until then the server uses logical-state fallback; immediate stale reporting is not yet on the phone.
+2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
+3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
 ## Gotchas
 - Air has no `~/Git/sidepulse` checkout: build a wheel on Mini, copy it over SSH, force-reinstall it into `~/.local/share/sidepulse/venv`, then kickstart agentstatus/remotehosts. Installed from the same 041333d wheel as Mini/M1 on 2026-09-10, including the earlier unread-click fix. The Air's hooks are separate: they run from the editable pipx venv → `~/Git/sidepulse-feature` (remote `origin`, same branch), so hook-side changes (log trimming/compaction) need `git pull --ff-only origin mac8005/remote-host-monitoring` there; done 2026-09-10 20:05 (f428de4→d4ee412).
@@ -30,6 +32,7 @@ Updated: 2026-09-11
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-11 13:16: 88b1297 server deployed, 811 tests + 519 subtests and unsigned iOS Release passed. Replaced current activity; phone registered active. TestFlight preflight blocked by removed retained certificate, no signing assets changed or upload made. Release artifacts /private/tmp/sidepulse-release.Tmbg0A; build check /Volumes/MacMiniData/sidepulse-build-check.ZAixFk.
 - 2026-09-11: Reviewed overlapping stopped-worker changes; reproduced three unnecessary-banner cases, implemented actual LED-program gating and immediate stale-state reports. Focused original regressions passed; full verification/release in progress.
 - 2026-09-11: Island vanished again at 3.5 h; root cause = phone reported the activity stale at 06:27 (18 such reports in the log history). Shipped stale guard + stale-report replacement, deployed to the mini, replaced the live activity by hand.
 - 2026-09-10 20:05: Air verified for the unread-click fix (launcher venv hashes match d4ee412, agents up since 19:57); hook checkout ~/Git/sidepulse-feature fast-forwarded, hook smoke test exit 0.
