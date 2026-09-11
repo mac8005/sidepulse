@@ -3,7 +3,7 @@ Updated: 2026-09-11
 
 ## In flight
 - 88b1297 pushed; Mini backend installed and source hash verified. Full suite: 811 tests + 519 subtests passed; unsigned Release iOS build succeeded (one job, external DerivedData). Replacement Live Activity registered active; actual Island visibility needs phone confirmation.
-- TestFlight blocked: retained distribution certificate A746ULFPFZ returns Apple 404 and SidePulse profiles are INVALID. Existing same-team IOS_DISTRIBUTION identity 4STRQLBTSW is retained under ~/.local/share/aura/ios-signing/identity-ou99a6vp (password referenced through Keychain metadata). Await authority to reuse it and create only replacement SidePulse profiles; do not revoke certificates. Current .testflight/deploy-persistent.sh assumes DISTRIBUTION, not IOS_DISTRIBUTION. No new upload occurred.
+- Signing repaired with user approval: reused same-team IOS_DISTRIBUTION certificate 4STRQLBTSW and created only six SidePulse IOS_APP_STORE profiles, all ACTIVE. Old SidePulse keychain password no longer worked; preserved it and imported the existing identity into sidepulse-distribution-20260911.keychain-db. New password stored in login Keychain service io.sidepulse.distribution-signing-20260911, account release. Local .testflight/deploy-persistent.sh accepts this retained identity; archive/upload next. No certificate creation/revocation.
 
 ## Decisions
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
@@ -17,7 +17,7 @@ Updated: 2026-09-11
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Resolve the signing blocker, upload to existing Personal Testing, verify VALID/group membership. Install/open once so the server receives the phone's rendered LED-state hashes. Until then the server uses logical-state fallback; immediate stale reporting is not yet on the phone.
+1. Upload to existing Personal Testing, verify VALID/group membership. Install/open once so the server receives the phone's rendered LED-state hashes. Until then the server uses logical-state fallback; immediate stale reporting is not yet on the phone.
 2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
 3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
@@ -32,6 +32,7 @@ Updated: 2026-09-11
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
 - 2026-09-11 13:16: 88b1297 server deployed, 811 tests + 519 subtests and unsigned iOS Release passed. Replaced current activity; phone registered active. TestFlight preflight blocked by removed retained certificate, no signing assets changed or upload made. Release artifacts /private/tmp/sidepulse-release.Tmbg0A; build check /Volumes/MacMiniData/sidepulse-build-check.ZAixFk.
 - 2026-09-11: Reviewed overlapping stopped-worker changes; reproduced three unnecessary-banner cases, implemented actual LED-program gating and immediate stale-state reports. Focused original regressions passed; full verification/release in progress.
 - 2026-09-11: Island vanished again at 3.5 h; root cause = phone reported the activity stale at 06:27 (18 such reports in the log history). Shipped stale guard + stale-report replacement, deployed to the mini, replaced the live activity by hand.
