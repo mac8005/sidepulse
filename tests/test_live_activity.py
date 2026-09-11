@@ -4437,3 +4437,128 @@ def test_usage_alerts_reach_every_phone_as_plain_notifications(tmp_path, monkeyp
     assert options["push_type"] == "alert"
     assert options["topic"] == config.bundle_id
     assert options["expiration"] > time.time() + 3000
+
+
+def _keep_fresh_daemon(tmp_path, monkeypatch, sent, clock):
+    """An active session, a registered activity, and every update push
+    recorded as (priority, time, stale-date)."""
+    import types
+
+    monkeypatch.setattr("sidepulse.live_activity.time.time", lambda: clock[0])
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.tokens.register(
+        "update",
+        "activity-token",
+        {"activity_id": "a", "activity_started_at": clock[0], "frequent_pushes_enabled": True},
+    )
+    working = make_status(
+        "claude:session:s1", AgentMode.WORKING, name="SidePulse: keep the island alive", session_id="s1"
+    )
+    daemon.monitor = types.SimpleNamespace(
+        snapshot=lambda include_stale=False: types.SimpleNamespace(
+            statuses=[working], aggregate=types.SimpleNamespace(mode=AgentMode.WORKING)
+        )
+    )
+
+    def fanout(kind, payload, priority=10, **options):
+        if kind == "update":
+            sent.append((priority, clock[0], payload["aps"].get("stale-date"), payload["aps"].get("event")))
+        elif kind == "push_to_start":
+            sent.append(("start", clock[0], None, "start"))
+        return True
+
+    monkeypatch.setattr(daemon, "_apns_fanout", fanout)
+    return daemon
+
+
+def test_an_active_activity_gets_a_high_priority_push_before_its_stale_date(tmp_path, monkeypatch):
+    """Title-only churn goes out at priority 5, which the phone defers for
+    long stretches while idle; the stale date then lapses and iOS drops the
+    activity from the Dynamic Island for good (2026-09-11). A priority-10
+    push must land inside every stale window regardless of content."""
+    from sidepulse.live_activity import STALE_AFTER_SECONDS, STALE_GUARD_SECONDS
+
+    sent = []
+    clock = [1000.0]
+    daemon = _keep_fresh_daemon(tmp_path, monkeypatch, sent, clock)
+
+    daemon._tick()  # hydration: structural, high priority
+    assert [priority for priority, *_ in sent] == [10]
+    assert sent[0][2] == int(1000.0 + STALE_AFTER_SECONDS)
+
+    # Quiet minutes inside the guard window: only low-priority pushes go out.
+    for moment in (1300.0, 1599.0):
+        clock[0] = moment
+        daemon._tick()
+    assert sent[1:] and all(priority == 5 for priority, *_ in sent[1:])
+
+    # Ten minutes without a high-priority push: the guard sends one, at once.
+    clock[0] = 1000.0 + STALE_GUARD_SECONDS + 1.0
+    daemon._tick()
+    assert sent[-1][0] == 10
+    assert daemon._last_priority_push_at == clock[0]
+
+    # And again after the next quiet stretch, well inside the stale window.
+    clock[0] = sent[-1][1] + STALE_GUARD_SECONDS + 1.0
+    daemon._tick()
+    assert sent[-1][0] == 10
+    assert sent[-1][1] - sent[-2][1] < STALE_AFTER_SECONDS
+
+
+def test_a_stale_report_replaces_the_activity_once_then_only_refreshes(tmp_path, monkeypatch):
+    """iOS drops a stale activity from the island for good; only a new one
+    comes back. The first stale report about the current activity ends it
+    and starts a fresh one; within the cooldown a repeat only refreshes at
+    high priority, and a late report about a retired activity is ignored."""
+    from sidepulse.live_activity import STALE_REPLACE_COOLDOWN_SECONDS
+
+    sent = []
+    clock = [1000.0]
+    daemon = _keep_fresh_daemon(tmp_path, monkeypatch, sent, clock)
+    daemon.tokens.register("push_to_start", "p2s", {"device": "phone"})
+    daemon._tick()
+    assert [priority for priority, *_ in sent] == [10]
+
+    clock[0] = 1100.0
+    daemon._wake.clear()
+    assert daemon.register_update_token(
+        "activity-token",
+        {"device": "phone", "activity_id": "a", "activity_state": "stale", "activities_enabled": True},
+    ) is True
+    assert daemon._wake.is_set()
+
+    clock[0] = 1101.0
+    daemon._tick()
+    assert [event for *_, event in sent[1:]] == ["end", "start"]
+    assert daemon.tokens.tokens("update") == []
+    assert daemon._activity_live is False
+
+    # The phone registers the replacement; a stale report inside the cooldown
+    # refreshes at high priority instead of churning another activity.
+    clock[0] = 1200.0
+    daemon.register_update_token(
+        "activity-token-2",
+        {"device": "phone", "activity_id": "b", "activity_started_at": 1200.0, "activities_enabled": True},
+    )
+    daemon._tick()  # hydrates the new activity
+    sent.clear()
+    clock[0] = 1300.0
+    daemon.register_update_token(
+        "activity-token-2",
+        {"device": "phone", "activity_id": "b", "activity_state": "stale", "activities_enabled": True},
+    )
+    clock[0] = 1301.0
+    daemon._tick()
+    assert [(priority, event) for priority, _, _, event in sent] == [(10, "update")]
+    assert daemon.tokens.tokens("update") == ["activity-token-2"]
+
+    # A late report about the retired activity changes nothing.
+    sent.clear()
+    clock[0] = 1301.0 + STALE_REPLACE_COOLDOWN_SECONDS
+    daemon._record_activity_report(
+        {"device": "phone", "activity_id": "a", "activity_state": "stale", "activities_enabled": True},
+        "device",
+    )
+    daemon._tick()
+    assert all(event != "end" for *_, event in sent)
+    assert daemon.tokens.tokens("update") == ["activity-token-2"]

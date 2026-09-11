@@ -65,7 +65,19 @@ COSMETIC_PUSH_INTERVAL_SECONDS = 60.0
 # Leave enough margin for APNs to defer a low-priority heartbeat without
 # expiring the Dynamic Island. The previous six-minute deadline was reached
 # during one short burst of throttling even though the daemon stayed healthy.
-STALE_AFTER_SECONDS = 15 * 60.0
+# Once the stale date lapses iOS drops the activity from the Dynamic Island
+# for good (the Lock Screen card stays, later updates never re-present it),
+# so the window is wide and a high-priority push is guaranteed inside it.
+STALE_AFTER_SECONDS = 30 * 60.0
+# Priority-5 pushes are deferred for long stretches while the phone idles
+# (2026-09-11: an hour of title-only updates at night, then "stale"). While
+# sessions are active, never let this long pass without a priority-10 push.
+STALE_GUARD_SECONDS = 10 * 60.0
+# A stale report means the island has already dropped the activity, and only
+# a new activity brings it back: replace it the way the 7.5 h cap does. Not
+# more often than this, though — every start carries an alert, and if the
+# phone is throttling the app, churning activities would not help.
+STALE_REPLACE_COOLDOWN_SECONDS = 2 * 3600.0
 PUSH_HEARTBEAT_SECONDS = 5 * 60.0
 # Once everything is finished the content stops changing, so nothing gets
 # pushed — and an activity that died on the phone meanwhile stays "live" in
@@ -1715,6 +1727,9 @@ class LiveActivityDaemon:
         self._last_pushed_signature: tuple | None = None
         self._last_pushed_state: dict[str, Any] | None = None
         self._last_push_at = 0.0
+        self._last_priority_push_at = 0.0
+        self._stale_reported_at = 0.0
+        self._last_stale_replacement_at = 0.0
         self._push_state_lock = threading.RLock()
         self._update_token_generation = 0
         self._retired_activity_ids: set[str] = set()
@@ -1864,6 +1879,14 @@ class LiveActivityDaemon:
         age = self._activity_age(now)
         if age is not None and age >= ACTIVITY_MAX_AGE_SECONDS:
             self._end_stale_activity(f"activity is {age / 3600:.1f}h old")
+        elif self._stale_reported_at:
+            self._stale_reported_at = 0.0
+            if (
+                not self._last_stale_replacement_at
+                or now - self._last_stale_replacement_at >= STALE_REPLACE_COOLDOWN_SECONDS
+            ):
+                self._last_stale_replacement_at = now
+                self._end_stale_activity("phone reports stale content")
 
         alerts, self._agent_modes = compute_alerts(
             self._agent_modes, statuses, now, self._last_alerts
@@ -1884,6 +1907,15 @@ class LiveActivityDaemon:
                 # A structural change (mode, row set, unread, counts) —
                 # deliver immediately at noticeable priority.
                 self._push_update(content_state, now, important=True)
+            elif (
+                active
+                and now - self._last_priority_push_at >= STALE_GUARD_SECONDS
+                and now - self._last_push_at >= PUSH_MIN_INTERVAL_SECONDS
+            ):
+                # Nothing structural for a while: the phone may have deferred
+                # every low-priority push since. Refresh the stale date with
+                # one it applies immediately.
+                self._push_update(content_state, now, keep_fresh=True)
             elif cosmetic and now - self._last_push_at >= COSMETIC_PUSH_INTERVAL_SECONDS:
                 # Text-only churn (summaries, tool names) coalesces quietly.
                 self._push_update(content_state, now, important=False)
@@ -2574,6 +2606,20 @@ class LiveActivityDaemon:
             f"{source} activity report from {report['device'] or 'unknown'}: "
             + ", ".join(labels)
         )
+        if evidence.get("activity_state") == "stale":
+            # The stale date lapsed on the phone: whatever went out lately was
+            # deferred. Refresh at high priority on the next tick, and replace
+            # the activity if it is the current one (a retired activity's
+            # late report must not restart a fresh one).
+            _log("phone reports stale content; refreshing at high priority")
+            self._last_priority_push_at = 0.0
+            current_ids = {
+                str(entry.get("activity_id", ""))
+                for entry in self.tokens.entries("update").values()
+            }
+            if report["activity_id"] and report["activity_id"] in current_ids:
+                self._stale_reported_at = moment
+            self._wake.set()
 
     def _activity_health(self, now: float | None = None) -> dict[str, Any]:
         """Concise evidence for ActivityKit state and bounded recovery."""
@@ -2797,6 +2843,7 @@ class LiveActivityDaemon:
                 self._last_pushed_signature = None
                 self._last_pushed_state = None
                 self._last_push_at = 0.0
+                self._last_priority_push_at = 0.0
                 self._wake.set()
             self._activity_live = True
             self._start_push_attempts = 0
@@ -3095,6 +3142,7 @@ class LiveActivityDaemon:
         now: float,
         alert: dict[str, str] | None = None,
         important: bool = True,
+        keep_fresh: bool = False,
     ) -> None:
         with self._push_state_lock:
             token_generation = self._update_token_generation
@@ -3116,7 +3164,9 @@ class LiveActivityDaemon:
         }
         # Apple: priority 10 for updates people would notice (state changes,
         # alerts); 5 only for the silent heartbeat.
-        priority = self._update_push_priority(alert=alert, important=important)
+        priority = (
+            10 if keep_fresh else self._update_push_priority(alert=alert, important=important)
+        )
         if alert:
             _log(f"alerting update -> {alert['title']}")
             aps["alert"] = {
@@ -3139,6 +3189,8 @@ class LiveActivityDaemon:
             self._activity_live = True
             self._last_pushed_signature = _structure_signature(content_state)
             self._last_pushed_state = content_state
+            if priority == 10:
+                self._last_priority_push_at = now
 
     def _push_usage_alert(self, alert: dict[str, str]) -> None:
         _log(f"usage alert -> {alert['title']}")
