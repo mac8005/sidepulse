@@ -70,12 +70,22 @@ def test_visible_completion_is_generic_soundless_and_replaces_first_silent_push(
     assert sent[1][1]["dot"]["commandID"] == payload["dot"]["commandID"]
 
 
-def test_completion_identity_not_unread_boolean_controls_new_alerts(tmp_path, monkeypatch):
+def test_a_completion_alerts_only_when_it_changes_what_the_dot_shows(tmp_path, monkeypatch):
+    """The Dot shows "unread finished" as one state: a second completion
+    while the first is still unread changes nothing on the LED, so it sends
+    nothing (the Live Activity carries the row anyway). Once everything is
+    read, the next completion lights the Dot again and alerts."""
     daemon, sent = make_daemon(tmp_path, monkeypatch)
-    assert not observe(daemon, snapshot(100, ("first", 90)), 100)
-    assert observe(daemon, snapshot(110, ("first", 90), ("second", 110)), 110)
-    assert not observe(daemon, snapshot(111, ("second", 110), ("first", 90)), 111)
-    assert observe(daemon, snapshot(120, ("second", 120), ("first", 90)), 120)
+    assert not observe(daemon, snapshot(100), 100)
+    assert observe(daemon, snapshot(110, ("first", 110)), 110)
+    assert not observe(daemon, snapshot(111, ("first", 110), ("second", 111)), 111)
+    assert not observe(daemon, snapshot(112, ("second", 112), ("first", 110)), 112)  # re-completed, still unread
+    read = {**snapshot(120), "agents": [
+        {"id": "first", "name": "Private", "mode": "completed", "finishedAt": 110, "unread": False},
+        {"id": "second", "name": "Private", "mode": "completed", "finishedAt": 112, "unread": False},
+    ]}
+    assert not observe(daemon, read, 120)
+    assert observe(daemon, snapshot(130, ("third", 130)), 130)
     assert len(sent) == 2
 
 
@@ -252,6 +262,7 @@ def test_restart_never_replays_historical_or_already_alerted_rows(tmp_path, monk
     assert not observe(restarted, snapshot(120, ("first", 110), ("offline", 115)), 120)
     assert not observe(restarted, snapshot(121, ("first", 110)), 121)
     assert not observe(restarted, snapshot(122, ("offline", 115)), 122)
+    assert not observe(restarted, snapshot(123), 123)  # all read: the Dot's unread state clears
     assert observe(restarted, snapshot(130, ("new", 130)), 130)
     assert len(sent) == 1
 
@@ -315,6 +326,7 @@ def test_manual_dnd_on_outside_schedule_survives_availability_lease(tmp_path, mo
     daemon.report_dot_availability("phone", True, reported_at=280, now=280)
     assert not observe(daemon, {**state, "updatedAt": 281}, 281)
     assert sent == []
+    assert not observe(daemon, snapshot(285), 285)  # the suppressed result gets read
     assert observe(daemon, snapshot(290, ("new", 290)), 290)
 
 
@@ -327,6 +339,7 @@ def test_default_off_and_enabling_does_not_replay_completed_rows(tmp_path, monke
     assert daemon.dot_command("phone", now=110)["dot"] is None
     daemon.report_dot_completion_alerts("phone", True)
     assert not observe(daemon, {**state, "updatedAt": 120}, 120)
+    assert not observe(daemon, snapshot(125), 125)  # the old result gets read
     assert observe(daemon, snapshot(130, ("new", 130)), 130)
     assert len(sent) == 1
 
@@ -350,6 +363,7 @@ def test_command_read_is_latest_expiry_checked_and_budget_neutral(tmp_path, monk
     observe(daemon, snapshot(100), 100)
     observe(daemon, snapshot(110, ("first", 110)), 110)
     old_id = daemon._pending_dot.command_id
+    observe(daemon, snapshot(115), 115)  # first read: the Dot clears
     observe(daemon, snapshot(120, ("second", 120)), 120)
     daemon._latest = {**daemon._latest, "aggregateMode": "tool_running", "updatedAt": 125}
     command = daemon.dot_command("phone", now=125)

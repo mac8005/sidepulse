@@ -171,6 +171,7 @@ DOT_COMPLETION_METADATA_KEYS = (
     "dot_completion_alerts_reported_at",
     "dot_completion_seen",
     "dot_completion_seen_cutoff",
+    "dot_display_signatures",
 )
 
 # Modes worth interrupting the user for, and their notification titles.
@@ -401,6 +402,43 @@ def _parse_dot_completion_alerts(body: dict[str, Any]) -> bool | None:
     ):
         raise ValueError("invalid completion preference reportedAt")
     return value
+
+
+def _parse_dot_display_signatures(body: dict[str, Any]) -> dict[str, str] | None:
+    """Accept only the owner's bounded, timestamped LED program hashes."""
+    if "dotDisplaySignatures" not in body:
+        return None
+    value = body["dotDisplaySignatures"]
+    expected = {f"{state}:{read}" for state in ("idle", "ask", "working", "done")
+                for read in ("read", "unread")}
+    reported_at = body.get("reportedAt")
+    if (
+        not isinstance(value, dict) or set(value) != expected
+        or any(not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+               for digest in value.values())
+        or isinstance(reported_at, bool) or not isinstance(reported_at, (int, float))
+        or not math.isfinite(reported_at)
+        or reported_at > time.time() + DOT_REPORTED_AT_MAX_FUTURE_SECONDS
+    ):
+        raise ValueError("invalid dotDisplaySignatures or reportedAt")
+    return dict(value)
+
+
+def _dot_display_signature(
+    signature: tuple[str, bool] | None, metadata: dict[str, Any]
+) -> str | tuple[str, bool] | None:
+    if signature is None:
+        return None
+    state, unread = signature
+    programs = metadata.get("dot_display_signatures", {})
+    key = f"{state}:{'unread' if unread else 'read'}"
+    if key in programs:
+        return programs[key]
+    # Older phones do not report appearance. Attention ignores unread;
+    # done without unread and idle both render off.
+    if state == "idle" or (state == "done" and not unread):
+        return ("idle", False)
+    return (state, unread if state == "working" else False)
 
 
 def _log(message: str) -> None:
@@ -3365,7 +3403,10 @@ class LiveActivityDaemon:
     def _maybe_send_dot_completion_alert(
         self, dot_state: str, content_state: dict[str, Any], now: float
     ) -> bool:
-        """One soundless notification for a completion or its visible reversal."""
+        """One soundless notification when a completion, or its reversal,
+        changes what the Dot shows. A completion that leaves the Dot as it is
+        (another finished session already unread) sends nothing: the Live
+        Activity and the Dynamic Island update on their own."""
         with self._dot_lock:
             entries = self.tokens.entries("dot_device")
             if not entries:
@@ -3374,6 +3415,11 @@ class LiveActivityDaemon:
             owner, metadata = next(iter(entries.items()))
             rows = content_state.get("agents", [])
             signature = (dot_state, _has_unread_finished(content_state))
+            rendered = _dot_display_signature(signature, metadata)
+            changed = rendered != _dot_display_signature(self._dot_completion_signature, metadata)
+            already_written = self._last_dot_state is not None and rendered == _dot_display_signature(
+                (self._last_dot_state, bool(self._last_dot_has_unread_finished)), metadata
+            )
             active_ids = {
                 row["id"] for row in rows
                 if isinstance(row.get("id"), str)
@@ -3381,7 +3427,7 @@ class LiveActivityDaemon:
             }
             resumed = (
                 dot_state == "working"
-                and self._dot_completion_signature != signature
+                and changed
                 and bool(self._dot_completion_unread_ids & active_ids)
             )
             self._dot_completion_signature = signature
@@ -3428,7 +3474,7 @@ class LiveActivityDaemon:
             # Consume identities even while opted out, in the foreground, or
             # suppressed. Enabling alerts or lifting Focus never replays them.
             if (
-                baseline or not (fresh or resumed)
+                baseline or not changed or already_written or not (fresh or resumed)
                 or metadata.get("dot_completion_alerts_enabled") is not True
                 or self._dot_completion_unavailability(now) is not None
             ):
@@ -3559,6 +3605,7 @@ class LiveActivityDaemon:
         now: float | None = None,
         force_resync: bool = True,
         completion_alerts_enabled: bool | None = None,
+        display_signatures: dict[str, str] | None = None,
     ) -> bool:
         """Persist a bounded suppression lease for the elected Dot owner."""
         moment = time.time() if now is None else now
@@ -3583,6 +3630,10 @@ class LiveActivityDaemon:
                 )
             if owner_matched and applied and completion_alerts_enabled is not None:
                 self.report_dot_completion_alerts(token, completion_alerts_enabled, reported_at)
+            if owner_matched and applied and display_signatures is not None:
+                self.tokens.update_metadata("dot_device", token, {
+                    "dot_display_signatures": dict(display_signatures),
+                })
 
             should_wake = False
             if owner_matched and applied and available and force_resync:
@@ -4319,6 +4370,7 @@ class LiveActivityDaemon:
                         availability = _parse_dot_availability(body)
                         dnd_schedule = _parse_dot_dnd_schedule(body)
                         completion_alerts_enabled = _parse_dot_completion_alerts(body)
+                        display_signatures = _parse_dot_display_signatures(body)
                     except ValueError as exc:
                         self._json(400, {"error": str(exc)})
                         return
@@ -4338,6 +4390,7 @@ class LiveActivityDaemon:
                         availability[3],
                         dnd_schedule,
                         completion_alerts_enabled=completion_alerts_enabled,
+                        display_signatures=display_signatures,
                     )
                     if not updated:
                         self._json(409, {"ok": False, "error": "not_dot_owner"})

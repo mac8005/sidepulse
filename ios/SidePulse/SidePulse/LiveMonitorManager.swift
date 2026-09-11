@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 import UserNotifications
 #if canImport(ActivityKit)
 import ActivityKit
@@ -11,6 +12,7 @@ private struct DotAvailabilityReportSignature: Equatable {
     let availability: DotAvailability
     let dndSchedule: DotDndScheduleMetadata
     let dotCompletionAlertsEnabled: Bool
+    let dotDisplaySignatures: [String: String]
 }
 
 private struct DotDndScheduleMetadata: Equatable {
@@ -755,6 +757,7 @@ final class LiveMonitorManager: ObservableObject {
             reportedAt: now.timeIntervalSince1970,
             dndSchedule: DotDndScheduleMetadata(model: model, now: now),
             dotCompletionAlertsEnabled: model.dotCompletionAlertsEnabled,
+            dotDisplaySignatures: dotDisplaySignatures(model: model),
             to: &payload
         )
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
@@ -800,7 +803,8 @@ final class LiveMonitorManager: ObservableObject {
                 token: token,
                 availability: availability,
                 dndSchedule: DotDndScheduleMetadata(model: model, now: now),
-                dotCompletionAlertsEnabled: model.dotCompletionAlertsEnabled
+                dotCompletionAlertsEnabled: model.dotCompletionAlertsEnabled,
+                dotDisplaySignatures: dotDisplaySignatures(model: model)
             ),
             reportedAt: now.timeIntervalSince1970
         )
@@ -854,6 +858,7 @@ final class LiveMonitorManager: ObservableObject {
             reportedAt: report.reportedAt,
             dndSchedule: report.signature.dndSchedule,
             dotCompletionAlertsEnabled: report.signature.dotCompletionAlertsEnabled,
+            dotDisplaySignatures: report.signature.dotDisplaySignatures,
             to: &payload
         )
 
@@ -888,12 +893,14 @@ final class LiveMonitorManager: ObservableObject {
         reportedAt: TimeInterval,
         dndSchedule: DotDndScheduleMetadata,
         dotCompletionAlertsEnabled: Bool,
+        dotDisplaySignatures: [String: String],
         to payload: inout [String: Any]
     ) {
         payload["available"] = availability.available
         payload["reportedAt"] = reportedAt
         payload["dndScheduleEnabled"] = dndSchedule.enabled
         payload["dotCompletionAlertsEnabled"] = dotCompletionAlertsEnabled
+        payload["dotDisplaySignatures"] = dotDisplaySignatures
         if let nextTransitionAt = dndSchedule.nextTransitionAt,
            let nextTransitionEnabled = dndSchedule.nextTransitionEnabled {
             payload["nextDndTransitionAt"] = nextTransitionAt
@@ -908,6 +915,24 @@ final class LiveMonitorManager: ObservableObject {
 
     private func dotDeviceKey(serverURL: String, token: String, dotCompletionAlertsEnabled: Bool) -> String {
         "\(serverURL)|\(token)|\(dotCompletionAlertsEnabled)"
+    }
+
+    private func dotDisplaySignatures(model: AppModel) -> [String: String] {
+        var signatures: [String: String] = [:]
+        let states: [(String, LedDisplayState)] = [
+            ("idle", .idle), ("ask", .ask), ("working", .working), ("done", .done)
+        ]
+        for (name, state) in states {
+            for unread in [false, true] {
+                let program = DotPrograms.program(
+                    for: state, appearance: model.dotAppearance, finiteWorking: true,
+                    showFinished: model.showFinishedEnabled, hasUnreadFinished: unread
+                )
+                signatures[name + (unread ? ":unread" : ":read")] = SHA256.hash(data: Data(program.utf8))
+                    .map { String(format: "%02x", $0) }.joined()
+            }
+        }
+        return signatures
     }
 
     @available(iOS 17.2, *)
@@ -985,7 +1010,8 @@ final class LiveMonitorManager: ObservableObject {
             guard let self else { return }
             var previousState = initialState
             for await state in activity.activityStateUpdates {
-                if state != previousState {
+                let stateChanged = state != previousState
+                if stateChanged {
                     EventLog.append(
                         "Live Activity \(activity.id.prefix(8)) state \(self.activityStateName(previousState)) -> \(self.activityStateName(state))"
                     )
@@ -1000,6 +1026,13 @@ final class LiveMonitorManager: ObservableObject {
                         source: "state transition"
                     )
                     break
+                }
+                if stateChanged, state == .stale {
+                    // Report staleness when observed, not only when the app
+                    // returns to the foreground or receives a repair nudge.
+                    await self.reconcileActivities(
+                        model: model, source: "stale transition", forceReportCurrent: true
+                    )
                 }
             }
             self.observedActivityIDs.remove(activity.id)
