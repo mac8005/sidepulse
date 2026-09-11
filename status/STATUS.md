@@ -4,8 +4,8 @@ Updated: 2026-09-11
 ## In flight
 - 88b1297 pushed; Mini backend installed and source hash verified. Full suite: 811 tests + 519 subtests passed; unsigned Release iOS build succeeded (one job, external DerivedData). Replacement Live Activity registered active; actual Island visibility needs phone confirmation.
 - Signing repaired with user approval: reused same-team IOS_DISTRIBUTION certificate 4STRQLBTSW and created only six SidePulse IOS_APP_STORE profiles, all ACTIVE. Old SidePulse keychain password no longer worked; preserved it and imported the existing identity into sidepulse-distribution-20260911.keychain-db. New password stored in login Keychain service io.sidepulse.distribution-signing-20260911, account release. Local .testflight/deploy-persistent.sh accepts this retained identity. No certificate creation/revocation.
-- Build 202609111122 (1.0.202609111122), source 2424bc3, signed archive/export passed and upload succeeded at 13:25; awaiting Apple processing/Personal Testing verification. Artifacts: /private/tmp/sidepulse-release.JZ9m8j.
-- User reported another unchanged-Working notification during upload. Logs show completion at 13:22:47 and resume at 13:22:52; unread flag changed, but phone has not yet reported rendered LED signatures. Asked whether Show finished is enabled and which notice appeared; do not assume physical output changed just because the flag did.
+- Build 202609111122 (1.0.202609111122), source 2424bc3, is VALID and verified assigned to existing Personal Testing. Signed archive/export/upload passed; original keychain search list restored. Artifacts: /private/tmp/sidepulse-release.JZ9m8j.
+- User confirmed the apparent completion was a short pause before continuing. Added a 10-second server-side completion-notification grace window, also holding its silent completion push. Cancel on resume/ACK/suppression without replay or unnecessary resume notice. 51 focused tests passed; final full suite and backend deployment in progress. No additional iOS build needed.
 
 ## Decisions
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
@@ -14,12 +14,13 @@ Updated: 2026-09-11
 - Paseo "closed"/"initializing" are quiet states (daemon restart lists every agent as closed); idle history from a directory listing is never announced.
 - Dynamic Island recovery: stale window 30 min, priority-10 keep-alive every ≤10 min while active, and current-activity stale reports trigger replacement (≥2 h apart). iOS now reports observed stale transitions immediately rather than waiting for foreground/reconcile. APNs acceptance and active reports do not prove Island visibility.
 - Visible Dot completion/resume alerts require a changed LED program, not just a new completed session. The phone reports bounded hashes of its rendered states (including Show finished/custom appearance); unchanged attention/disabled overlays/already-ACKed output need no banner. Live Activity updates remain independent.
+- Completed LED notifications wait 10 seconds; hold the matching silent push during this window so brief auto-continuations do not consume a visible completion/resume pair. Normal Live Activity delivery stays immediate.
 - Push-to-start bursts stop after one retry (MAX_UNANSWERED_START_PUSHES=2): unanswered starts stacked three cards on 2026-09-06.
 - Hook logs self-trim to 64 MB at 96 MB; tool_response/tool_input compacted to head 1 KB + tail 2 KB at write time (was 2.2 GB, 100 MB/day).
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Upload to existing Personal Testing, verify VALID/group membership. Install/open once so the server receives the phone's rendered LED-state hashes. Until then the server uses logical-state fallback; immediate stale reporting is not yet on the phone.
+1. Deploy the server-side grace window after final verification. Install/open TestFlight 202609111122 once so the server receives the phone's rendered LED-state hashes; until then it uses logical-state fallback and immediate stale reporting is not yet on the phone.
 2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
 3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
@@ -34,6 +35,7 @@ Updated: 2026-09-11
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
 - 2026-09-11 13:25: Signed build 202609111122 uploaded without errors; awaiting processing. Continued investigation of unchanged-Working notices; new phone appearance metadata not received yet.
 - 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
 - 2026-09-11 13:16: 88b1297 server deployed, 811 tests + 519 subtests and unsigned iOS Release passed. Replaced current activity; phone registered active. TestFlight preflight blocked by removed retained certificate, no signing assets changed or upload made. Release artifacts /private/tmp/sidepulse-release.Tmbg0A; build check /Volumes/MacMiniData/sidepulse-build-check.ZAixFk.

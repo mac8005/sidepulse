@@ -15,8 +15,11 @@ from sidepulse.live_activity import (
 )
 
 
-def make_daemon(tmp_path, monkeypatch, *, enabled=True):
+def make_daemon(tmp_path, monkeypatch, *, enabled=True, completion_delay=0):
     monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    # Payload/policy tests settle immediately; timed regressions opt into
+    # the production grace window using a deterministic clock.
+    monkeypatch.setattr("sidepulse.live_activity.DOT_COMPLETION_SETTLE_SECONDS", completion_delay)
     daemon = LiveActivityDaemon(
         LiveActivityConfig(tmp_path / "unused.p8", "unused", "unused", summaries_enabled=False, port=0),
         token_store=TokenStore(tmp_path / "tokens.json"),

@@ -139,6 +139,7 @@ DOT_WORKING_REFRESH_SECONDS = 20 * 60.0
 DOT_COLLAPSE_ID = "sidepulse-dot-state"
 DOT_COMPLETION_COLLAPSE_ID = "sidepulse-dot-completion"
 DOT_COMPLETION_HISTORY_LIMIT = 256
+DOT_COMPLETION_SETTLE_SECONDS = 10.0
 DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
 DOT_UNAVAILABLE_MIN_SECONDS = 60.0
 DOT_UNAVAILABLE_MAX_SECONDS = 24 * 60 * 60.0
@@ -1791,6 +1792,7 @@ class LiveActivityDaemon:
         self._dot_completion_owner: str | None = None
         self._dot_completion_signature: tuple[str, bool] | None = None
         self._dot_completion_unread_ids: set[str] = set()
+        self._dot_completion_candidate: tuple[str, tuple[str, bool], float] | None = None
         self._idle_since: float | None = None
         self._activity_live = False
         self._start_push_attempts = 0
@@ -3411,6 +3413,7 @@ class LiveActivityDaemon:
             entries = self.tokens.entries("dot_device")
             if not entries:
                 self._dot_completion_owner = None
+                self._dot_completion_candidate = None
                 return False
             owner, metadata = next(iter(entries.items()))
             rows = content_state.get("agents", [])
@@ -3474,10 +3477,29 @@ class LiveActivityDaemon:
             # Consume identities even while opted out, in the foreground, or
             # suppressed. Enabling alerts or lifting Focus never replays them.
             if (
-                baseline or not changed or already_written or not (fresh or resumed)
+                baseline or already_written
                 or metadata.get("dot_completion_alerts_enabled") is not True
                 or self._dot_completion_unavailability(now) is not None
             ):
+                self._dot_completion_candidate = None
+                return False
+            candidate = self._dot_completion_candidate
+            if candidate is not None and candidate[:2] != (owner, signature):
+                self._dot_completion_candidate = candidate = None
+                # The completion was held, including its silent command:
+                # continuing work does not need a compensating notice.
+                resumed = False
+            if candidate is not None:
+                if now - candidate[2] < DOT_COMPLETION_SETTLE_SECONDS:
+                    return False
+                # Still the same visible completion after the grace window.
+                # Identities were already consumed, so this is not a replay.
+                fresh = True
+                self._dot_completion_candidate = None
+            elif not changed or not (fresh or resumed):
+                return False
+            elif fresh and DOT_COMPLETION_SETTLE_SECONDS > 0:
+                self._dot_completion_candidate = (owner, signature, now)
                 return False
             if self._dot_owner_availability(now)[3]:
                 # This new command is already the post-suppression refresh;
@@ -4041,6 +4063,10 @@ class LiveActivityDaemon:
                     return False
                 self.request_dot_resync(now=now, force=True)
             if self._dot_owner_stream_count() > 0 or unavailable_until is not None:
+                return False
+            if self._dot_completion_candidate is not None:
+                # Do not dispatch the transient green program through the
+                # silent path while its completion is still being settled.
                 return False
             if (
                 # A maxed-out or expired command deliberately remains pending:
