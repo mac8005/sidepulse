@@ -2,10 +2,7 @@
 Updated: 2026-09-11
 
 ## In flight
-- 88b1297 pushed; Mini backend installed and source hash verified. Full suite: 811 tests + 519 subtests passed; unsigned Release iOS build succeeded (one job, external DerivedData). Replacement Live Activity registered active; actual Island visibility needs phone confirmation.
-- Signing repaired with user approval: reused same-team IOS_DISTRIBUTION certificate 4STRQLBTSW and created only six SidePulse IOS_APP_STORE profiles, all ACTIVE. Old SidePulse keychain password no longer worked; preserved it and imported the existing identity into sidepulse-distribution-20260911.keychain-db. New password stored in login Keychain service io.sidepulse.distribution-signing-20260911, account release. Local .testflight/deploy-persistent.sh accepts this retained identity. No certificate creation/revocation.
-- Build 202609111122 (1.0.202609111122), source 2424bc3, is VALID and verified assigned to existing Personal Testing. Signed archive/export/upload passed; original keychain search list restored. Artifacts: /private/tmp/sidepulse-release.JZ9m8j.
-- User confirmed the apparent completion was a short pause before continuing. Added a 10-second server-side completion-notification grace window, also holding its silent completion push. Cancel on resume/ACK/suppression without replay or unnecessary resume notice. 51 focused tests passed; final full suite and backend deployment in progress. No additional iOS build needed.
+- Nothing mid-change. de891a6 pushed and deployed to Mini, installed source hash verified; 816 tests + 519 subtests passed. TestFlight 202609111122 is VALID and assigned to existing Personal Testing. Actual Island visibility and LED behavior await phone confirmation after installation/opening.
 
 ## Decisions
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
@@ -20,11 +17,12 @@ Updated: 2026-09-11
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Deploy the server-side grace window after final verification. Install/open TestFlight 202609111122 once so the server receives the phone's rendered LED-state hashes; until then it uses logical-state fallback and immediate stale reporting is not yet on the phone.
+1. Install/open TestFlight 202609111122 once so the server receives the phone's rendered LED-state hashes; until then it uses logical-state fallback and immediate stale reporting is not yet on the phone. The server-side 10-second grace window already applies to old clients.
 2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
 3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
 ## Gotchas
+- TestFlight signing repaired with approval Sep 11: reused IOS_DISTRIBUTION 4STRQLBTSW, six ACTIVE SidePulse profiles, no certificate creation/revocation. Metadata lives in ~/.local/share/sidepulse/signing/signing.json; .testflight/deploy.sh reuses it. Dedicated keychain sidepulse-distribution-20260911.keychain-db uses login Keychain service io.sidepulse.distribution-signing-20260911/account release. Old keychain preserved (its saved password failed). Release 202609111122/source 2424bc3 artifacts: /private/tmp/sidepulse-release.JZ9m8j. All user keychain search-list changes were restored.
 - Air has no `~/Git/sidepulse` checkout: build a wheel on Mini, copy it over SSH, force-reinstall it into `~/.local/share/sidepulse/venv`, then kickstart agentstatus/remotehosts. Installed from the same 041333d wheel as Mini/M1 on 2026-09-10, including the earlier unread-click fix. The Air's hooks are separate: they run from the editable pipx venv → `~/Git/sidepulse-feature` (remote `origin`, same branch), so hook-side changes (log trimming/compaction) need `git pull --ff-only origin mac8005/remote-host-monitoring` there; done 2026-09-10 20:05 (f428de4→d4ee412).
 - M1 menu-bar app also runs a COPIED venv (`~/.local/share/sidepulse/venv`, launcher execs its python): `git pull` there is inert until `venv/bin/pip install --no-deps --force-reinstall ~/Git/sidepulse` + kickstart agentstatus/remotehosts. Cost a day on the unread-click fix.
 - Mini venv is a COPIED install: deploy = `~/.local/share/sidepulse/venv/bin/pip install --no-deps --force-reinstall .` then `launchctl kickstart -k gui/501/io.sidepulse.live-activity` (and `io.sidepulse.paseo-monitor` when paseo_monitor.py changed). Hooks run from the source tree by path.
@@ -35,6 +33,7 @@ Updated: 2026-09-11
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-11: de891a6 pushed/deployed to Mini; installed hash + healthy daemon verified, completion grace 10 seconds. 816 tests + 519 subtests passed. TestFlight 202609111122 already VALID in Personal Testing; server-only grace required no rebuild.
 - 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
 - 2026-09-11 13:25: Signed build 202609111122 uploaded without errors; awaiting processing. Continued investigation of unchanged-Working notices; new phone appearance metadata not received yet.
 - 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
@@ -49,4 +48,3 @@ Updated: 2026-09-11
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
 - 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.
 - 2026-09-07: Usage-alert repeat storm fixed (reset_at jitter → 10-min tolerance), 1566d70.
-- 2026-09-06: Usage alerts (5079930), hook-log trimming+compaction (24cb9a7), direct Codex usage + Paseo quiet states + start-push guard (783ecd4); CodexBar Gatekeeper hang unblocked; maintenance casks now `--no-quarantine`.
