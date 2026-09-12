@@ -2,7 +2,7 @@
 Updated: 2026-09-12
 
 ## In flight
-- Scheduled-session filter verified locally: 824 tests + 538 subtests passed, then nine focused tests passed after identity-input hardening. Deploying Mini and M1; Air is offline (SSH timed out). No iOS rebuild needed; TestFlight remains 202609111122.
+- 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight remains 202609111122.
 
 ## Decisions
 - Hide healthy Codex standalone scheduled runs using thread_source=automation, not names. Keep effective blocked/waiting/unknown states visible; carry origin metadata over SSH and remove hidden completion history without stopping routines.
@@ -18,8 +18,8 @@ Updated: 2026-09-12
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Install/open TestFlight 202609111122 once so the server receives the phone's rendered LED-state hashes; until then it uses logical-state fallback and immediate stale reporting is not yet on the phone. The server-side 10-second grace window already applies to old clients.
-2. Watch that usage warnings fire once per window (first live cycle: Codex weekly reset 2026-09-07 05:41).
+1. When Air is online, install /tmp/sidepulse-scheduled-release.4E3fUN/sidepulse-0.1.0-py3-none-any.whl from Mini into its copied venv, restart agentstatus/remotehosts, verify module hashes. Backfill old remote entries by replaying the latest non-summary/non-subagent Codex hook per explicit scheduled_session_ids() from Mini (bounded last 5000 lines) through _emit_envelope -> consume_remote_envelope; preserve event timestamps. M1 needed 20 such metadata refreshes, no task reruns.
+2. Install/open TestFlight 202609111122 once for rendered LED-state hashes and stale reporting; server-side completion grace already applies to old clients. Watch usage warnings fire once per window.
 3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
 ## Gotchas
@@ -34,6 +34,7 @@ Updated: 2026-09-12
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-12: 3bec91c verified deployed on Mini/M1, matching installed hashes, healthy services; no scheduled guard rows in live mobile snapshot or M1 menu inputs. Existing M1 remote metadata refreshed without rerunning tasks. 825 tests + 543 subtests pass; Air offline, rollout pending there. No scheduler changes or iOS rebuild.
 - 2026-09-12: Implemented scheduled-run filtering before aggregate/LED computation, with persisted/remote metadata and completion-history cleanup. Local replay hides spend guard and keeps interactive work. Rollout in progress; Air offline.
 - 2026-09-12: Read-only visibility diagnosis: three Kleido Android spend guard rows are completed hourly automation runs (at :37), thread_source=automation, archived=0. Codex groups runs under Scheduled; SidePulse includes their session events. No filtering or scheduler changes requested or made.
 - 2026-09-11: de891a6 pushed/deployed to Mini; installed hash + healthy daemon verified, completion grace 10 seconds. 816 tests + 519 subtests passed. TestFlight 202609111122 already VALID in Personal Testing; server-only grace required no rebuild.
@@ -48,4 +49,3 @@ Updated: 2026-09-12
 - 2026-09-10: Added title-helper filter and eight regression cases; focused tests and real log replay passed, rollout in progress.
 - 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
-- 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
