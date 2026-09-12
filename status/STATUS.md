@@ -1,5 +1,5 @@
 # Status
-Updated: 2026-09-11
+Updated: 2026-09-12
 
 ## In flight
 - Nothing mid-change. de891a6 pushed and deployed to Mini, installed source hash verified; 816 tests + 519 subtests passed. TestFlight 202609111122 is VALID and assigned to existing Personal Testing. Actual Island visibility and LED behavior await phone confirmation after installation/opening.
@@ -33,6 +33,7 @@ Updated: 2026-09-11
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-12: Read-only visibility diagnosis: three Kleido Android spend guard rows are completed hourly automation runs (at :37), thread_source=automation, archived=0. Codex groups runs under Scheduled; SidePulse includes their session events. No filtering or scheduler changes requested or made.
 - 2026-09-11: de891a6 pushed/deployed to Mini; installed hash + healthy daemon verified, completion grace 10 seconds. 816 tests + 519 subtests passed. TestFlight 202609111122 already VALID in Personal Testing; server-only grace required no rebuild.
 - 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
 - 2026-09-11 13:25: Signed build 202609111122 uploaded without errors; awaiting processing. Continued investigation of unchanged-Working notices; new phone appearance metadata not received yet.
@@ -47,4 +48,3 @@ Updated: 2026-09-11
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
 - 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.
-- 2026-09-07: Usage-alert repeat storm fixed (reset_at jitter → 10-min tolerance), 1566d70.
