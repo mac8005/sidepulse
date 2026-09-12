@@ -2,9 +2,10 @@
 Updated: 2026-09-12
 
 ## In flight
-- Nothing mid-change. de891a6 pushed and deployed to Mini, installed source hash verified; 816 tests + 519 subtests passed. TestFlight 202609111122 is VALID and assigned to existing Personal Testing. Actual Island visibility and LED behavior await phone confirmation after installation/opening.
+- Scheduled-session filter verified locally: 824 tests + 538 subtests passed, then nine focused tests passed after identity-input hardening. Deploying Mini and M1; Air is offline (SSH timed out). No iOS rebuild needed; TestFlight remains 202609111122.
 
 ## Decisions
+- Hide healthy Codex standalone scheduled runs using thread_source=automation, not names. Keep effective blocked/waiting/unknown states visible; carry origin metadata over SSH and remove hidden completion history without stopping routines.
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
 - Usage meters read Claude (Keychain OAuth) and Codex (`~/.codex/auth.json`, wham endpoints) directly; CodexBar CLI is fallback only — it hung for hours behind a Gatekeeper prompt after a cask upgrade (2026-09-06).
 - Usage alerts: one warning per window at 90%, one reset alert when an armed window comes back; a window is "new" only when its reset time moves >10 min (Codex `reset_at` jitters ±1 s).
@@ -33,6 +34,7 @@ Updated: 2026-09-12
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-12: Implemented scheduled-run filtering before aggregate/LED computation, with persisted/remote metadata and completion-history cleanup. Local replay hides spend guard and keeps interactive work. Rollout in progress; Air offline.
 - 2026-09-12: Read-only visibility diagnosis: three Kleido Android spend guard rows are completed hourly automation runs (at :37), thread_source=automation, archived=0. Codex groups runs under Scheduled; SidePulse includes their session events. No filtering or scheduler changes requested or made.
 - 2026-09-11: de891a6 pushed/deployed to Mini; installed hash + healthy daemon verified, completion grace 10 seconds. 816 tests + 519 subtests passed. TestFlight 202609111122 already VALID in Personal Testing; server-only grace required no rebuild.
 - 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
@@ -47,4 +49,3 @@ Updated: 2026-09-12
 - 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
 - 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.
 - 2026-09-10: Mac app "clicked finished session stays unread" fixed: exact-generation match now tolerates the datetime round trip (remote_state.match_status). Deployed to M1.
-- 2026-09-10: Island-vanished report checked: daemon+phone healthy (activity 52967973 since 22:23 after the mini's 22:22 reboot); auto-replace due 05:53. Created this file.

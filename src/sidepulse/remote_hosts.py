@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from .hook import write_hook_line
 from .codex_goals import goal_states
+from .scheduled_sessions import is_scheduled_session
 from .ipc import send_hook_event
 from .models import provider_label
 from .providers import EVENT_PROVIDERS, SUMMARY_EVENT_NAME, default_state_dir, detect_log_path
@@ -347,6 +348,7 @@ def _emit_envelope(provider: str, line: str, output: TextIO) -> None:
         if provider == "codex":
             session_id = payload.get("session_id") or payload.get("sessionId")
             payload["sidepulse_goal_status"] = goal_states().get(session_id) if isinstance(session_id, str) else None
+            payload["sidepulse_scheduled_session"] = is_scheduled_session(provider, session_id)
         payload.pop("sidepulse_deep_link", None)
         deep_link = remote_session_web_link(provider, parsed)
         if deep_link:

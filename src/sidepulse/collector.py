@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .codex_goals import goal_states
+from .scheduled_sessions import hide_scheduled_session, is_scheduled_session
 from .models import (
     MODE_PRIORITY,
     AgentMode,
@@ -66,6 +67,7 @@ class StatusMetadata:
     origin: str | None = None
     summary: str | None = None
     internal_title_helper: bool = False
+    scheduled: bool = False
 
 
 @dataclass(frozen=True)
@@ -196,6 +198,10 @@ class AgentMonitor:
                 now,
                 post_tool_working_visible_seconds=self.post_tool_working_visible_seconds,
             )
+            if hide_scheduled_session(
+                effective.provider, effective.session_id, effective.mode.value, effective.scheduled
+            ):
+                continue
             is_stale = self.is_stale_status(effective, now)
             current = _replace_stale(effective, is_stale)
             if is_stale:
@@ -1099,10 +1105,13 @@ def metadata_for_record(
         internal_title_helper=(
             status_metadata.internal_title_helper or session_metadata.internal_title_helper
         ),
+        scheduled=status_metadata.scheduled or session_metadata.scheduled,
     )
 
 
 def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
+    if record.raw.get("sidepulse_scheduled_session") is True:
+        metadata.scheduled = True
     if is_internal_title_helper(record):
         metadata.internal_title_helper = True
     if record.cwd:
@@ -1169,6 +1178,10 @@ def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None)
         origin=record.origin or metadata.origin or origin_label_from_payload(record.provider, record.raw),
         deep_link=_string_or_none(record.raw.get("sidepulse_deep_link")),
         goal_status=_string_or_none(record.raw.get("sidepulse_goal_status")),
+        scheduled=is_scheduled_session(
+            record.provider, record.session_id,
+            metadata.scheduled or record.raw.get("sidepulse_scheduled_session") is True,
+        ),
     )
 
 
@@ -1373,6 +1386,8 @@ def snapshot_from_statuses(
             collected_at,
             post_tool_working_visible_seconds=post_tool_working_visible_seconds,
         )
+        if hide_scheduled_session(status.provider, status.session_id, status.mode.value, status.scheduled):
+            continue
         is_stale = status_is_stale(
             status,
             collected_at,
@@ -1523,6 +1538,7 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             deep_link=_string_or_none(data.get("deep_link")),
             stale=bool(data.get("stale", False)),
             goal_status=_string_or_none(data.get("goal_status")),
+            scheduled=data.get("scheduled") is True,
         )
     except Exception:
         return None
@@ -1975,6 +1991,7 @@ def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
         deep_link=status.deep_link,
         stale=stale,
         goal_status=status.goal_status,
+        scheduled=status.scheduled,
     )
 
 
@@ -1996,6 +2013,7 @@ def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
         deep_link=status.deep_link,
         stale=status.stale,
         goal_status=status.goal_status,
+        scheduled=status.scheduled,
     )
 
 

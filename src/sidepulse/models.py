@@ -80,6 +80,7 @@ class AgentStatus:
     deep_link: str | None = None
     stale: bool = False
     goal_status: str | None = None
+    scheduled: bool = False
 
     @property
     def priority(self) -> int:
@@ -112,6 +113,7 @@ class AgentStatus:
             "deep_link": self.deep_link,
             "stale": self.stale,
             "goal_status": self.goal_status,
+            "scheduled": self.scheduled,
         }
 
 

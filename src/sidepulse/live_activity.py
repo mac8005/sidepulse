@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from .collector import AgentMonitor
+from .scheduled_sessions import hide_scheduled_session
 from .ipc import HookEventServer
 from .hook import write_hook_line
 from .led_status import display_state_for_mode
@@ -886,6 +887,8 @@ def status_row(status: AgentStatus) -> dict[str, Any]:
         "cwd": _truncate(Path(status.cwd).name, MAX_DETAIL_CHARS) if status.cwd else None,
     }
     link = status.deep_link
+    if status.scheduled:
+        row["scheduled"] = True
     if not link and _DEEP_LINKS is not None:
         link = _DEEP_LINKS.link_for(status.provider, status.session_id)
     if link:
@@ -2277,6 +2280,16 @@ class LiveActivityDaemon:
             elif status.mode.value not in TERMINAL_MODES:
                 # Reactivated: it is no longer "recently finished".
                 self._recent_finished.pop(status.agent_id, None)
+
+        # A scheduled run disappearing after recovery is hidden, not a new
+        # completion. Also remove healthy rows saved before this filter existed.
+        for agent_id, row in list(self._recent_finished.items()):
+            provider, separator, session_id = agent_id.partition(":session:")
+            if separator and hide_scheduled_session(
+                provider, session_id, str(row.get("mode", "completed")),
+                row.get("scheduled") is True,
+            ):
+                del self._recent_finished[agent_id]
 
         # Always retain the newest MAX_FINISHED_ROWS finished sessions so the
         # list still shows "the last 3 are done" after everything wraps up
