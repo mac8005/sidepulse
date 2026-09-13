@@ -41,9 +41,9 @@ from .scheduled_sessions import hide_scheduled_session
 from .ipc import HookEventServer
 from .hook import write_hook_line
 from .led_status import display_state_for_mode
-from .paseo_monitor import paseo_agent_link, paseo_server_id
+from .paseo_monitor import paseo_agent_link, paseo_host_link, paseo_server_id
 from .providers import SUMMARY_EVENT_NAME
-from .models import MODE_PRIORITY, AgentMode, AgentStatus
+from .models import MODE_PRIORITY, AgentMode, AgentStatus, provider_label
 from .providers import default_state_dir
 from .usage_monitor import UsageMonitor, consume_codex_reset
 from .title_integrity import (
@@ -198,6 +198,31 @@ USAGE_ALERT_THREAD_ID = "sidepulse-usage"
 # The Live Activity "Finished" buzz waits just as long, for the same reason,
 # and is dropped outright if the session resumes meanwhile.
 FINISHED_ALERT_SETTLE_SECONDS = DOT_COMPLETION_SETTLE_SECONDS
+# Where "New session" in the app sends people: the provider's own app at its
+# new-session screen. First a universal link that app claims (checked against
+# the apple-app-site-association files on 2026-09-13: Claude claims /code/*,
+# ChatGPT claims /codex/tasks/* but no Codex root), then the custom scheme as
+# the fallback. Served by the daemon so a wrong guess is corrected here,
+# without an app build.
+NEW_SESSION_LINKS = {
+    "claude": ("https://claude.ai/code/", "claude://"),
+    "codex": ("https://chatgpt.com/codex/tasks/", "chatgpt://"),
+}
+
+
+def new_session_links(server_id: str | None) -> list[dict[str, Any]]:
+    links = [
+        {"provider": provider, "label": provider_label(provider), "urls": list(urls)}
+        for provider, urls in NEW_SESSION_LINKS.items()
+    ]
+    # Paseo's host home carries its "Do anything" composer; only offered when
+    # this Mac runs a Paseo daemon.
+    home = paseo_host_link(server_id)
+    if home:
+        links.append(
+            {"provider": "paseo", "label": provider_label("paseo"), "urls": [home, "paseo://"]}
+        )
+    return links
 
 
 @dataclass(frozen=True)
@@ -4317,6 +4342,8 @@ class LiveActivityDaemon:
                     self._stream(parsed.query)
                 elif parsed.path == "/usage":
                     self._json(200, daemon.usage.snapshot())
+                elif parsed.path == "/session-links":
+                    self._json(200, {"links": new_session_links(paseo_server_id())})
                 else:
                     self._json(404, {"error": "not found"})
 

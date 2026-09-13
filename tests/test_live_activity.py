@@ -4591,3 +4591,42 @@ def test_a_stale_report_replaces_the_activity_once_then_only_refreshes(tmp_path,
     daemon._tick()
     assert all(event != "end" for *_, event in sent)
     assert daemon.tokens.tokens("update") == ["activity-token-2"]
+
+
+def _get_json(daemon, path):
+    import threading
+    from http.client import HTTPConnection
+
+    server = daemon._build_server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_session_links_send_each_provider_to_its_own_app(tmp_path, monkeypatch):
+    from sidepulse.live_activity import new_session_links
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    monkeypatch.setattr("sidepulse.live_activity.paseo_server_id", lambda: "srv_C27ik7se_OUO")
+
+    status, body = _get_json(daemon, "/session-links")
+
+    assert status == 200
+    assert [(link["provider"], link["label"], link["urls"][0]) for link in body["links"]] == [
+        ("claude", "Claude", "https://claude.ai/code/"),
+        ("codex", "Codex", "https://chatgpt.com/codex/tasks/"),
+        ("paseo", "Paseo", "paseo://h/srv_C27ik7se_OUO"),
+    ]
+    # The custom scheme is the fallback, never the first choice.
+    assert all(link["urls"][-1].endswith("://") for link in body["links"])
+    # Without a Paseo daemon on this Mac there is nothing of Paseo's to open.
+    assert [link["provider"] for link in new_session_links(None)] == ["claude", "codex"]

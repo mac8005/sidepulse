@@ -13,6 +13,7 @@ struct AgentsLiveView: View {
     @ObservedObject var model: AppModel
     @ObservedObject private var stream = DotStatusMirror.shared.stream
     @StateObject private var usage = UsageClient()
+    @StateObject private var sessionLinks = SessionLinksClient()
     /// Completions tapped this app session, keyed by the row's finish time
     /// so the dimming applies only to the completion the user actually
     /// opened — a session that finishes another turn re-arms as unread.
@@ -44,6 +45,19 @@ struct AgentsLiveView: View {
                 }
             }
 
+            if !sessionLinks.links.isEmpty {
+                Section {
+                    // Hands off to the provider's own app; the daemon says where.
+                    Menu {
+                        ForEach(sessionLinks.links) { link in
+                            Button(link.label) { openFirstAvailable(link.candidates) }
+                        }
+                    } label: {
+                        Label("New session", systemImage: "plus.circle")
+                    }
+                }
+            }
+
             UsageSection(usage: usage)
 
             Section {
@@ -60,6 +74,9 @@ struct AgentsLiveView: View {
         }
         .task(id: model.liveMonitorServerURL) {
             await usage.poll(baseURL: model.liveMonitorServerURL)
+        }
+        .task(id: model.liveMonitorServerURL) {
+            await sessionLinks.load(baseURL: model.liveMonitorServerURL)
         }
     }
 
@@ -188,12 +205,7 @@ private struct AgentLiveRow: View {
     }
 
     private func open(candidates: [URL]) {
-        guard let first = candidates.first else { return }
-        UIApplication.shared.open(first) { success in
-            if !success, candidates.count > 1 {
-                open(candidates: Array(candidates.dropFirst()))
-            }
-        }
+        openFirstAvailable(candidates)
     }
 
     private var rowContent: some View {

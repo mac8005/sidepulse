@@ -49,6 +49,13 @@ def paseo_server_id(home: Path | None = None) -> str | None:
     return text.strip() or None
 
 
+def paseo_host_link(server_id: str | None) -> str | None:
+    """The host's home screen in the Paseo app; its composer starts a new agent."""
+    if not server_id:
+        return None
+    return f"paseo://h/{quote(server_id, safe=_URI_COMPONENT_SAFE)}"
+
+
 def paseo_agent_link(server_id: str | None, agent_id: str | None) -> str | None:
     if not server_id or not agent_id:
         return None

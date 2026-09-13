@@ -27,6 +27,7 @@
         9F0000010000000000000034 /* DotStatusMirror.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000134 /* DotStatusMirror.swift */; };
         9F000001000000000000003C /* UsageClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F000001000000000000013D /* UsageClient.swift */; };
         9F000001000000000000003D /* UsageSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F000001000000000000013E /* UsageSection.swift */; };
+        9F0000010000000000000045 /* SessionLinks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000145 /* SessionLinks.swift */; };
         9F0000010000000000000016 /* SidePulseWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000119 /* SidePulseWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
         9F0000010000000000000024 /* WatchRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000126 /* WatchRelay.swift */; };
         9F0000010000000000000025 /* WatchSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000127 /* WatchSessionStore.swift */; };
@@ -157,6 +158,7 @@
         9F0000010000000000000134 /* DotStatusMirror.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DotStatusMirror.swift; sourceTree = "<group>"; };
         9F000001000000000000013D /* UsageClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageClient.swift; sourceTree = "<group>"; };
         9F000001000000000000013E /* UsageSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSection.swift; sourceTree = "<group>"; };
+        9F0000010000000000000145 /* SessionLinks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLinks.swift; sourceTree = "<group>"; };
         9F0000010000000000000119 /* SidePulseWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SidePulseWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
         9F0000010000000000000122 /* SidePulseWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePulseWatchApp.swift; sourceTree = "<group>"; };
         9F0000010000000000000126 /* WatchRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRelay.swift; sourceTree = "<group>"; };
@@ -263,6 +265,7 @@
                 9F0000010000000000000121 /* AgentsLiveView.swift */,
                 9F000001000000000000013D /* UsageClient.swift */,
                 9F000001000000000000013E /* UsageSection.swift */,
+                9F0000010000000000000145 /* SessionLinks.swift */,
                 9F0000010000000000000134 /* DotStatusMirror.swift */,
                 9F0000010000000000000140 /* DotNotificationShared.swift */,
                 9F0000010000000000000144 /* DndSchedule.swift */,
@@ -579,6 +582,7 @@
                 9F0000010000000000000018 /* AgentsLiveView.swift in Sources */,
                 9F000001000000000000003C /* UsageClient.swift in Sources */,
                 9F000001000000000000003D /* UsageSection.swift in Sources */,
+                9F0000010000000000000045 /* SessionLinks.swift in Sources */,
                 9F0000010000000000000034 /* DotStatusMirror.swift in Sources */,
                 9F000001000000000000003F /* DotNotificationShared.swift in Sources */,
                 9F0000010000000000000043 /* DndSchedule.swift in Sources */,

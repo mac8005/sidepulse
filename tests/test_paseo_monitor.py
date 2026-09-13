@@ -14,6 +14,7 @@ from sidepulse.paseo_monitor import (
     agent_signature,
     hook_line_for_agent,
     paseo_agent_link,
+    paseo_host_link,
     paseo_server_id,
 )
 from sidepulse.providers import parse_log_line
@@ -49,6 +50,12 @@ def test_agent_link_matches_app_route_encoding() -> None:
     assert paseo_agent_link("srv/1", "a b") == "paseo://h/srv%2F1/agent/a%20b"
     assert paseo_agent_link(None, AGENT_ID) is None
     assert paseo_agent_link(SERVER_ID, None) is None
+
+
+def test_host_link_opens_the_hosts_composer() -> None:
+    assert paseo_host_link(SERVER_ID) == f"paseo://h/{SERVER_ID}"
+    assert paseo_host_link("srv/1") == "paseo://h/srv%2F1"
+    assert paseo_host_link(None) is None
 
 
 def test_server_id_is_read_from_paseo_home(tmp_path: Path) -> None:
