@@ -62,7 +62,7 @@ def test_visible_completion_is_generic_soundless_and_replaces_first_silent_push(
     assert payload["aps"]["alert"] == {"title": "Session finished", "body": "Open SidePulse to view the result."}
     assert payload["aps"]["mutable-content"] == 1
     assert "sound" not in payload["aps"]
-    assert "interruption-level" not in payload["aps"]
+    assert payload["aps"]["interruption-level"] == "passive"  # list only, never a banner
     assert "Private project" not in json.dumps(payload)
     assert payload["dot"]["hasUnreadFinished"] is True
     assert payload["dot"]["commandID"] == daemon._pending_dot.command_id

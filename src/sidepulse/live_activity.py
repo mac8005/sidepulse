@@ -3602,12 +3602,17 @@ class LiveActivityDaemon:
                     },
                     "mutable-content": 1,
                     "thread-id": DOT_COMPLETION_COLLAPSE_ID,
+                    # Both land in the Notification Center list only: the
+                    # Live Activity already buzzes for a finish, and this push
+                    # exists to wake the extension for the Dot, not to be read.
+                    # Truly hidden delivery needs Apple's filtering
+                    # entitlement (Developer Support case 102956095213).
+                    "interruption-level": "passive",
                 },
                 "dot": self._dot_payload(pending),
             }
             if not fresh:
                 payload["aps"]["alert"]["body"] = "Work is continuing. SidePulse is updating your Dot."
-                payload["aps"]["interruption-level"] = "passive"
         event = "completion" if fresh else "resume"
         _log(f"dot {event} alert -> command {pending.command_id[:8]}")
         accepted = self._apns_fanout(
