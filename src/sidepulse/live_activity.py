@@ -1182,6 +1182,11 @@ IOS_COMPACT_PROJECT_LABELS = {
     "cspennyscalpingtrader": "Trading",
 }
 CODEX_TRANSCRIPT_RECOVERY_BYTES = 2 * 1024 * 1024
+# Transcript reads run off the tick thread: on 2026-09-13 an open() on a
+# Codex transcript that had just been moved onto an external volume wedged
+# in the kernel, and the tick waited on it for 50 minutes while the Live
+# Activity, Dot and alerts all went silent. Say so once when it happens.
+PROMPT_POLL_STUCK_SECONDS = 30.0
 CODEX_TRANSCRIPT_RECOVERY_LINES = 500
 CODEX_EXEC_COMMAND = "tools.exec_command"
 
@@ -1419,6 +1424,41 @@ class PromptTracker:
         self._projects: dict[str, str] = {}
         self._offsets: dict[str, int] = {}
         self._transcript_offsets: dict[str, int] = {}
+        self._poll_thread: threading.Thread | None = None
+        self._poll_started_at = 0.0
+        self._current_transcript: str | None = None
+        self._stuck_logged = False
+
+    def poll_in_background(self) -> None:
+        """Start a poll unless the previous one is still running.
+
+        The maps this fills are read by the tick with plain dict lookups, so
+        a poll that never returns costs titles, not the daemon.
+        """
+        thread = self._poll_thread
+        if thread is not None and thread.is_alive():
+            if (
+                not self._stuck_logged
+                and time.time() - self._poll_started_at >= PROMPT_POLL_STUCK_SECONDS
+            ):
+                self._stuck_logged = True
+                _log(
+                    "prompt tracker stuck for "
+                    f"{time.time() - self._poll_started_at:.0f}s on {self._current_transcript}"
+                )
+            return
+        self._stuck_logged = False
+        self._poll_started_at = time.time()
+        self._poll_thread = threading.Thread(
+            target=self._poll_guarded, name="sidepulse-prompts", daemon=True
+        )
+        self._poll_thread.start()
+
+    def _poll_guarded(self) -> None:
+        try:
+            self.poll()
+        except Exception as exc:  # a bad log line must not end polling for good
+            _log(f"prompt tracker poll failed: {exc}")
 
     def prompt_for(self, session_id: str) -> str | None:
         return self._prompts.get(session_id)
@@ -1459,12 +1499,15 @@ class PromptTracker:
             offset = 0
         if size == offset:
             return None
+        self._current_transcript = key
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
                 chunk = handle.read(size - offset)
         except OSError:
             return None
+        finally:
+            self._current_transcript = None
         self._transcript_offsets[key] = size
         lines = chunk.splitlines()
         if first_read and offset and lines:
@@ -1925,7 +1968,7 @@ class LiveActivityDaemon:
         statuses = [s for s in snapshot.statuses if ":agent:" not in s.agent_id]
         self._sync_background_tasks(statuses, now_ts)
         if self.summarizer is not None:
-            self._prompt_tracker.poll()
+            self._prompt_tracker.poll_in_background()
             statuses = [self._apply_summary(status) for status in statuses]
         with self._recent_finished_lock:
             self._remember_finished(statuses, now_ts)

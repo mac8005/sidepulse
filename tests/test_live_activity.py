@@ -4630,3 +4630,39 @@ def test_session_links_send_each_provider_to_its_own_app(tmp_path, monkeypatch):
     assert all(link["urls"][-1].endswith("://") for link in body["links"])
     # Without a Paseo daemon on this Mac there is nothing of Paseo's to open.
     assert [link["provider"] for link in new_session_links(None)] == ["claude", "codex"]
+
+
+def test_a_stuck_transcript_read_cannot_freeze_the_tick(tmp_path, monkeypatch):
+    """2026-09-13: an open() on a Codex transcript that had just been moved
+    onto the external volume wedged in the kernel; the tick waited on it and
+    the daemon updated nothing for 50 minutes. Transcript polling now runs
+    on its own thread, and a stuck poll is named once."""
+    import threading
+    import types
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    daemon.summarizer = types.SimpleNamespace(summary_for=lambda *args, **kwargs: None)
+    daemon.monitor = types.SimpleNamespace(
+        snapshot=lambda include_stale=False: types.SimpleNamespace(
+            statuses=[], aggregate=types.SimpleNamespace(mode=AgentMode.IDLE_READY)
+        )
+    )
+    release = threading.Event()
+
+    def stuck_poll():
+        daemon._prompt_tracker._current_transcript = "/Volumes/MacMiniData/rollout.jsonl"
+        release.wait(5)
+
+    monkeypatch.setattr(daemon._prompt_tracker, "poll", stuck_poll)
+    monkeypatch.setattr("sidepulse.live_activity.PROMPT_POLL_STUCK_SECONDS", 0.0)
+    logs = []
+    monkeypatch.setattr("sidepulse.live_activity._log", logs.append)
+
+    started = time.time()
+    daemon._tick()
+    daemon._tick()
+    daemon._tick()
+    assert time.time() - started < 2.0
+    stuck = [line for line in logs if "prompt tracker stuck" in line]
+    assert len(stuck) == 1 and "/Volumes/MacMiniData/rollout.jsonl" in stuck[0]
+    release.set()
