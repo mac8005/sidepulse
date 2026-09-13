@@ -1,5 +1,5 @@
 # Status
-Updated: 2026-09-12
+Updated: 2026-09-13
 
 ## In flight
 - 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight remains 202609111122.
@@ -12,7 +12,7 @@ Updated: 2026-09-12
 - Paseo "closed"/"initializing" are quiet states (daemon restart lists every agent as closed); idle history from a directory listing is never announced.
 - Dynamic Island recovery: stale window 30 min, priority-10 keep-alive every ≤10 min while active, and current-activity stale reports trigger replacement (≥2 h apart). iOS now reports observed stale transitions immediately rather than waiting for foreground/reconcile. APNs acceptance and active reports do not prove Island visibility.
 - Visible Dot completion/resume alerts require a changed LED program, not just a new completed session. The phone reports bounded hashes of its rendered states (including Show finished/custom appearance); unchanged attention/disabled overlays/already-ACKed output need no banner. Live Activity updates remain independent.
-- Completed LED notifications wait 10 seconds; hold the matching silent push during this window so brief auto-continuations do not consume a visible completion/resume pair. Normal Live Activity delivery stays immediate.
+- A completion must hold for 60 s before anything says "finished": the Dot notice (settle raised from 10 s on 2026-09-13; the silent push is held meanwhile) and the Live Activity "Finished" buzz, which is dropped outright if the session group turns active again during the wait. Log data: of finished→resumed pairs, most resumed within 10 s, nearly all within a minute. Needs-input/blocked alerts stay immediate.
 - Push-to-start bursts stop after one retry (MAX_UNANSWERED_START_PUSHES=2): unanswered starts stacked three cards on 2026-09-06.
 - Hook logs self-trim to 64 MB at 96 MB; tool_response/tool_input compacted to head 1 KB + tail 2 KB at write time (was 2.2 GB, 100 MB/day).
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
@@ -34,6 +34,7 @@ Updated: 2026-09-12
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-13: "Finished" notices for auto-resuming agents: settle 60 s for both the Dot notice and the Live Activity buzz, the buzz now cancels on resume (it never checked before). Deployed to the mini.
 - 2026-09-12: 3bec91c verified deployed on Mini/M1, matching installed hashes, healthy services; no scheduled guard rows in live mobile snapshot or M1 menu inputs. Existing M1 remote metadata refreshed without rerunning tasks. 825 tests + 543 subtests pass; Air offline, rollout pending there. No scheduler changes or iOS rebuild.
 - 2026-09-12: Implemented scheduled-run filtering before aggregate/LED computation, with persisted/remote metadata and completion-history cleanup. Local replay hides spend guard and keeps interactive work. Rollout in progress; Air offline.
 - 2026-09-12: Read-only visibility diagnosis: three Kleido Android spend guard rows are completed hourly automation runs (at :37), thread_source=automation, archived=0. Codex groups runs under Scheduled; SidePulse includes their session events. No filtering or scheduler changes requested or made.

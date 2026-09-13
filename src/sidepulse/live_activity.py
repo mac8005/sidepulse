@@ -140,7 +140,10 @@ DOT_WORKING_REFRESH_SECONDS = 20 * 60.0
 DOT_COLLAPSE_ID = "sidepulse-dot-state"
 DOT_COMPLETION_COLLAPSE_ID = "sidepulse-dot-completion"
 DOT_COMPLETION_HISTORY_LIMIT = 256
-DOT_COMPLETION_SETTLE_SECONDS = 10.0
+# Agents often resume on their own after a Stop: of the resumes seen in the
+# log, most came within 10 s, the rest mostly within a minute. A "Session
+# finished" for those is noise, so a completion must hold for this long.
+DOT_COMPLETION_SETTLE_SECONDS = 60.0
 DOT_ACK_SUCCESS_STATUSES = {"written", "alreadyCurrent"}
 DOT_UNAVAILABLE_MIN_SECONDS = 60.0
 DOT_UNAVAILABLE_MAX_SECONDS = 24 * 60 * 60.0
@@ -192,7 +195,9 @@ ALERT_COOLDOWN_SECONDS = 90.0
 # activity live, and one sent while the phone is offline should still land.
 USAGE_ALERT_EXPIRY_SECONDS = 3600.0
 USAGE_ALERT_THREAD_ID = "sidepulse-usage"
-FINISHED_ALERT_DEFER_SECONDS = 20.0
+# The Live Activity "Finished" buzz waits just as long, for the same reason,
+# and is dropped outright if the session resumes meanwhile.
+FINISHED_ALERT_SETTLE_SECONDS = DOT_COMPLETION_SETTLE_SECONDS
 
 
 @dataclass(frozen=True)
@@ -2467,33 +2472,40 @@ class LiveActivityDaemon:
     def _defer_finished_alerts(
         self, alerts: list[dict[str, str]], statuses, now: float
     ) -> list[dict[str, str]]:
-        """Hold Finished buzzes until the outcome summary exists, so the
-        alert names what happened rather than quoting the stale prompt.
-        Needs-input and blocked alerts stay immediate."""
+        """Hold Finished buzzes until the session has stayed finished for
+        FINISHED_ALERT_SETTLE_SECONDS: agents often resume on their own
+        within seconds, and "Finished" for those is noise. The wait also
+        lets the outcome summary exist, so the alert names what happened
+        rather than quoting the stale prompt. Needs-input and blocked
+        alerts stay immediate."""
         ready: list[dict[str, str]] = []
         for alert in alerts:
-            session_id = alert["thread_id"].split(":")[-1]
-            if (
-                self.summarizer is None
-                or alert["kind"] != "completed"
-                or self.summarizer.summary_for(session_id, None, style="outcome")
-            ):
+            if alert["kind"] != "completed":
                 ready.append(alert)
-            else:
-                self._deferred_alerts.append(
-                    {
-                        **alert,
-                        "session_id": session_id,
-                        "cwd": next(
-                            (status.cwd for status in statuses if status.session_id == session_id),
-                            None,
-                        ),
-                        "deadline": now + FINISHED_ALERT_DEFER_SECONDS,
-                    }
-                )
+                continue
+            session_id = alert["thread_id"].split(":")[-1]
+            self._deferred_alerts.append(
+                {
+                    **alert,
+                    "session_id": session_id,
+                    "cwd": next(
+                        (status.cwd for status in statuses if status.session_id == session_id),
+                        None,
+                    ),
+                    "deadline": now + FINISHED_ALERT_SETTLE_SECONDS,
+                }
+            )
 
         still_waiting = []
         for pending in self._deferred_alerts:
+            # The thread id is the session group key; a group that vanished
+            # (session closed) stays finished, one that turned active resumed.
+            if self._agent_modes.get(pending["thread_id"], "completed") != "completed":
+                continue
+            if now < pending["deadline"]:
+                still_waiting.append(pending)
+                continue
+            title = pending["title"]
             summary = (
                 self.summarizer.summary_for(pending["session_id"], None, style="outcome")
                 if self.summarizer
@@ -2503,23 +2515,15 @@ class LiveActivityDaemon:
                 summary = self._summary_title(
                     pending["session_id"], summary, pending.get("cwd")
                 )
-                ready.append(
-                    {
-                        "title": f"{ALERT_MODES['completed']}: {_truncate(summary, MAX_NAME_CHARS)}",
-                        "body": pending["body"],
-                        "thread_id": pending["thread_id"],
-                        "kind": pending["kind"],
-                    }
-                )
-            elif now >= pending["deadline"]:
-                ready.append(
-                    {
-                        k: pending[k]
-                        for k in ("title", "body", "thread_id", "kind")
-                    }
-                )
-            else:
-                still_waiting.append(pending)
+                title = f"{ALERT_MODES['completed']}: {_truncate(summary, MAX_NAME_CHARS)}"
+            ready.append(
+                {
+                    "title": title,
+                    "body": pending["body"],
+                    "thread_id": pending["thread_id"],
+                    "kind": pending["kind"],
+                }
+            )
         self._deferred_alerts = still_waiting
         return ready
 

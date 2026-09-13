@@ -1499,6 +1499,8 @@ def test_structural_update_respects_frequent_push_setting_but_alert_stays_high(
 
 
 def test_deferred_finished_alert_preserves_its_kind(tmp_path, monkeypatch):
+    from sidepulse.live_activity import FINISHED_ALERT_SETTLE_SECONDS
+
     daemon = _make_dot_daemon(tmp_path, monkeypatch)
 
     class Summarizer:
@@ -1518,8 +1520,35 @@ def test_deferred_finished_alert_preserves_its_kind(tmp_path, monkeypatch):
 
     assert daemon._defer_finished_alerts([alert], [], now=100.0) == []
     summarizer.ready = True
-    ready = daemon._defer_finished_alerts([], [], now=101.0)
+    # A summary alone does not release it: the session must stay finished.
+    assert daemon._defer_finished_alerts([], [], now=101.0) == []
+    ready = daemon._defer_finished_alerts([], [], now=100.0 + FINISHED_ALERT_SETTLE_SECONDS)
     assert ready[0]["kind"] == "completed"
+    assert ready[0]["title"].startswith("Finished: ")
+    assert daemon._deferred_alerts == []
+
+
+def test_finished_alert_is_dropped_when_the_session_resumes_during_the_settle(tmp_path, monkeypatch):
+    """Agents routinely resume on their own seconds after a Stop; the buzz
+    for such a "finish" is noise (2026-09-13). Needs-input stays immediate."""
+    from sidepulse.live_activity import FINISHED_ALERT_SETTLE_SECONDS
+
+    daemon = _make_dot_daemon(tmp_path, monkeypatch)
+    finished = {"kind": "completed", "title": "Finished: Task", "body": "Completed", "thread_id": "group:codex:s1"}
+    assert daemon._defer_finished_alerts([finished], [], now=100.0) == []
+    daemon._agent_modes = {"group:codex:s1": "active"}
+    assert daemon._defer_finished_alerts([], [], now=100.0 + FINISHED_ALERT_SETTLE_SECONDS) == []
+    assert daemon._deferred_alerts == []
+
+    # Without a summarizer the buzz still waits, then fires once it settles.
+    daemon.summarizer = None
+    daemon._agent_modes = {}
+    assert daemon._defer_finished_alerts([finished], [], now=200.0) == []
+    assert daemon._defer_finished_alerts([], [], now=200.0 + FINISHED_ALERT_SETTLE_SECONDS - 1) == []
+    assert daemon._defer_finished_alerts([], [], now=200.0 + FINISHED_ALERT_SETTLE_SECONDS)[0]["title"] == "Finished: Task"
+
+    waiting = {"kind": "waiting_for_input", "title": "Needs your input: Task", "body": "Bash", "thread_id": "codex:session:s1"}
+    assert daemon._defer_finished_alerts([waiting], [], now=300.0) == [waiting]
 
 
 def test_dot_push_reports_unread_finished_rows_without_changing_public_mode(
