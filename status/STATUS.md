@@ -20,7 +20,7 @@ Updated: 2026-09-13
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
-1. Massimo: submit the notification filtering entitlement request (draft in status/2026-09-13-notification-filtering-entitlement.md); on approval follow its "When granted" steps.
+1. Wait for Apple's reply in Developer Support case 102956095213 (request sent 2026-09-13 20:11 by email; the web form is not usable — mandatory category radio, see status/2026-09-13-notification-filtering-entitlement.md). On approval follow that file's "When granted" steps.
 2. When Air is online, install /tmp/sidepulse-scheduled-release.4E3fUN/sidepulse-0.1.0-py3-none-any.whl from Mini into its copied venv, restart agentstatus/remotehosts, verify module hashes. Backfill old remote entries by replaying the latest non-summary/non-subagent Codex hook per explicit scheduled_session_ids() from Mini (bounded last 5000 lines) through _emit_envelope -> consume_remote_envelope; preserve event timestamps. M1 needed 20 such metadata refreshes, no task reruns.
 3. Install/open TestFlight 202609111122 once for rendered LED-state hashes and stale reporting; server-side completion grace already applies to old clients. Watch usage warnings fire once per window.
 4. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
@@ -38,6 +38,7 @@ Updated: 2026-09-13
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-13 20:11: Filtering entitlement request sent as a reply in DS case 102956095213 (the web form only allows four fixed categories, none applies). Apple portal login via throwaway CDP Chrome + SMS code from the mini's Messages worked from the shell.
 - 2026-09-13: Dot "Session finished" push made passive (list only); Apple's answer on the filtering entitlement recorded with a request draft.
 - 2026-09-13 10:48: daemon found frozen since 09:59 (tick blocked in open() on a transcript moved to MacMiniData); restarted, PromptTracker moved to its own thread (830 tests), deployed. Mini swap 11/12 GB from another session's Android emulators + iOS sims.
 - 2026-09-13: New-session menu (Claude/Codex/Paseo → their apps) shipped: daemon route + iOS SessionLinks.swift; sim build OK, 829 tests; TestFlight build 202609130759 VALID (Personal Testing). Codex link is a best guess pending a tap on the phone.

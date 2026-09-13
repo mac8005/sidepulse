@@ -1,4 +1,14 @@
-# Notification filtering entitlement — request draft
+# Notification filtering entitlement — request
+
+**2026-09-13 20:11 — request sent as a reply in Developer Support case 102956095213**
+(from massimo@cerqui.ch, the mailbox apple@cerqui.ch forwards to; copy in Gmail Sent).
+The official form at developer.apple.com/contact/request/notification-service could
+NOT be used: its mandatory "My app needs the entitlement because it" radio offers only
+the four listed categories (E2E messaging, earthquake, education, healthcare) with no
+"other", and its "App Store URL" field is mandatory too. Submitting it would have
+required a false category. The reply asks Apple to route the request or say no.
+Next: wait for Apple's answer in that thread.
+
 
 Apple Developer Support case 102956095213 (2026-09-13): the entitlement
 `com.apple.developer.usernotifications.filtering` lets a notification service
