@@ -2,7 +2,7 @@
 Updated: 2026-09-13
 
 ## In flight
-- 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight remains 202609111122.
+- 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight is 202609130759 (New session menu).
 
 ## Decisions
 - Hide healthy Codex standalone scheduled runs using thread_source=automation, not names. Keep effective blocked/waiting/unknown states visible; carry origin metadata over SSH and remove hidden completion history without stopping routines.
@@ -35,7 +35,7 @@ Updated: 2026-09-13
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
-- 2026-09-13: New-session menu (Claude/Codex/Paseo → their apps) shipped: daemon route + iOS SessionLinks.swift; sim build OK, 829 tests; TestFlight release started after commit.
+- 2026-09-13: New-session menu (Claude/Codex/Paseo → their apps) shipped: daemon route + iOS SessionLinks.swift; sim build OK, 829 tests; TestFlight build 202609130759 VALID (Personal Testing). Codex link is a best guess pending a tap on the phone.
 - 2026-09-13: "Finished" notices for auto-resuming agents: settle 60 s for both the Dot notice and the Live Activity buzz, the buzz now cancels on resume (it never checked before). Deployed to the mini.
 - 2026-09-12: 3bec91c verified deployed on Mini/M1, matching installed hashes, healthy services; no scheduled guard rows in live mobile snapshot or M1 menu inputs. Existing M1 remote metadata refreshed without rerunning tasks. 825 tests + 543 subtests pass; Air offline, rollout pending there. No scheduler changes or iOS rebuild.
 - 2026-09-12: Implemented scheduled-run filtering before aggregate/LED computation, with persisted/remote metadata and completion-history cleanup. Local replay hides spend guard and keeps interactive work. Rollout in progress; Air offline.
