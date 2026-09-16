@@ -2,10 +2,11 @@
 Updated: 2026-09-16
 
 ## In flight
-- Live Activity stale count repair: foreground SSE now feeds ActivityKit directly and retries current token registration every 30 s; local cards get a 30-minute stale date. 830 existing tests + 543 subtests and the new SSE completion regression passed; simulator Release build passed. Signed build 202609160455 uploaded successfully; awaiting Apple processing and Personal Testing assignment. At 06:52 daemon had zero update tokens after 05:38 age replacement; exact phone-side token failure remains unobserved.
+- Live Activity count fix ff9fa32 shipped as TestFlight 202609160455 (VALID, existing Personal Testing). Needs installation/open on phone; physical Lock Screen/Island result and restored APNs token remain unverified.
 - 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight is 202609130759 (New session menu).
 
 ## Decisions
+- Foreground SSE feeds the selected ActivityKit card directly, guarded by server URL/enabled state and newer snapshot timestamps; re-report current token every 30 s while streaming. Local cards have a 30-minute stale date. Missing APNs token must not leave the card behind the visible list.
 - Hide healthy Codex standalone scheduled runs using thread_source=automation, not names. Keep effective blocked/waiting/unknown states visible; carry origin metadata over SSH and remove hidden completion history without stopping routines.
 - Ignore the specific internal title-generation prompt without a transcript, retaining the classification for later helper events. Do not kill the app or filter ordinary sessions by model or age.
 - Usage meters read Claude (Keychain OAuth) and Codex (`~/.codex/auth.json`, wham endpoints) directly; CodexBar CLI is fallback only — it hung for hours behind a Gatekeeper prompt after a cask upgrade (2026-09-06).
@@ -21,6 +22,7 @@ Updated: 2026-09-16
 - Upstream policy (Massimo): cherry-pick small upstream fixes only; skip the animation framework, keep idle→off.
 
 ## Next
+1. Install/open TestFlight 202609160455; verify a real completion updates both list and Island and /health regains an update token. 2026-09-16 at 06:52 server had zero update tokens after overnight age replacement; exact phone-side delivery failure is unobserved.
 1. Wait for Apple's reply in Developer Support case 102956095213 (request sent 2026-09-13 20:11 by email; the web form is not usable — mandatory category radio, see status/2026-09-13-notification-filtering-entitlement.md). On approval follow that file's "When granted" steps.
 2. When Air is online, install /tmp/sidepulse-scheduled-release.4E3fUN/sidepulse-0.1.0-py3-none-any.whl from Mini into its copied venv, restart agentstatus/remotehosts, verify module hashes. Backfill old remote entries by replaying the latest non-summary/non-subagent Codex hook per explicit scheduled_session_ids() from Mini (bounded last 5000 lines) through _emit_envelope -> consume_remote_envelope; preserve event timestamps. M1 needed 20 such metadata refreshes, no task reruns.
 3. Install/open TestFlight 202609111122 once for rendered LED-state hashes and stale reporting; server-side completion grace already applies to old clients. Watch usage warnings fire once per window.
@@ -39,6 +41,7 @@ Updated: 2026-09-16
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-16 07:01: TestFlight 202609160455 VALID and verified in Personal Testing. Simulator Release + signed archive/export passed; 830 existing tests + 543 subtests and new SSE completion test passed. Physical phone verification pending install.
 - 2026-09-16 06:58: ff9fa32 pushed; simulator/production archive/export passed, TestFlight 202609160455 uploaded without errors. Processing pending. Artifacts /private/tmp/sidepulse-release.QPrROs.
 - 2026-09-16: Fixed missing foreground stream-to-ActivityKit update path after 2-vs-1 report; test reproduces completion forwarding to both outputs, release in progress.
 - 2026-09-13 20:11: Filtering entitlement request sent as a reply in DS case 102956095213 (the web form only allows four fixed categories, none applies). Apple portal login via throwaway CDP Chrome + SMS code from the mini's Messages worked from the shell.
@@ -53,4 +56,3 @@ Updated: 2026-09-16
 - 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
 - 2026-09-11 13:25: Signed build 202609111122 uploaded without errors; awaiting processing. Continued investigation of unchanged-Working notices; new phone appearance metadata not received yet.
 - 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
-- 2026-09-11 13:16: 88b1297 server deployed, 811 tests + 519 subtests and unsigned iOS Release passed. Replaced current activity; phone registered active. TestFlight preflight blocked by removed retained certificate, no signing assets changed or upload made. Release artifacts /private/tmp/sidepulse-release.Tmbg0A; build check /Volumes/MacMiniData/sidepulse-build-check.ZAixFk.
