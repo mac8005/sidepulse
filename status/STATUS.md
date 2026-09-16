@@ -1,7 +1,8 @@
 # Status
-Updated: 2026-09-13
+Updated: 2026-09-16
 
 ## In flight
+- Live Activity stale count repair: foreground SSE now feeds ActivityKit directly and retries current token registration every 30 s; local cards get a 30-minute stale date. 830 existing tests + 543 subtests and the new SSE completion regression passed; simulator build and private TestFlight release in progress. At 06:52 daemon had zero update tokens after 05:38 age replacement; exact phone-side token failure remains unobserved.
 - 3bec91c pushed and deployed to Mini + M1; all five changed installed module hashes match source, daemons running. 825 tests + 543 subtests passed. Live Mini snapshot and M1 menu inputs contain no spend-guard rows, interactive work retained. Air update blocked by offline host/SSH timeout. No iOS rebuild needed; TestFlight is 202609130759 (New session menu).
 
 ## Decisions
@@ -38,6 +39,7 @@ Updated: 2026-09-13
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
 
 ## Log
+- 2026-09-16: Fixed missing foreground stream-to-ActivityKit update path after 2-vs-1 report; test reproduces completion forwarding to both outputs, release in progress.
 - 2026-09-13 20:11: Filtering entitlement request sent as a reply in DS case 102956095213 (the web form only allows four fixed categories, none applies). Apple portal login via throwaway CDP Chrome + SMS code from the mini's Messages worked from the shell.
 - 2026-09-13: Dot "Session finished" push made passive (list only); Apple's answer on the filtering entitlement recorded with a request draft.
 - 2026-09-13 10:48: daemon found frozen since 09:59 (tick blocked in open() on a transcript moved to MacMiniData); restarted, PromptTracker moved to its own thread (830 tests), deployed. Mini swap 11/12 GB from another session's Android emulators + iOS sims.
@@ -52,9 +54,3 @@ Updated: 2026-09-13
 - 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
 - 2026-09-11 13:16: 88b1297 server deployed, 811 tests + 519 subtests and unsigned iOS Release passed. Replaced current activity; phone registered active. TestFlight preflight blocked by removed retained certificate, no signing assets changed or upload made. Release artifacts /private/tmp/sidepulse-release.Tmbg0A; build check /Volumes/MacMiniData/sidepulse-build-check.ZAixFk.
 - 2026-09-11: Reviewed overlapping stopped-worker changes; reproduced three unnecessary-banner cases, implemented actual LED-program gating and immediate stale-state reports. Focused original regressions passed; full verification/release in progress.
-- 2026-09-11: Island vanished again at 3.5 h; root cause = phone reported the activity stale at 06:27 (18 such reports in the log history). Shipped stale guard + stale-report replacement, deployed to the mini, replaced the live activity by hand.
-- 2026-09-10 20:05: Air verified for the unread-click fix (launcher venv hashes match d4ee412, agents up since 19:57); hook checkout ~/Git/sidepulse-feature fast-forwarded, hook smoke test exit 0.
-- 2026-09-10: 041333d pushed and deployed to Mini/M1/Air; phantom absent in live snapshot, all installed collector hashes match. Full suite: 804 tests + 519 subtests passed (33 existing warnings); no iOS rebuild required.
-- 2026-09-10: Added title-helper filter and eight regression cases; focused tests and real log replay passed, rollout in progress.
-- 2026-09-10: Traced "Repair corrupted Kleido marketing session" false Working row to an unfiltered ephemeral title helper; diagnosis only, runtime unchanged.
-- 2026-09-10 16:48: M1 venv reinstalled — the 05:40 git pull had not reached the running app; fix now live there.

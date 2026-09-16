@@ -90,6 +90,7 @@ final class LiveMonitorManager: ObservableObject {
 
     @Published var statusMessage: String = "Off"
 
+    private var nextStreamReconcileAt = Date.distantPast
     private var observersStarted = false
     private var localActivityStartInProgress = false
     private var nextLocalActivityStartAt = Date.distantPast
@@ -128,6 +129,9 @@ final class LiveMonitorManager: ObservableObject {
         }
         guard !observersStarted else { return }
         observersStarted = true
+        DotStatusMirror.shared.stream.onSnapshot = { [weak self] snapshot, baseURL in
+            await self?.updateFromStream(snapshot, baseURL: baseURL)
+        }
         statusMessage = "Registering with \(model.liveMonitorServerURL)…"
 
         // Alert pushes (finished / needs input / blocked) are silent unless
@@ -212,6 +216,38 @@ final class LiveMonitorManager: ObservableObject {
             reportAbsenceToServer: !appIsActive,
             forceReportCurrent: true
         )
+    }
+
+    /// The foreground list and ActivityKit must consume the same snapshot,
+    /// even when APNs has not supplied or delivered an update token yet.
+    func updateFromStream(_ snapshot: AgentSnapshot, baseURL: String) async {
+        let model = AppModel.shared
+        guard #available(iOS 17.2, *),
+              model.liveMonitorEnabled,
+              model.liveMonitorServerURL == baseURL,
+              UIApplication.shared.applicationState == .active
+        else { return }
+        startIfEnabled(model: model)
+        let now = Date()
+        if now >= nextStreamReconcileAt {
+            nextStreamReconcileAt = now.addingTimeInterval(30)
+            // Retry token delivery after transient failures without making
+            // the stream wait for the registration request to finish.
+            Task {
+                await self.reconcileActivities(
+                    model: model, source: "foreground stream", forceReportCurrent: true
+                )
+            }
+        }
+        guard let activityID = selectedActivityID,
+              let activity = reusableActivities().first(where: { $0.id == activityID }),
+              snapshot.updatedAt > activity.content.state.updatedAt
+        else { return }
+        let state = contentState(from: snapshot)
+        await activity.update(ActivityContent(
+            state: state,
+            staleDate: Date(timeIntervalSince1970: snapshot.updatedAt + 30 * 60)
+        ))
     }
 
     /// On a fresh install the APNs token arrives after `start`; the daemon
@@ -600,7 +636,10 @@ final class LiveMonitorManager: ObservableObject {
             do {
                 let activity = try Activity.request(
                     attributes: AgentActivityAttributes(hostLabel: label),
-                    content: ActivityContent(state: state, staleDate: nil),
+                    content: ActivityContent(
+                        state: state,
+                        staleDate: Date(timeIntervalSince1970: state.updatedAt + 30 * 60)
+                    ),
                     pushType: .token
                 )
                 localActivityStartInProgress = false
@@ -659,7 +698,11 @@ final class LiveMonitorManager: ObservableObject {
               let snapshot = try? JSONDecoder().decode(AgentSnapshot.self, from: data)
         else { return fallback }
 
-        return AgentActivityAttributes.ContentState(
+        return contentState(from: snapshot)
+    }
+
+    private func contentState(from snapshot: AgentSnapshot) -> AgentActivityAttributes.ContentState {
+        AgentActivityAttributes.ContentState(
             aggregateMode: snapshot.aggregateMode,
             activeCount: snapshot.activeCount,
             agents: snapshot.agents.map {

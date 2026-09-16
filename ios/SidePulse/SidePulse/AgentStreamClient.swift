@@ -37,6 +37,8 @@ final class AgentStreamClient: ObservableObject {
     @Published var state: ConnectionState = .idle
     @Published var snapshot: AgentSnapshot?
 
+    var onSnapshot: ((AgentSnapshot, String) async -> Void)?
+
     private var task: Task<Void, Never>?
     private var connectionBaseURL: String?
     private var connectionDotToken: String?
@@ -103,6 +105,7 @@ final class AgentStreamClient: ObservableObject {
                     ) {
                         snapshot = parsed
                         state = .live
+                        await onSnapshot?(parsed, baseURL)
                     }
                 }
             } catch {
