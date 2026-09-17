@@ -1,5 +1,58 @@
 # Notification filtering entitlement — request
 
+**2026-09-17 — Apple answered the case with boilerplate: "submit the form".**
+The reply ignores the point made on 09-13 and lists the form's fields as "sample
+answers". Form re-checked the same day while logged in as the Account Holder
+(DOM dump, not a guess): unchanged. `request_reason` is still a mandatory radio
+with exactly four statements (E2E encrypted messaging / earthquake critical
+alerts / retract urgent alerts in an education platform / retract time-sensitive
+alerts in a healthcare workflow) and `app_store_url` is still mandatory; SidePulse
+is TestFlight-only. Submitting therefore still means asserting a category that is
+not true, under the Account Holder identity of the team that also ships Kleido
+and SwimInsights. Not submitted; decision put to Massimo (see STATUS.md).
+
+Same day the need shrank: the daemon now sends the visible push only while a Dot
+is known to be plugged into the phone (commit 1c7d7c9). Without a Dot there is
+no notification at all; with one it is a passive, list-only entry.
+
+### Answers mapped to the form's real fields (ready to paste)
+- `app_name`: SidePulse Monitor
+- `app_store_url`: — none, TestFlight only (field is mandatory)
+- `app_id`: 6804387957
+- `bundle_id`: com.massimo.sidepulse
+- `request_reason`: — none of the four applies (field is mandatory)
+- `reason_why_not_adequate`: SidePulse mirrors the status of coding agents
+  running on my Mac onto a small USB-C LED accessory (SidePulse Dot) plugged into
+  the iPhone. Only code running on the phone can rewrite the LED. In the
+  background there are two ways to run that code: background pushes
+  (content-available), which iOS throttles to a few per hour and often does not
+  deliver, so the LED falls out of sync; and an alert push with mutable-content
+  handled by a Notification Service Extension, which is delivered reliably but
+  must then display a notification. Live Activity pushes are reliable but give
+  no code execution. So the app has to show a notification whose only purpose
+  was to wake the extension.
+- `why_no_visible_notification`: The notification carries no information. The
+  same event (a session finished or resumed) is already shown by the app's Live
+  Activity on the Lock Screen and in the Dynamic Island, updated by its own
+  ActivityKit push at the same moment. The push only wakes the extension so it
+  can write the new LED state to the accessory. It is delivered at the passive
+  interruption level today, but still adds a Notification Center entry for
+  every LED change. With the entitlement the extension would write the LED and
+  deliver empty content. The server sends these pushes only while the accessory
+  is plugged into the phone.
+- `resources_needed`: One GET to the user's own Mac (local network or the
+  user's VPN) for the current LED command (<1 KB JSON, 5 s timeout), one file
+  write of a few hundred bytes to the accessory's USB volume through a
+  security-scoped bookmark granted in the app, one small POST to acknowledge.
+  Typically 1–3 s, hard cap 20 s. No location, media, third-party servers,
+  user-generated or encrypted content.
+- `how_often_runs`: Only when the state shown on the LED changes because an
+  agent session finished or resumed: about 20–60 times a day on one device
+  (measured: ~420 in the first 10 days), at most one per state change, with a
+  60-second settle before a "finished" push. Nothing is sent while the app is
+  in the foreground, during Do Not Disturb or Focus, or with no accessory
+  attached.
+
 **2026-09-13 20:11 — request sent as a reply in Developer Support case 102956095213**
 (from massimo@cerqui.ch, the mailbox apple@cerqui.ch forwards to; copy in Gmail Sent).
 The official form at developer.apple.com/contact/request/notification-service could
