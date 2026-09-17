@@ -2,7 +2,7 @@
 Updated: 2026-09-17
 
 ## In flight
-- 1c7d7c9 deployed to the Mini 2026-09-17 17:33 (daemon-only, no iOS build): the visible Dot push is sent only while a Dot is known to be plugged into the phone. The `dot_write_failed` flag arms on the first failed ACK the daemon sees, so ONE more stray "Open SidePulse to update your Dot." entry is expected; after that none until a write succeeds. Live arming not yet observed (the 17:33 silent probe was throttled).
+- 1c7d7c9 deployed to the Mini 2026-09-17 17:33 (daemon-only, no iOS build): the visible Dot push is sent only while a Dot is known to be plugged into the phone. Verified live: the 17:34:32 failed ACK of a silent probe set `dot_write_failed: true` on the owner, and no `dot completion/resume alert` was sent afterwards. Still to see on the phone: plugging the Dot in (+ opening the app once) brings the alerts back.
 - Filtering entitlement request SUBMITTED via Apple's web form 2026-09-17, Request ID HY8SFJ3KR3 (Massimo's choice: tick the forced category + plain disclaimer that none applies). Apple's earlier answer in case 102956095213 was boilerplate. Waiting 2–3+ weeks; refusal is the likely outcome. Details + text as sent: status/2026-09-13-notification-filtering-entitlement.md.
 - Live Activity count fix ff9fa32 shipped as TestFlight 202609160455 (VALID, existing Personal Testing). Needs installation/open on phone; physical Lock Screen/Island result and restored APNs token remain unverified.
 - 99e6be4 (StopFailure hook + everything since 3bec91c) deployed to Mini, M1 and Air on 2026-09-17: 36/36 installed modules match source on each, agents restarted, remote streams reconnected, Claude `StopFailure` hook installed on all three (settings.json backups kept, hook command probed on each). M1/Air menus show no scheduled spend-guard rows, so the old Air metadata backfill is moot. No iOS rebuild needed.
@@ -27,7 +27,7 @@ Updated: 2026-09-17
 ## Next
 1. Install/open TestFlight 202609160455; verify a real completion updates both list and Island and /health regains an update token. 2026-09-16 at 06:52 server had zero update tokens after overnight age replacement; exact phone-side delivery failure is unobserved.
 1. Filtering entitlement: wait for Apple on Request ID HY8SFJ3KR3 (mail goes to apple@cerqui.ch → massimo@). If granted, follow "When granted" in status/2026-09-13-notification-filtering-entitlement.md; if refused, close the topic — the passive, Dot-attached-only push is the end state.
-1. Confirm the Dot-push fix live: after the next finish/resume, `live_activity_tokens.json` → `dot_device` owner should show `dot_write_failed: true` and the log should stop showing `dot completion/resume alert` lines while no Dot is attached; plug the Dot in + open the app → flag false, alerts return.
+1. Dot-push fix, remaining check: plug the Dot into the phone + open SidePulse once → `dot_write_failed` goes false in `live_activity_tokens.json` and `dot completion alert` lines return in the log.
 2. Install/open TestFlight 202609111122 once for rendered LED-state hashes and stale reporting; server-side completion grace already applies to old clients. Watch usage warnings fire once per window.
 3. Air: `~/.local/state/sidepulse/agent-monitor/status-history.jsonl` is 292 MB (status-bar history is not covered by log_trim); decide whether to trim it like the hook logs.
 
