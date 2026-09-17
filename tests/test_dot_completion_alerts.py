@@ -189,7 +189,7 @@ def test_resume_after_expired_suppression_does_not_duplicate_initial_push(tmp_pa
     observe(daemon, snapshot(100), 100)
     observe(daemon, snapshot(110, ("session", 110)), 110)
     daemon.ack_dot(daemon._pending_dot.command_id, "written", now=111)
-    daemon.report_dot_availability("phone", False, "write_failed", 60, 115, now=115)
+    daemon.report_dot_availability("phone", False, "focus", 60, 115, now=115)
     resumed = {**snapshot(180), "agents": [{"id": "session", "mode": "working"}]}
     assert observe(daemon, resumed, 180)
     command_id = daemon._pending_dot.command_id
@@ -474,3 +474,64 @@ def test_command_http_response_is_not_cacheable(http_daemon):
         response.read()
     finally:
         connection.close()
+
+
+def all_read(now, *agent_ids):
+    return {**snapshot(now), "agents": [
+        {"id": agent_id, "name": "Private", "mode": "completed", "finishedAt": now - 1, "unread": False}
+        for agent_id in agent_ids
+    ]}
+
+
+def alerts(sent):
+    return [entry for entry in sent if entry[2]["push_type"] == "alert"]
+
+
+def test_failed_extension_write_stops_visible_alerts_until_a_write_succeeds(tmp_path, monkeypatch):
+    """The visible push only exists to wake the extension for a Dot plugged
+    into the phone. A failed write means there is none: the Live Activity
+    carries the news alone until the phone proves a Dot is back."""
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    assert observe(daemon, snapshot(110, ("first", 110)), 110)
+    assert not daemon.ack_dot(daemon._pending_dot.command_id, "failed", now=111)  # extension: no availability
+
+    observe(daemon, all_read(120, "first"), 120)
+    assert not observe(daemon, snapshot(130, ("second", 130)), 130)
+    assert len(alerts(sent)) == 1
+    # The invisible probe still goes out, so a Dot plugged in later is found.
+    assert daemon._send_pending_dot_if_due(130)
+    assert sent[-1][2]["push_type"] == "background"
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=131)
+
+    observe(daemon, all_read(140, "first", "second"), 140)
+    assert daemon._send_pending_dot_if_due(140)
+    assert daemon.ack_dot(daemon._pending_dot.command_id, "written", now=141)
+    assert observe(daemon, snapshot(150, ("third", 150)), 150)
+    assert len(alerts(sent)) == 2
+
+
+def test_app_write_failure_outlives_its_lease_for_visible_alerts(tmp_path, monkeypatch):
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    daemon._queue_dot_state("working", snapshot(100), 100)
+    daemon.ack_dot(daemon._pending_dot.command_id, "failed", (False, "write_failed", 300.0, None), now=101)
+
+    # Lease over and the silent retry was throttled away: still no proof of a Dot.
+    assert not observe(daemon, snapshot(500, ("first", 500)), 500)
+    assert alerts(sent) == []
+    assert daemon._record_dot_availability("phone", True, None, None, None, now=510) == (True, True)
+    observe(daemon, all_read(520, "first"), 520)
+    assert observe(daemon, snapshot(530, ("second", 530)), 530)
+    assert len(alerts(sent)) == 1
+
+
+@pytest.mark.parametrize("availability", [(True, None, None, None), (False, "focus", 60.0, None)])
+def test_failed_status_without_a_usb_failure_keeps_visible_alerts(tmp_path, monkeypatch, availability):
+    """Superseded writes and Focus report "failed" too, with a Dot attached."""
+    daemon, sent = make_daemon(tmp_path, monkeypatch)
+    observe(daemon, snapshot(100), 100)
+    daemon._queue_dot_state("working", snapshot(100), 100)
+    daemon.ack_dot(daemon._pending_dot.command_id, "failed", availability, now=101)
+    assert observe(daemon, snapshot(500, ("first", 500)), 500)
+    assert len(alerts(sent)) == 1

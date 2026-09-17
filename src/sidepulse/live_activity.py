@@ -170,6 +170,7 @@ DOT_UNAVAILABLE_METADATA_KEYS = (
     "dot_focus_active",
     "dot_focus_reported_at",
     "dot_dnd_active",
+    "dot_write_failed",
 )
 DOT_COMPLETION_METADATA_KEYS = (
     "dot_completion_alerts_enabled",
@@ -3561,9 +3562,13 @@ class LiveActivityDaemon:
             self._dot_completion_owner = owner
             # Consume identities even while opted out, in the foreground, or
             # suppressed. Enabling alerts or lifting Focus never replays them.
+            # The push is only visible because the extension needs waking for
+            # the Dot: after a failed USB write no Dot is plugged in, and the
+            # Live Activity carries the news alone until a write succeeds.
             if (
                 baseline or already_written
                 or metadata.get("dot_completion_alerts_enabled") is not True
+                or metadata.get("dot_write_failed") is True
                 or self._dot_completion_unavailability(now) is not None
             ):
                 self._dot_completion_candidate = None
@@ -3832,11 +3837,14 @@ class LiveActivityDaemon:
                         "dot_unavailable_until": None,
                         "dot_unavailable_reason": None,
                         "dot_dnd_active": False,
+                        "dot_write_failed": False,
                     }
                 )
             else:
                 if reason == "dnd":
                     values["dot_dnd_active"] = True
+                if reason == "write_failed":
+                    values["dot_write_failed"] = True
                 lease_seconds = max(
                     DOT_UNAVAILABLE_MIN_SECONDS,
                     min(
@@ -4105,6 +4113,14 @@ class LiveActivityDaemon:
                         owner,
                         dnd_schedule,
                         now=now,
+                    )
+            if availability is None and status in {"failed", *DOT_ACK_SUCCESS_STATUSES}:
+                # The extension ACKs without availability: its write result is
+                # the only word on whether a Dot is plugged into the phone.
+                owner = next(iter(self.tokens.entries("dot_device")), None)
+                if owner is not None:
+                    self.tokens.update_metadata(
+                        "dot_device", owner, {"dot_write_failed": status == "failed"}
                     )
             delivered = status in DOT_ACK_SUCCESS_STATUSES and (
                 availability is None
