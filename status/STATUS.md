@@ -1,5 +1,5 @@
 # Status
-Updated: 2026-09-16
+Updated: 2026-09-17
 
 ## In flight
 - Live Activity count fix ff9fa32 shipped as TestFlight 202609160455 (VALID, existing Personal Testing). Needs installation/open on phone; physical Lock Screen/Island result and restored APNs token remain unverified.
@@ -39,8 +39,10 @@ Updated: 2026-09-16
 - `ignoring retired activity token <current id>` in the log is benign: the app re-sent an older observation of the same activity.
 - Full suite: `.venv/bin/python -m pytest -q tests` (not the repo root: `ios/SidePulse/tools/tests` needs fastapi). ruff is not installed; `uvx ruff check` works, the tree has pre-existing findings.
 - Log files: `~/.local/state/sidepulse/agent-monitor/live-activity.{out,err}.log`; err log is full of benign `ConnectionResetError` from SSE clients.
+- "No Claude usage data" in the app with a healthy daemon = that Mac's Claude Code login is dead, not a SidePulse bug: the meter only reads the Keychain access token and never refreshes it (by design). Tell-tale in live-activity.out.log: `claude -p exited 1: Failed to authenticate: OAuth session expired and could not be refreshed` (summaries pause too). Fix = `/login` in a GUI terminal on that Mac; the meter recovers on its next 5-min refresh. Remote-control workers started while the login was dead keep answering "Not logged in" afterwards — kill them, they respawn on the next message.
 
 ## Log
+- 2026-09-17: "No Claude usage data" report traced to the Mini's Claude Code login: server refused the refresh token between 06:30 and 06:38; Massimo's /login at 06:40 restored it, usage meter + summaries verified back, stuck remote-control worker killed. No SidePulse change.
 - 2026-09-16 07:01: TestFlight 202609160455 VALID and verified in Personal Testing. Simulator Release + signed archive/export passed; 830 existing tests + 543 subtests and new SSE completion test passed. Physical phone verification pending install.
 - 2026-09-16 06:58: ff9fa32 pushed; simulator/production archive/export passed, TestFlight 202609160455 uploaded without errors. Processing pending. Artifacts /private/tmp/sidepulse-release.QPrROs.
 - 2026-09-16: Fixed missing foreground stream-to-ActivityKit update path after 2-vs-1 report; test reproduces completion forwarding to both outputs, release in progress.
@@ -55,4 +57,3 @@ Updated: 2026-09-16
 - 2026-09-11: de891a6 pushed/deployed to Mini; installed hash + healthy daemon verified, completion grace 10 seconds. 816 tests + 519 subtests passed. TestFlight 202609111122 already VALID in Personal Testing; server-only grace required no rebuild.
 - 2026-09-11: TestFlight 202609111122 verified VALID/Personal Testing. Added completion grace plus held silent push after a real five-second completion/resume pair; 51 focused regressions passed, final verification/deploy next.
 - 2026-09-11 13:25: Signed build 202609111122 uploaded without errors; awaiting processing. Continued investigation of unchanged-Working notices; new phone appearance metadata not received yet.
-- 2026-09-11: Authorized signing repair complete: reused 4STRQLBTSW, six verified replacement profiles, isolated SidePulse keychain, original keychain/search list preserved. No certificates revoked or created. TestFlight release proceeding.
