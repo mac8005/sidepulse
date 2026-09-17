@@ -3264,6 +3264,24 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertFalse(any(command.startswith("jq -c") for command in commands))
             self.assertEqual(data["permissions"]["allow"], ["Bash(date)"])
 
+    def test_claude_installer_registers_stop_failure_hook(self) -> None:
+        # Claude fires StopFailure instead of Stop when an API error (expired
+        # login, rate limit) ends the turn; unheard, the session stays "working".
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "settings.json"
+            log = base / "claude.jsonl"
+
+            install_claude_hooks(log_path=log, config_path=config, python_executable="python3")
+
+            data = json.loads(config.read_text())
+            commands = [
+                hook["command"]
+                for entry in data["hooks"].get("StopFailure", [])
+                for hook in entry["hooks"]
+            ]
+            self.assertTrue(any("hook_entry.py" in command for command in commands))
+
     def test_grok_installer_writes_global_hook_file_without_lifecycle_matchers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
