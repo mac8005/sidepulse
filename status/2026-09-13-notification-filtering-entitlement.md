@@ -9,18 +9,28 @@ alerts / retract urgent alerts in an education platform / retract time-sensitive
 alerts in a healthcare workflow) and `app_store_url` is still mandatory; SidePulse
 is TestFlight-only. Submitting therefore still means asserting a category that is
 not true, under the Account Holder identity of the team that also ships Kleido
-and SwimInsights. Not submitted; decision put to Massimo (see STATUS.md).
+and SwimInsights. Put to Massimo, who chose: submit with a plain disclaimer.
+
+**Submitted 2026-09-17 ~17:50 — Request ID HY8SFJ3KR3** ("We'll review your
+request and contact you soon"). First option ticked because the form forces one;
+the first text field opens with "None of the four categories above applies …
+selected only to be able to submit … not a messaging app and uses no encryption
+… TestFlight only, so the App Store URL is not live … if the entitlement is
+limited to the four listed categories, please simply decline." Text below is what
+was sent. Confirmation screenshot (not in git, repo is public):
+`~/.local/share/sidepulse/apple/2026-09-17-entitlement-request-HY8SFJ3KR3.png`.
+Expect 2–3+ weeks and most likely a refusal.
 
 Same day the need shrank: the daemon now sends the visible push only while a Dot
 is known to be plugged into the phone (commit 1c7d7c9). Without a Dot there is
 no notification at all; with one it is a passive, list-only entry.
 
-### Answers mapped to the form's real fields (ready to paste)
+### Answers as submitted
 - `app_name`: SidePulse Monitor
-- `app_store_url`: — none, TestFlight only (field is mandatory)
+- `app_store_url`: https://apps.apple.com/app/id6804387957 (not live; said so in the text)
 - `app_id`: 6804387957
 - `bundle_id`: com.massimo.sidepulse
-- `request_reason`: — none of the four applies (field is mandatory)
+- `request_reason`: first option, with the disclaimer above
 - `reason_why_not_adequate`: SidePulse mirrors the status of coding agents
   running on my Mac onto a small USB-C LED accessory (SidePulse Dot) plugged into
   the iPhone. Only code running on the phone can rewrite the LED. In the
