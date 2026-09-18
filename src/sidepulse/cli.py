@@ -181,8 +181,8 @@ def add_live_activity_parser(subparsers: argparse._SubParsersAction) -> None:
         target.add_argument("--idle-end-minutes", type=float, default=10.0)
         target.add_argument(
             "--summary-model",
-            default="claude-haiku-4-5-20251001",
-            help="Model for `claude -p` session-state summaries.",
+            default="qwen-3.8-27b",
+            help="Cerebras model for session-state summaries.",
         )
         target.add_argument(
             "--no-summaries",

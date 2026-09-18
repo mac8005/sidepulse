@@ -22,12 +22,12 @@ import math
 import os
 import queue
 import re
-import shutil
 import socket
 import sqlite3
-import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -238,7 +238,7 @@ class LiveActivityConfig:
     poll_seconds: float = 2.0
     idle_end_minutes: float = 10.0
     summaries_enabled: bool = True
-    summary_model: str = "claude-haiku-4-5-20251001"
+    summary_model: str = "qwen-3.8-27b"
 
     @property
     def apns_host(self) -> str:
@@ -1154,7 +1154,25 @@ class APNsLiveActivityClient:
 
 
 SUMMARY_MAX_CHARS = 90
-SUMMARY_PROMPT_VERSION = 4
+SUMMARY_PROMPT_VERSION = 5
+CEREBRAS_CHAT_URL = "https://api.cerebras.ai/v1/chat/completions"
+# Beside the APNs key, outside the repository; CEREBRAS_API_KEY wins.
+CEREBRAS_KEY_PATH = Path.home() / ".local" / "share" / "sidepulse" / "cerebras_key"
+# A session that only `cd`s into a repository for an errand (reading mail
+# credentials to chase a shoe order) is not about that repository. The title
+# model may then swap the repository label for one of these words. The list
+# is closed on purpose: the model must never name a project itself.
+SUMMARY_TOPIC_LABELS = (
+    "Shopping",
+    "Email",
+    "Research",
+    "Home",
+    "Finance",
+    "Travel",
+    "School",
+    "Health",
+    "System",
+)
 SUMMARY_FAILURE_BACKOFF_BASE_SECONDS = 60.0
 SUMMARY_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60.0
 SUMMARY_PROGRESS_REFRESH_SECONDS = 45.0
@@ -1395,6 +1413,31 @@ def _exec_command_workdirs(source: str) -> list[str]:
     return workdirs
 
 
+def _cerebras_key() -> str:
+    value = os.environ.get("CEREBRAS_API_KEY", "").strip()
+    if value:
+        return value
+    try:
+        return CEREBRAS_KEY_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _topic_label(label: str) -> str | None:
+    """The canonical topic for a model-written label, None for anything else."""
+    folded = label.strip().casefold()
+    return next(
+        (topic for topic in SUMMARY_TOPIC_LABELS if topic.casefold() == folded),
+        None,
+    )
+
+
+def _split_topic(summary: str) -> tuple[str | None, str]:
+    label, separator, body = summary.partition(": ")
+    topic = _topic_label(label) if separator else None
+    return (topic, body) if topic else (None, summary)
+
+
 def _summary_cache_key(session_id: str, style: str) -> str:
     # Versioned because title semantics are user-visible and an old cached
     # phrase can otherwise survive a daemon upgrade indefinitely.
@@ -1619,17 +1662,14 @@ class PromptTracker:
 
 class SessionSummarizer:
     """Turns a session's last assistant message into a tiny outcome line
-    ("TestFlight build deployed") via `claude -p` on a fast model.
+    ("TestFlight build deployed") via a fast model on Cerebras.
 
-    Runs the CLI without tools and with an isolated cwd whose path contains
-    an ignored directory name and a private MOONSIDE_RUNTIME_DIR, so the
-    summary sessions cannot mutate files and never appear in any monitor or
-    on the lamp.
+    A plain chat completion: no tools and no agent session, so a summary
+    cannot mutate files and never appears in any monitor or on the lamp.
     """
 
     def __init__(self, model: str) -> None:
         self.model = model
-        self.claude = shutil.which("claude") or "/opt/homebrew/bin/claude"
         self._results: dict[str, tuple[str, str]] = {}  # session -> (source_hash, summary)
         self._requested_hashes: dict[str, str] = {}
         self._pending: set[str] = set()
@@ -1638,12 +1678,7 @@ class SessionSummarizer:
         self._failure_count = 0
         self._retry_after = 0.0
         base = default_state_dir() / "summarizer"
-        # "memories" is on the ignored-directory list, hiding these runs
-        # from every sidepulse consumer.
-        self.workdir = base / "memories"
-        self.moonside_dir = base / "moonside"
-        self.workdir.mkdir(parents=True, exist_ok=True)
-        self.moonside_dir.mkdir(parents=True, exist_ok=True)
+        base.mkdir(parents=True, exist_ok=True)
         self._cache_path = base / "summaries.json"
         self._load_cache()
         for _ in range(2):
@@ -1758,57 +1793,65 @@ class SessionSummarizer:
             )
         prompt = (
             instruction
-            + "Use the exact format `Task; latest state`, sentence case, at most "
-            "twelve words total. Read through typos. Never invent work. Do not "
-            "include or guess a project or product name; the caller adds a "
-            "trusted label separately. No quotes or final period. Return only "
-            "the title body.\n\n"
-            f"Trusted session context: {context[:800]}\n\n"
+            + "Use the exact format `Label: Task; latest state`, sentence case, "
+            "at most twelve words after the label. Read through typos. Never "
+            "invent work. Never write a project, product or repository name "
+            "anywhere; the caller adds a trusted label separately. The label is "
+            "the single word `repo` whenever the request concerns the observed "
+            "repository in any way: its code, app, data, users, deployment, "
+            "marketing or operations. Only when the request has nothing to do "
+            "with that repository, or no repository was observed (a personal "
+            "errand that merely runs from some folder), the label is the one "
+            "best fitting word of: " + ", ".join(SUMMARY_TOPIC_LABELS) + ". No "
+            "quotes or final period. Return only the labelled title.\n\n"
+            f"Trusted session context: {context[:800] or 'no repository observed'}\n\n"
             f"Content:\n{message[:3000]}"
         )
-        env = dict(os.environ)
-        env["MOONSIDE_RUNTIME_DIR"] = str(self.moonside_dir)
-        # Under launchd the PATH lacks Homebrew, so the CLI's node-based
-        # hooks fail noisily and slow the call down.
-        env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "/usr/bin:/bin")
+        key = _cerebras_key()
+        if not key:
+            _log("summary generation failed: no Cerebras key")
+            return None
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            # Left to itself the model spends the whole budget reasoning and
+            # returns no title at all.
+            "reasoning_effort": "low",
+            "max_completion_tokens": 2048,
+        }
+        request = urllib.request.Request(
+            CEREBRAS_CHAT_URL,
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                # Cloudflare answers urllib's default agent with 403 (1010).
+                "User-Agent": "sidepulse",
+            },
+        )
         try:
-            result = subprocess.run(
-                [
-                    self.claude,
-                    "-p",
-                    "--model", self.model,
-                    # Strip startup weight: no MCP servers, no hooks, no
-                    # session persistence. Roughly halves the latency.
-                    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-                    "--settings", '{"disableAllHooks":true}',
-                    "--no-session-persistence",
-                    # The complete source text is already in the prompt; the
-                    # summary worker needs no filesystem or shell access.
-                    "--tools", "",
-                ],
-                capture_output=True,
-                text=True,
-                input=prompt,
-                timeout=120,
-                cwd=self.workdir,
-                env=env,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read())
+            content = data["choices"][0]["message"].get("content")
+        except urllib.error.HTTPError as exc:
+            # Provider error bodies may echo the request; the status is enough.
+            _log(f"cerebras request failed: HTTP {exc.code}")
+            return None
+        except (OSError, ValueError, LookupError, AttributeError) as exc:
             _log(f"summary generation failed: {exc}")
             return None
-        if result.returncode != 0:
-            detail = (result.stderr.strip() or result.stdout.strip()).replace("\n", " ")
-            _log(f"claude -p exited {result.returncode}: {detail[:120]}")
-            return None
-        line = result.stdout.strip().splitlines()
+        line = content.strip().splitlines() if isinstance(content, str) else []
         # Models sometimes add a trailing period or stray spaces; row text
         # must be clean — it renders as a one-line title.
         text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
-        # Defensive boundary for a model that still emits a project prefix.
-        # Project identity is supplied deterministically by the daemon.
+        # Only a topic from the closed list survives as a label. `repo`, and
+        # any project name a model still emits, is dropped here: project
+        # identity is supplied deterministically by the daemon.
+        topic = None
         semicolon_at = text.find("; ")
         colon_at = text.find(": ")
         if colon_at >= 0 and (semicolon_at < 0 or colon_at < semicolon_at):
+            topic = _topic_label(text[:colon_at])
             text = text[colon_at + 2:].strip()
         else:
             trusted_project = (
@@ -1824,6 +1867,10 @@ class SessionSummarizer:
             _log("summary rejected: protocol or tool metadata")
             return None
         if text:
+            # Behind a label the model tends to start the task in lower case.
+            text = text[0].upper() + text[1:]
+            if topic:
+                text = f"{topic}: {text}"
             _log(f"summary -> {text[:70]}")
             return _truncate(text, SUMMARY_MAX_CHARS)
         return None
@@ -1904,6 +1951,7 @@ class LiveActivityDaemon:
         self._task_sources: dict[str, tuple[str, str, float]] = {}
         self._settled_statuses: dict[str, AgentStatus] = {}
         self._published_summaries: dict[str, str] = {}
+        self._session_topics: dict[str, str] = {}
         self.usage = UsageMonitor(
             on_alert=self._push_usage_alert,
             alert_state_path=default_state_dir() / "usage_alerts.json",
@@ -2200,6 +2248,14 @@ class LiveActivityDaemon:
             or not is_readable_session_title(summary)
         ):
             summary = self._fallback_summary(prompt, status)
+        else:
+            # The model's latest label stands until it answers again, so the
+            # fallback shown between two answers keeps the same prefix.
+            topic, summary = _split_topic(summary)
+            if topic:
+                self._session_topics[status.session_id] = topic
+            else:
+                self._session_topics.pop(status.session_id, None)
         summary = self._summary_title(status.session_id, summary, status.cwd)
         if not is_readable_session_title(summary):
             summary = self._summary_title(
@@ -2246,7 +2302,9 @@ class LiveActivityDaemon:
     def _summary_title(
         self, session_id: str, action: str, cwd: str | None = None
     ) -> str:
-        project = self._prompt_tracker.project_for(session_id, cwd)
+        project = self._session_topics.get(
+            session_id
+        ) or self._prompt_tracker.project_for(session_id, cwd)
         prefix = f"{project}: " if project else ""
         if "; " not in action:
             return _truncate(prefix + action, SUMMARY_MAX_CHARS)

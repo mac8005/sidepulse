@@ -3265,30 +3265,42 @@ def test_stop_with_running_background_tasks_is_long_task():
     assert mode_for_event(stop([{"id": "b1", "status": "completed"}])) == AgentMode.COMPLETED
 
 
-def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+class _FakeCerebrasResponse:
+    def __init__(self, content):
+        self._body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
 
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _cerebras_summarizer(monkeypatch, content, seen=None):
     from sidepulse.live_activity import SessionSummarizer
 
-    command = []
+    def urlopen(request, timeout):
+        if seen is not None:
+            seen["url"] = request.full_url
+            seen["headers"] = {k.lower(): v for k, v in request.header_items()}
+            seen["body"] = json.loads(request.data)
+        return _FakeCerebrasResponse(content)
 
-    call = {}
-
-    def fake_run(args, **kwargs):
-        command.extend(args)
-        call.update(kwargs)
-        return SimpleNamespace(
-            returncode=0,
-            stdout="Kleido: Deploy TestFlight build; upload running\n",
-            stderr="",
-        )
-
+    monkeypatch.setattr("sidepulse.live_activity._cerebras_key", lambda: "key-123")
+    monkeypatch.setattr("sidepulse.live_activity.urllib.request.urlopen", urlopen)
     summarizer = object.__new__(SessionSummarizer)
-    summarizer.model = "claude-haiku-test"
-    summarizer.claude = "/usr/local/bin/claude"
-    summarizer.workdir = tmp_path
-    summarizer.moonside_dir = tmp_path / "moonside"
-    monkeypatch.setattr("sidepulse.live_activity.subprocess.run", fake_run)
+    summarizer.model = "qwen-test"
+    return summarizer
+
+
+def test_summarizer_asks_cerebras_without_tools_and_drops_a_project_label(monkeypatch):
+    seen = {}
+    summarizer = _cerebras_summarizer(
+        monkeypatch, "\n\nKleido: Deploy TestFlight build; upload running\n", seen
+    )
 
     assert summarizer._generate(
         "Upload to TestFlight: success.",
@@ -3297,16 +3309,45 @@ def test_summarizer_disables_all_claude_tools(tmp_path, monkeypatch):
     ) == (
         "Deploy TestFlight build; upload running"
     )
-    assert "task; latest state" in call["input"].lower()
-    assert call["input"] not in command
-    tools_index = command.index("--tools")
-    assert command[tools_index + 1] == ""
-    prompt = call["input"].lower()
+    assert seen["url"] == "https://api.cerebras.ai/v1/chat/completions"
+    assert seen["headers"]["authorization"] == "Bearer key-123"
+    assert seen["body"]["model"] == "qwen-test"
+    assert seen["body"]["reasoning_effort"] == "low"
+    assert "tools" not in seen["body"]
+    prompt = seen["body"]["messages"][0]["content"].lower()
     assert "kleido" not in prompt
     assert "sidepulse:" not in prompt
     assert "task; latest state" in prompt
     assert "never replace the task" in prompt
     assert "low-level command" in prompt
+
+
+def test_summarizer_keeps_only_a_topic_from_the_closed_list(monkeypatch):
+    context = "repository observed for this session: aura-server"
+
+    summarizer = _cerebras_summarizer(
+        monkeypatch, "shopping: check unshipped order; fetching status page"
+    )
+    assert summarizer._generate("Content", context, style="task") == (
+        "Shopping: Check unshipped order; fetching status page"
+    )
+
+    summarizer = _cerebras_summarizer(monkeypatch, "repo: fix bridge logout; working")
+    assert summarizer._generate("Content", context, style="task") == (
+        "Fix bridge logout; working"
+    )
+
+
+def test_summarizer_without_a_key_makes_no_request(monkeypatch):
+    messages = []
+    seen = {}
+    summarizer = _cerebras_summarizer(monkeypatch, "Shopping: Task; state", seen)
+    monkeypatch.setattr("sidepulse.live_activity._cerebras_key", lambda: "")
+    monkeypatch.setattr("sidepulse.live_activity._log", messages.append)
+
+    assert summarizer._generate("Content", "", style="task") is None
+    assert seen == {}
+    assert any("no Cerebras key" in message for message in messages)
 
 
 def test_summarizer_never_returns_a_cached_result_for_changed_content():
@@ -3385,49 +3426,27 @@ def test_summarizer_failure_backoff_is_global_and_resets_on_success(monkeypatch)
     assert summarizer._retry_after == 0.0
 
 
-def test_summarizer_logs_cli_errors_from_stdout(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def test_summarizer_logs_only_the_status_of_a_failed_request(monkeypatch):
+    import io
+    import urllib.error
 
-    from sidepulse.live_activity import SessionSummarizer
+    def rate_limited(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"echoed prompt")
+        )
 
     messages = []
-    summarizer = object.__new__(SessionSummarizer)
-    summarizer.model = "claude-haiku-test"
-    summarizer.claude = "/usr/local/bin/claude"
-    summarizer.workdir = tmp_path
-    summarizer.moonside_dir = tmp_path / "moonside"
-    monkeypatch.setattr(
-        "sidepulse.live_activity.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=1,
-            stdout="You've hit your session limit\n",
-            stderr="",
-        ),
-    )
+    summarizer = _cerebras_summarizer(monkeypatch, "unused")
+    monkeypatch.setattr("sidepulse.live_activity.urllib.request.urlopen", rate_limited)
     monkeypatch.setattr("sidepulse.live_activity._log", messages.append)
 
     assert summarizer._generate("Content", "", style="task") is None
-    assert any("session limit" in message for message in messages)
+    assert any("HTTP 429" in message for message in messages)
+    assert not any("echoed prompt" in message for message in messages)
 
 
-def test_summarizer_rejects_a_title_without_task_and_state(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from sidepulse.live_activity import SessionSummarizer
-
-    summarizer = object.__new__(SessionSummarizer)
-    summarizer.model = "claude-haiku-test"
-    summarizer.claude = "/usr/local/bin/claude"
-    summarizer.workdir = tmp_path
-    summarizer.moonside_dir = tmp_path / "moonside"
-    monkeypatch.setattr(
-        "sidepulse.live_activity.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0,
-            stdout="SidePulse: Improving session titles\n",
-            stderr="",
-        ),
-    )
+def test_summarizer_rejects_a_title_without_task_and_state(monkeypatch):
+    summarizer = _cerebras_summarizer(monkeypatch, "SidePulse: Improving session titles\n")
 
     assert summarizer._generate(
         "Current request:\nImprove titles\n\nSession state:\nWorking",
@@ -3732,6 +3751,55 @@ def test_generated_title_cannot_override_observed_repository(tmp_path, monkeypat
     assert "Uploaded. Waiting on processing." in calls[0][0]
 
 
+def test_topic_label_replaces_a_repository_the_session_only_passed_through(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    (tmp_path / "claude.jsonl").write_text(
+        json.dumps(
+            {
+                "session_id": "s1",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/Users/x/Git/aura-server",
+                "prompt": "Then check my order which is still not shipped.",
+            }
+        )
+        + "\n"
+    )
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker.poll()
+
+    answers = []
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            return answers.pop(0)
+
+    daemon.summarizer = FakeSummarizer()
+    working = make_status("claude:session:s1", AgentMode.WORKING, session_id="s1")
+    working = type(working)(**{**working.__dict__, "cwd": "/Users/x/Git/aura-server"})
+
+    answers.append("Shopping: Check unshipped order; searching mailbox")
+    assert daemon._apply_summary(working).display_name == (
+        "Shopping: Check unshipped order; searching mailbox"
+    )
+    # The next answer is still in flight: the fallback keeps the label.
+    answers.append(None)
+    assert daemon._apply_summary(working).display_name == (
+        "Shopping: Then check my order which is still not shipped; working"
+    )
+    # `repo` answers arrive without a label and restore the repository.
+    answers.append("Fix bridge logout; working")
+    assert daemon._apply_summary(working).display_name == (
+        "aura-server: Fix bridge logout; working"
+    )
+
+
 def test_blocked_session_title_keeps_task_and_concrete_state(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 
@@ -3855,15 +3923,16 @@ def test_summarizer_replaces_display_name(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 
     monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
-    fake = tmp_path / "claude"
-    fake.write_text(
-        "#!/bin/sh\necho 'sidepulse: Deploy TestFlight build; build deployed'\n"
+    monkeypatch.setattr("sidepulse.live_activity._cerebras_key", lambda: "key-123")
+    monkeypatch.setattr(
+        "sidepulse.live_activity.urllib.request.urlopen",
+        lambda request, timeout: _FakeCerebrasResponse(
+            "sidepulse: Deploy TestFlight build; build deployed"
+        ),
     )
-    fake.chmod(0o755)
 
     config = LiveActivityConfig(apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y")
     daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
-    daemon.summarizer.claude = str(fake)
 
     done = make_status("claude:session:s1", AgentMode.COMPLETED, name="old prompt", session_id="s1")
     done = type(done)(**{**done.__dict__, "event_name": "Stop",
