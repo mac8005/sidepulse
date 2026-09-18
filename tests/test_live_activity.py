@@ -3895,6 +3895,36 @@ def test_session_emoji_is_chosen_once_kept_and_distinct(tmp_path, monkeypatch):
     assert daemon._fallback_summary(None, titled) == "Where is my shoe order; working"
 
 
+def test_finished_rows_without_an_emoji_get_one(tmp_path, monkeypatch):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            assert (session_id, style) == ("s9", "emoji")
+            return "📮"
+
+    daemon.summarizer = FakeSummarizer()
+    daemon._recent_finished = {
+        "claude:session:s9": {"name": "Email: Write to support; completed", "mode": "completed"},
+        "claude:session:s1": {"name": "👟 Shopping: Check order; completed", "mode": "completed"},
+    }
+
+    daemon._refresh_finished_summaries()
+
+    assert daemon._recent_finished["claude:session:s9"]["name"] == (
+        "📮 Email: Write to support; completed"
+    )
+    assert daemon._recent_finished["claude:session:s1"]["name"] == (
+        "👟 Shopping: Check order; completed"
+    )
+
+
 def test_ios_project_compaction_looks_past_the_session_emoji():
     from sidepulse.live_activity import _ios_content_row
 

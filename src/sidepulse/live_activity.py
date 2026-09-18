@@ -2300,7 +2300,7 @@ class LiveActivityDaemon:
     def _emoji_for(self, session_id: str, request: str) -> str | None:
         """The session's emoji: chosen once from its request, then kept."""
         emoji = self._session_emoji.get(session_id)
-        if emoji:
+        if emoji or self.summarizer is None:
             return emoji
         taken = list(self._session_emoji.values())[-SESSION_EMOJI_DISTINCT:]
         answer = self.summarizer.summary_for(
@@ -2411,6 +2411,16 @@ class LiveActivityDaemon:
                 continue
             row["name"] = summarized.display_name
             changed = True
+        # Rows that finished without an emoji (before a restart, or while the
+        # model was unreachable) get theirs here.
+        for agent_id, row in self._recent_finished.items():
+            name = row.get("name")
+            if not isinstance(name, str) or split_session_emoji(name)[0]:
+                continue
+            emoji = self._emoji_for(agent_id.rsplit(":", 1)[-1], name)
+            if emoji:
+                row["name"] = f"{emoji} {name}"
+                changed = True
         if changed:
             self._save_recent_finished()
 
