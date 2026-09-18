@@ -3936,6 +3936,71 @@ def test_ios_project_compaction_looks_past_the_session_emoji():
     )
 
 
+def test_held_open_session_names_the_background_task_instead_of_an_outcome(
+    tmp_path, monkeypatch
+):
+    from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    waiter = {
+        "id": "b1",
+        "type": "shell",
+        "status": "running",
+        "description": "Wait for the rollout chain to finish\nand show its receipts",
+    }
+    log = tmp_path / "claude.jsonl"
+
+    def write(*events):
+        log.write_text("".join(json.dumps({"session_id": "s1", **e}) + "\n" for e in events))
+
+    prompt = {
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": "/Users/x/Git/aura",
+        "prompt": "Trace why the image shows up late.",
+    }
+    write(prompt, {"hook_event_name": "Stop", "background_tasks": [waiter]})
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon._prompt_tracker.poll()
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            return None if style == "emoji" else "Trace image delay; fix deployed"
+
+    daemon.summarizer = FakeSummarizer()
+    held = make_status("claude:session:s1", AgentMode.LONG_TASK_PROGRESS, session_id="s1")
+    held = type(held)(**{**held.__dict__, "event_name": "Stop", "cwd": "/Users/x/Git/aura"})
+
+    assert daemon._apply_summary(held).display_name == (
+        "aura: Trace image delay; background task: Wait for the rollout chain to f…"
+    )
+
+    # Several open tasks are counted; the latest one is named.
+    done = {**waiter, "id": "b0", "status": "completed", "description": "Old build"}
+    other = {**waiter, "id": "b2", "description": "Watch the TestFlight upload"}
+    write(prompt, {"hook_event_name": "Stop", "background_tasks": [done, waiter, other]})
+    daemon._prompt_tracker._offsets.clear()
+    daemon._prompt_tracker.poll()
+    assert daemon._apply_summary(held).display_name == (
+        "aura: Trace image delay; 2 background tasks: Watch the TestFlight upload"
+    )
+
+    # A long-running tool inside a turn is not held open: its title is untouched.
+    busy = type(held)(**{**held.__dict__, "event_name": "PreToolUse"})
+    assert daemon._apply_summary(busy).display_name == "aura: Trace image delay; fix deployed"
+
+    # Without a recorded task list the state still says why the row is busy.
+    write(prompt)
+    daemon._prompt_tracker._offsets.clear()
+    daemon._prompt_tracker._background.clear()
+    daemon._prompt_tracker.poll()
+    assert daemon._apply_summary(held).display_name == (
+        "aura: Trace image delay; background task running"
+    )
+
+
 def test_blocked_session_title_keeps_task_and_concrete_state(tmp_path, monkeypatch):
     from sidepulse.live_activity import LiveActivityConfig, LiveActivityDaemon, TokenStore
 

@@ -1464,6 +1464,7 @@ class PromptTracker:
     def __init__(self) -> None:
         self._prompts: dict[str, str] = {}
         self._actions: dict[str, list[str]] = {}
+        self._background: dict[str, list[str]] = {}
         self._projects: dict[str, str] = {}
         self._offsets: dict[str, int] = {}
         self._transcript_offsets: dict[str, int] = {}
@@ -1508,6 +1509,10 @@ class PromptTracker:
 
     def actions_for(self, session_id: str) -> list[str]:
         return self._actions.get(session_id, [])
+
+    def background_tasks_for(self, session_id: str) -> list[str]:
+        """Descriptions of the tasks the session's last Stop left running."""
+        return self._background.get(session_id, [])
 
     def project_for(self, session_id: str, cwd: str | None = None) -> str | None:
         return _project_name_from_cwd(cwd) or self._projects.get(session_id)
@@ -1656,6 +1661,13 @@ class PromptTracker:
                         actions = self._actions.setdefault(session_id, [])
                         actions.append(description.strip().splitlines()[0][:80])
                         del actions[:-4]
+                elif hook == "Stop":
+                    tasks = event.get("background_tasks")
+                    self._background[session_id] = [
+                        " ".join(str(task.get("description") or "").split())
+                        for task in (tasks if isinstance(tasks, list) else [])
+                        if isinstance(task, dict) and task.get("status") == "running"
+                    ]
 
 
 
@@ -2209,13 +2221,15 @@ class LiveActivityDaemon:
         if status.provider not in {"claude", "codex"} or not status.session_id:
             return status
         prompt = self._prompt_tracker.prompt_for(status.session_id)
-        settled = (
-            status.mode.value in {"completed", "waiting_for_input", "blocked_error"}
-            or (
-                status.event_name in {"Stop", "SubagentStop", "SessionEnd"}
-                and status.mode.value == "long_task_progress"
-            )
+        held_open = (
+            status.event_name in {"Stop", "SubagentStop", "SessionEnd"}
+            and status.mode.value == "long_task_progress"
         )
+        settled = held_open or status.mode.value in {
+            "completed",
+            "waiting_for_input",
+            "blocked_error",
+        }
         trusted_context = self._prompt_tracker.trusted_context_for(
             status.session_id, status.cwd
         )
@@ -2284,6 +2298,11 @@ class LiveActivityDaemon:
                 self._session_topics[status.session_id] = topic
             else:
                 self._session_topics.pop(status.session_id, None)
+        if held_open:
+            # The turn is over but the row stays busy. An outcome here reads
+            # as finished ("fix deployed") and hides why; name what is open.
+            task = summary.rsplit("; ", 1)[0]
+            summary = f"{task}; {self._background_state(status.session_id)}"
         summary = self._summary_title(status.session_id, summary, status.cwd)
         if not is_readable_session_title(summary):
             summary = self._summary_title(
@@ -2296,6 +2315,16 @@ class LiveActivityDaemon:
             summary = f"{emoji} {summary}"
         self._publish_summary(status, summary)
         return dataclass_replace(status, display_name=summary)
+
+    def _background_state(self, session_id: str) -> str:
+        tasks = self._prompt_tracker.background_tasks_for(session_id)
+        described = [task for task in tasks if task]
+        if not described:
+            return "background task running"
+        label = (
+            "background task" if len(tasks) == 1 else f"{len(tasks)} background tasks"
+        )
+        return f"{label}: {_truncate(described[-1], 32)}"
 
     def _emoji_for(self, session_id: str, request: str) -> str | None:
         """The session's emoji: chosen once from its request, then kept."""
