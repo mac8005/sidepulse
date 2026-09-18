@@ -204,6 +204,7 @@ from .settings import (
     save_settings,
 )
 from .status_bar_launch import install_launch_agent, launch_agent_installed
+from .title_integrity import TOPIC_LABELS, split_session_emoji
 
 
 @dataclass(frozen=True)
@@ -5080,6 +5081,8 @@ def native_session_menu_title(
     title, project = session_title_parts(status)
     if disambiguate and status.session_id:
         title = f"{title} ({status.session_id[:8]})"
+    if emoji := session_emoji(status):
+        title = f"{emoji} {title}"
     parts = [title]
     if project:
         parts.append(project)
@@ -5510,6 +5513,8 @@ def menu_status_sort_key(status: AgentStatus) -> tuple[int, int, float]:
 def menu_title_for_status(status: AgentStatus, now: datetime) -> str:
     state = state_for_mode(status.mode)
     title, project = session_title_parts(status)
+    if emoji := session_emoji(status):
+        title = f"{emoji} {title}"
     origin = menu_origin_label(status)
     if origin:
         first_line = f"{state.label}  {origin}  {title}"
@@ -5543,9 +5548,16 @@ def primary_session_open_action(status: AgentStatus | object) -> str | None:
     return default_session_open_action(status)
 
 
+def session_emoji(status: AgentStatus) -> str | None:
+    return split_session_emoji(status.display_name.strip())[0]
+
+
 def session_title_parts(status: AgentStatus) -> tuple[str, str | None]:
+    """Title and project without the session emoji, so the title still
+    matches terminal windows; menus put the emoji back in front."""
     project = project_name_from_cwd(status.cwd)
     title = strip_session_short_id(status.display_name, status.session_id)
+    title = split_session_emoji(title)[1]
     if project and title.startswith(f"{project}: "):
         title = title[len(project) + 2 :]
     elif ": " in title:
@@ -5554,6 +5566,8 @@ def session_title_parts(status: AgentStatus) -> tuple[str, str | None]:
             not project
             or is_generic_session_project(project)
             or session_project_labels_match(project, maybe_project)
+            # An errand's topic beats the repository it merely ran from.
+            or maybe_project in TOPIC_LABELS
         ):
             project = maybe_project
         title = maybe_title

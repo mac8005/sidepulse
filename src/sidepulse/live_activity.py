@@ -47,9 +47,12 @@ from .models import MODE_PRIORITY, AgentMode, AgentStatus, provider_label
 from .providers import default_state_dir
 from .usage_monitor import UsageMonitor, consume_codex_reset
 from .title_integrity import (
+    TOPIC_LABELS,
+    first_emoji,
     humanize_title_text,
     is_readable_session_title,
     normalize_user_request,
+    split_session_emoji,
 )
 
 MAX_AGENT_ROWS = 6
@@ -1158,20 +1161,15 @@ SUMMARY_PROMPT_VERSION = 5
 CEREBRAS_CHAT_URL = "https://api.cerebras.ai/v1/chat/completions"
 # Beside the APNs key, outside the repository; CEREBRAS_API_KEY wins.
 CEREBRAS_KEY_PATH = Path.home() / ".local" / "share" / "sidepulse" / "cerebras_key"
-# A session that only `cd`s into a repository for an errand (reading mail
-# credentials to chase a shoe order) is not about that repository. The title
-# model may then swap the repository label for one of these words. The list
-# is closed on purpose: the model must never name a project itself.
-SUMMARY_TOPIC_LABELS = (
-    "Shopping",
-    "Email",
-    "Research",
-    "Home",
-    "Finance",
-    "Travel",
-    "School",
-    "Health",
-    "System",
+# A session keeps one emoji for life so it can be recognised at a glance; it
+# only has to differ from the sessions a person may still have in mind.
+SESSION_EMOJI_DISTINCT = 40
+SESSION_EMOJI_KEPT = 400
+# Stand-ins for a model that repeats an emoji another session already has.
+SESSION_EMOJI_POOL = (
+    "🦊", "🐙", "🦉", "🐝", "🦋", "🐢", "🐳", "🦜", "🌵", "🍋",
+    "🍒", "🥝", "🥨", "🧩", "🎈", "🪁", "🎺", "🥁", "⛵", "🚂",
+    "🛵", "🌋", "🗿", "🧭", "🔭", "🪐", "🌈", "🍄", "🪴", "🧊",
 )
 SUMMARY_FAILURE_BACKOFF_BASE_SECONDS = 60.0
 SUMMARY_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60.0
@@ -1226,12 +1224,13 @@ def _ios_content_row(row: dict[str, Any]) -> dict[str, Any]:
     name = mobile_row.get("name")
     if not isinstance(name, str):
         return mobile_row
-    project, separator, task = name.partition(": ")
+    emoji, title = split_session_emoji(name)
+    project, separator, task = title.partition(": ")
     compact_project = IOS_COMPACT_PROJECT_LABELS.get(
         _normalized_project_name(project)
     )
     if separator and compact_project:
-        mobile_row["name"] = f"{compact_project}: {task}"
+        mobile_row["name"] = f"{emoji} " * bool(emoji) + f"{compact_project}: {task}"
     return mobile_row
 
 
@@ -1427,7 +1426,7 @@ def _topic_label(label: str) -> str | None:
     """The canonical topic for a model-written label, None for anything else."""
     folded = label.strip().casefold()
     return next(
-        (topic for topic in SUMMARY_TOPIC_LABELS if topic.casefold() == folded),
+        (topic for topic in TOPIC_LABELS if topic.casefold() == folded),
         None,
     )
 
@@ -1775,38 +1774,7 @@ class SessionSummarizer:
                 self._retry_after = now + delay
         return delay
 
-    def _generate(self, message: str, context: str, style: str = "outcome") -> str | None:
-        if style == "task":
-            instruction = (
-                "Write a compact session title body with two clauses. The first "
-                "clause must preserve the overall task from Current request. The "
-                "second must state the latest meaningful phase from Latest "
-                "progress and Session state. Never replace the task with a "
-                "low-level command. "
-            )
-        else:
-            instruction = (
-                "Write a compact session title body with two clauses. The first "
-                "clause must identify the task from Current request. The second "
-                "must state the latest outcome, blocker, or requested input from "
-                "Latest result or blocker and Session state. "
-            )
-        prompt = (
-            instruction
-            + "Use the exact format `Label: Task; latest state`, sentence case, "
-            "at most twelve words after the label. Read through typos. Never "
-            "invent work. Never write a project, product or repository name "
-            "anywhere; the caller adds a trusted label separately. The label is "
-            "the single word `repo` whenever the request concerns the observed "
-            "repository in any way: its code, app, data, users, deployment, "
-            "marketing or operations. Only when the request has nothing to do "
-            "with that repository, or no repository was observed (a personal "
-            "errand that merely runs from some folder), the label is the one "
-            "best fitting word of: " + ", ".join(SUMMARY_TOPIC_LABELS) + ". No "
-            "quotes or final period. Return only the labelled title.\n\n"
-            f"Trusted session context: {context[:800] or 'no repository observed'}\n\n"
-            f"Content:\n{message[:3000]}"
-        )
+    def _complete(self, prompt: str) -> str | None:
         key = _cerebras_key()
         if not key:
             _log("summary generation failed: no Cerebras key")
@@ -1840,7 +1808,64 @@ class SessionSummarizer:
         except (OSError, ValueError, LookupError, AttributeError) as exc:
             _log(f"summary generation failed: {exc}")
             return None
-        line = content.strip().splitlines() if isinstance(content, str) else []
+        return content if isinstance(content, str) else None
+
+    def _generate(self, message: str, context: str, style: str = "outcome") -> str | None:
+        if style == "emoji":
+            # `context` carries the emoji other sessions already have.
+            content = self._complete(
+                "Pick the one emoji a person would instantly associate with "
+                "this work session, so they can find it again in a list of "
+                "sessions. Prefer a concrete object, animal or place tied to "
+                "the subject of the request over generic computer, tool or "
+                "robot symbols. Never use a symbol that reads as a status: "
+                "⚡ ✅ ☑️ ✔️ ❌ ⚠️ ❓ ❗ ⏳ 🔴 🟢 🟡. "
+                + (
+                    f"These belong to other sessions, do not use them: {context}. "
+                    if context
+                    else ""
+                )
+                + f"Return only the emoji.\n\nRequest:\n{message[:600]}"
+            )
+            emoji = first_emoji(content or "")
+            if content is not None and emoji is None:
+                _log("emoji rejected: not a single pictograph")
+            return emoji
+        if style == "task":
+            instruction = (
+                "Write a compact session title body with two clauses. The first "
+                "clause must preserve the overall task from Current request. The "
+                "second must state the latest meaningful phase from Latest "
+                "progress and Session state. Never replace the task with a "
+                "low-level command. "
+            )
+        else:
+            instruction = (
+                "Write a compact session title body with two clauses. The first "
+                "clause must identify the task from Current request. The second "
+                "must state the latest outcome, blocker, or requested input from "
+                "Latest result or blocker and Session state. "
+            )
+        prompt = (
+            instruction
+            + "Use the exact format `Label: Task; latest state`, sentence case, "
+            "at most twelve words after the label. Read through typos. Never "
+            "invent work. Never write a project, product or repository name "
+            "anywhere; the caller adds a trusted label separately. The label is "
+            "the single word `repo` whenever the request concerns the observed "
+            "repository in any way: its code, app, data, users, deployment, "
+            "marketing or operations. Only when the request has nothing to do "
+            "with that repository, or no repository was observed (a personal "
+            "errand that merely runs from some folder), the label is the one "
+            "best fitting word of: " + ", ".join(TOPIC_LABELS) + ". No "
+            "quotes or final period. Return only the labelled title.\n\n"
+            f"Trusted session context: {context[:800] or 'no repository observed'}\n\n"
+            f"Content:\n{message[:3000]}"
+        )
+        content = self._complete(prompt)
+        if content is None:
+            return None
+        line = content.strip().splitlines()
         # Models sometimes add a trailing period or stray spaces; row text
         # must be clean — it renders as a one-line title.
         text = line[0].strip().strip("\"'").rstrip(".").strip() if line else ""
@@ -1952,6 +1977,9 @@ class LiveActivityDaemon:
         self._settled_statuses: dict[str, AgentStatus] = {}
         self._published_summaries: dict[str, str] = {}
         self._session_topics: dict[str, str] = {}
+        self._session_emoji_path = default_state_dir() / "session_emoji.json"
+        self._session_emoji: dict[str, str] = {}
+        self._load_session_emoji()
         self.usage = UsageMonitor(
             on_alert=self._push_usage_alert,
             alert_state_path=default_state_dir() / "usage_alerts.json",
@@ -2263,8 +2291,51 @@ class LiveActivityDaemon:
                 self._fallback_summary(None, status),
                 status.cwd,
             )
+        emoji = self._emoji_for(status.session_id, prompt or status.display_name)
+        if emoji:
+            summary = f"{emoji} {summary}"
         self._publish_summary(status, summary)
         return dataclass_replace(status, display_name=summary)
+
+    def _emoji_for(self, session_id: str, request: str) -> str | None:
+        """The session's emoji: chosen once from its request, then kept."""
+        emoji = self._session_emoji.get(session_id)
+        if emoji:
+            return emoji
+        taken = list(self._session_emoji.values())[-SESSION_EMOJI_DISTINCT:]
+        answer = self.summarizer.summary_for(
+            session_id, request, " ".join(taken), style="emoji"
+        )
+        if not answer or first_emoji(answer) != answer:
+            return None  # still being chosen
+        if answer in taken:
+            start = int(hashlib.sha256(session_id.encode()).hexdigest(), 16)
+            pool = [
+                SESSION_EMOJI_POOL[(start + step) % len(SESSION_EMOJI_POOL)]
+                for step in range(len(SESSION_EMOJI_POOL))
+            ]
+            answer = next((emoji for emoji in pool if emoji not in taken), answer)
+        self._session_emoji[session_id] = answer
+        for stale in list(self._session_emoji)[:-SESSION_EMOJI_KEPT]:
+            del self._session_emoji[stale]
+        try:
+            self._session_emoji_path.write_text(json.dumps(self._session_emoji))
+        except OSError:
+            pass
+        _log(f"emoji {answer} -> {session_id[:8]}")
+        return answer
+
+    def _load_session_emoji(self) -> None:
+        try:
+            raw = json.loads(self._session_emoji_path.read_text())
+        except (OSError, ValueError):
+            return
+        if isinstance(raw, dict):
+            self._session_emoji = {
+                str(session): emoji
+                for session, emoji in raw.items()
+                if isinstance(emoji, str) and first_emoji(emoji) == emoji
+            }
 
     @staticmethod
     def _fallback_summary(prompt: str | None, status: AgentStatus) -> str:
@@ -2278,7 +2349,7 @@ class LiveActivityDaemon:
             if ends:
                 text = text[:min(ends)]
         else:
-            text = status.display_name.split(";", 1)[0].strip()
+            text = split_session_emoji(status.display_name)[1].split(";", 1)[0].strip()
             if ": " in text:
                 text = text.split(": ", 1)[1]
             text = humanize_title_text(text) or ""

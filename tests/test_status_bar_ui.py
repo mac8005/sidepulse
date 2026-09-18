@@ -552,6 +552,27 @@ class PureUiLogicTests(unittest.TestCase):
             "Working  Improving session titles\nSidePulse",
         )
 
+    def test_session_emoji_leads_the_row_and_a_topic_beats_the_cwd_repository(self):
+        status = make_status(
+            provider="claude",
+            display_name="👟 Shopping: Write to support; completed",
+            cwd="/Users/massimo/Git/aura-server",
+        )
+
+        self.assertEqual(
+            sb.menu_title_for_status(status, datetime.now(timezone.utc)),
+            "Working  👟 Write to support; completed\nShopping",
+        )
+        self.assertEqual(
+            sb.native_session_menu_title(status),
+            "👟 Write to support; completed  Shopping",
+        )
+        # Terminal windows are matched by the plain title.
+        self.assertEqual(
+            sb.terminal_session_hints(status).match_title,
+            "Write to support; completed",
+        )
+
     def test_summary_project_beats_generic_workspace_cwd(self):
         status = make_status(
             provider="codex",

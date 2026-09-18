@@ -1,6 +1,50 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+
+
+# A session that only `cd`s into a repository for an errand (reading mail
+# credentials to chase a shoe order) is not about that repository. The title
+# model may then swap the repository label for one of these words. The list
+# is closed on purpose: the model must never name a project itself.
+TOPIC_LABELS = (
+    "Shopping",
+    "Email",
+    "Research",
+    "Home",
+    "Finance",
+    "Travel",
+    "School",
+    "Health",
+    "System",
+)
+
+
+def first_emoji(text: str) -> str | None:
+    """The leading emoji of a model answer: one pictograph with its modifiers."""
+    cluster = ""
+    joined = False
+    for character in text.strip():
+        category = unicodedata.category(character)
+        if "\U0001F1E6" <= character <= "\U0001F1FF":
+            return None  # half a flag renders as a boxed letter
+        if category == "So" and (not cluster or joined):
+            cluster += character
+        elif cluster and category in {"Sk", "Mn", "Cf"}:
+            cluster += character
+        else:
+            break
+        joined = character == "‍"
+    return cluster.rstrip("‍") or None
+
+
+def split_session_emoji(title: str) -> tuple[str | None, str]:
+    """Separate the session emoji a title starts with from the title proper."""
+    head, separator, rest = title.partition(" ")
+    if separator and first_emoji(head) == head:
+        return head, rest
+    return None, title
 
 
 _REQUEST_SECTION_PATTERN = re.compile(

@@ -3778,7 +3778,7 @@ def test_topic_label_replaces_a_repository_the_session_only_passed_through(
 
     class FakeSummarizer:
         def summary_for(self, session_id, message, context="", style="outcome"):
-            return answers.pop(0)
+            return None if style == "emoji" else answers.pop(0)
 
     daemon.summarizer = FakeSummarizer()
     working = make_status("claude:session:s1", AgentMode.WORKING, session_id="s1")
@@ -3797,6 +3797,112 @@ def test_topic_label_replaces_a_repository_the_session_only_passed_through(
     answers.append("Fix bridge logout; working")
     assert daemon._apply_summary(working).display_name == (
         "aura-server: Fix bridge logout; working"
+    )
+
+
+def test_first_emoji_keeps_one_pictograph_with_its_modifiers():
+    from sidepulse.title_integrity import first_emoji, split_session_emoji
+
+    assert first_emoji(" 👟\n") == "👟"
+    assert first_emoji("🎙️") == "🎙️"
+    assert first_emoji("👨‍💻 coding") == "👨‍💻"
+    assert first_emoji("👟📦") == "👟"
+    assert first_emoji("🇨🇭") is None
+    assert first_emoji("Shoes 👟") is None
+    assert first_emoji("1️⃣") is None
+
+    assert split_session_emoji("👟 Shopping: Task; done") == ("👟", "Shopping: Task; done")
+    assert split_session_emoji("Shopping: Task; done") == (None, "Shopping: Task; done")
+    assert split_session_emoji("→ not an emoji") == (None, "→ not an emoji")
+
+
+def test_summarizer_returns_a_single_emoji_and_names_the_taken_ones(monkeypatch):
+    seen = {}
+    summarizer = _cerebras_summarizer(monkeypatch, "\n\n👟📦\n", seen)
+
+    assert summarizer._generate("Where is my shoe order?", "🚦 🧸", style="emoji") == "👟"
+    prompt = seen["body"]["messages"][0]["content"]
+    assert "do not use them: 🚦 🧸" in prompt
+    assert "Where is my shoe order?" in prompt
+
+    summarizer = _cerebras_summarizer(monkeypatch, "shoe")
+    assert summarizer._generate("Where is my shoe order?", "", style="emoji") is None
+
+
+def test_session_emoji_is_chosen_once_kept_and_distinct(tmp_path, monkeypatch):
+    from sidepulse.live_activity import (
+        SESSION_EMOJI_POOL,
+        LiveActivityConfig,
+        LiveActivityDaemon,
+        TokenStore,
+    )
+
+    monkeypatch.setattr("sidepulse.live_activity.default_state_dir", lambda: tmp_path)
+    config = LiveActivityConfig(
+        apns_key_path=tmp_path / "k.p8", apns_key_id="X", apns_team_id="Y"
+    )
+
+    emoji_answers = {"s1": None, "s2": "👟"}
+    asked = []
+
+    class FakeSummarizer:
+        def summary_for(self, session_id, message, context="", style="outcome"):
+            if style == "emoji":
+                asked.append((session_id, message, context))
+                return emoji_answers[session_id]
+            return "Check unshipped order; searching mailbox"
+
+    def working(session_id):
+        status = make_status(
+            f"claude:session:{session_id}", AgentMode.WORKING,
+            name="Where is my shoe order", session_id=session_id,
+        )
+        return type(status)(**{**status.__dict__, "cwd": "/Users/x/Git"})
+
+    daemon = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    daemon.summarizer = FakeSummarizer()
+
+    # Still being chosen: the title simply has no emoji yet.
+    assert daemon._apply_summary(working("s1")).display_name == (
+        "Where is my shoe order; working"
+    )
+    emoji_answers["s1"] = "👟"
+    assert daemon._apply_summary(working("s1")).display_name == (
+        "👟 Where is my shoe order; working"
+    )
+    # Kept for good: a different answer later changes nothing, nor is one asked for.
+    emoji_answers["s1"] = "📦"
+    asked.clear()
+    assert daemon._apply_summary(working("s1")).display_name.startswith("👟 ")
+    assert asked == []
+
+    # Another session is told what is taken, and a repeat gets a stand-in.
+    second = daemon._apply_summary(working("s2")).display_name
+    assert asked[-1][2] == "👟"
+    assert second.split(" ", 1)[0] in SESSION_EMOJI_POOL
+
+    # A restarted daemon still knows both.
+    restarted = LiveActivityDaemon(config, token_store=TokenStore(tmp_path / "tok.json"))
+    restarted.summarizer = FakeSummarizer()
+    asked.clear()
+    assert restarted._apply_summary(working("s1")).display_name.startswith("👟 ")
+    assert restarted._apply_summary(working("s2")).display_name == second
+    assert asked == []
+
+    # A title published with its emoji never doubles it in the fallback.
+    titled = working("s1")
+    titled = type(titled)(**{**titled.__dict__, "display_name": "👟 Where is my shoe order; working"})
+    assert daemon._fallback_summary(None, titled) == "Where is my shoe order; working"
+
+
+def test_ios_project_compaction_looks_past_the_session_emoji():
+    from sidepulse.live_activity import _ios_content_row
+
+    assert _ios_content_row({"name": "📈 CSPennyScalpingTrader: Arm shadow; working"})["name"] == (
+        "📈 Trading: Arm shadow; working"
+    )
+    assert _ios_content_row({"name": "CSPennyScalpingTrader: Arm shadow; working"})["name"] == (
+        "Trading: Arm shadow; working"
     )
 
 
