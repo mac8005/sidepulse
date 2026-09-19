@@ -70,12 +70,14 @@ struct AgentsLiveView: View {
 
     private var isWide: Bool { horizontalSizeClass == .regular }
 
-    /// A narrow container that is also short — the iPhone Duo's outer display
-    /// is 200 pt shorter than an iPhone's — is a glance surface: one summary
+    /// A narrow container that is also short is a glance surface: one summary
     /// line instead of a card, one line per title, tighter rows, so the
-    /// sessions that matter are all on screen at once.
+    /// sessions that matter are all on screen at once. The iPhone Duo's outer
+    /// display is 200 pt shorter than an iPhone 17 Pro and lands here; so do
+    /// the small phones and any phone held sideways, which want it just as
+    /// much. A full-height phone keeps the roomier list.
     private var isGlance: Bool {
-        horizontalSizeClass == .compact && containerHeight > 0 && containerHeight < 760
+        horizontalSizeClass == .compact && containerHeight > 0 && containerHeight < 720
     }
 
     @ViewBuilder
