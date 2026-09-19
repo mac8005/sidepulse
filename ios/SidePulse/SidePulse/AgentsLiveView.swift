@@ -551,21 +551,68 @@ struct AgentsDashboard: View {
     @ObservedObject var model: AppModel
     @ObservedObject var usage: UsageClient
     let openDot: () -> Void
+    @ObservedObject private var mirror = DotStatusMirror.shared
 
     var body: some View {
         List {
             UsageSection(usage: usage)
 
             Section {
+                HStack(spacing: 14) {
+                    DotPreview(model: model)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(mirror.statusText)
+                            .font(.subheadline)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(model.selectedFolderPath)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 2)
+                .accessibilityElement(children: .combine)
+
+                // The two controls people actually reach for; everything else
+                // is a push away.
+                Toggle("Do Not Disturb", isOn: $model.dndEnabled)
+                LabeledContent("Brightness", value: brightnessLabel)
+                Slider(value: brightnessPercentage, in: 0...100, step: 1) {
+                    Text("SidePulse Dot brightness")
+                } minimumValueLabel: {
+                    Image(systemName: "sun.min").accessibilityHidden(true)
+                } maximumValueLabel: {
+                    Image(systemName: "sun.max").accessibilityHidden(true)
+                }
+                .accessibilityLabel("SidePulse Dot brightness")
+                .accessibilityValue(brightnessLabel)
+
                 Button {
                     openDot()
                 } label: {
-                    DotStatusRow(model: model)
+                    Label("All Dot settings", systemImage: "chevron.right")
+                        .labelStyle(.titleOnly)
                 }
-                .buttonStyle(.plain)
             } header: {
                 Text("SidePulse Dot")
             }
+        }
+    }
+
+    private var brightnessLabel: String {
+        guard model.dotBrightness > 0 else { return "Off" }
+        return "\(Int((Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100).rounded()))%"
+    }
+
+    private var brightnessPercentage: Binding<Double> {
+        Binding {
+            (Double(model.dotBrightness) / Double(DotBrightness.maximum) * 100).rounded()
+        } set: { percentage in
+            model.dotBrightness = DotBrightness.clamped(
+                Int((min(100, max(0, percentage.rounded())) / 100 * Double(DotBrightness.maximum)).rounded())
+            )
         }
     }
 }
