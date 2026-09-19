@@ -37,12 +37,17 @@ struct AgentsLiveView: View {
     @State private var locallySeen: [String: Double] = [:]
     @State private var dotSettingsExpanded = false
     @State private var ownSelection: String?
+    @State private var fold = DuoFold()
+    @State private var hingeOpenness: Double = 1
 
     var body: some View {
         content
             .navigationTitle("Mac Agents")
             .toolbar { toolbar }
             .duoCompactTitle()
+            .duoPrefersToolbarItems()
+            .duoFold($fold)
+            .duoHingeOpenness($hingeOpenness)
             .task {
                 // Normally already running from the scene going active; harmless
                 // to repeat.
@@ -69,7 +74,28 @@ struct AgentsLiveView: View {
         case .listOnly:
             sessionsPane
         case .adaptive:
-            if isWide {
+            if fold.isTabletop {
+                // Standing on a desk: a board that reads from a distance above
+                // the crease, everything you touch below it.
+                DuoSplit {
+                    AgentsStatusBoard(
+                        snapshot: stream.snapshot,
+                        hostLabel: hostLabel,
+                        isUnread: isUnread,
+                        selectedID: selection.wrappedValue,
+                        select: activateOnBoard,
+                        openness: hingeOpenness
+                    )
+                } secondary: {
+                    AgentsDeskControls(
+                        model: model,
+                        usage: usage,
+                        selected: selectedAgent,
+                        links: sessionLinks.links,
+                        clearSelection: { selection.wrappedValue = nil }
+                    )
+                }
+            } else if isWide {
                 DuoSplit {
                     sessionsPane
                 } secondary: {
@@ -79,6 +105,10 @@ struct AgentsLiveView: View {
                 narrowList
             }
         }
+    }
+
+    private var hostLabel: String {
+        URL(string: model.liveMonitorServerURL)?.host ?? "the Mac"
     }
 
     /// Everything in one scroll, the way the phone has always shown it.
@@ -164,13 +194,23 @@ struct AgentsLiveView: View {
 
     // MARK: - Toolbar
 
-    /// Both items carry a title and an icon: the icon is what lets the system
-    /// move them into the vertical bar strip it uses on the iPhone Duo, and
-    /// the title is what labels them in the overflow menu.
+    /// Every item carries a title and an icon: the icon is what lets the
+    /// system move it into the vertical bar strip it uses on the iPhone Duo,
+    /// and the title is what labels it in the overflow menu. The attention
+    /// item wears a badge rather than spelling its count out, so it stays
+    /// legible at the width of that strip.
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        if !sessionLinks.links.isEmpty {
-            ToolbarItem(placement: .topBarTrailing) {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button {
+                selectFirstNeedingAttention()
+            } label: {
+                Label("Needs you", systemImage: "bell.badge")
+            }
+            .badge(attentionCount)
+            .disabled(attentionCount == 0)
+
+            if !sessionLinks.links.isEmpty {
                 // Hands off to the provider's own app; the daemon says where.
                 Menu {
                     ForEach(sessionLinks.links) { link in
@@ -181,6 +221,9 @@ struct AgentsLiveView: View {
                 }
             }
         }
+        // Status first: these two are the last to fall into the overflow when
+        // a Live Activity takes its share of the strip.
+        .visibilityPriority(.high)
 
         if layout == .adaptive {
             ToolbarItem(placement: .topBarTrailing) {
@@ -188,7 +231,38 @@ struct AgentsLiveView: View {
                     Label("Settings", systemImage: "gearshape")
                 }
             }
+            .visibilityPriority(.low)
         }
+
+        // The one rarely used action goes straight into the system overflow;
+        // the ellipsis belongs to it and to nothing else.
+        ToolbarOverflowMenu {
+            Button("Refresh usage", systemImage: "arrow.clockwise") {
+                Task { await usage.fetch(baseURL: model.liveMonitorServerURL) }
+            }
+        }
+    }
+
+    /// Sessions that have stopped and are waiting for a person.
+    private var attentionCount: Int {
+        guard let snapshot = stream.snapshot else { return 0 }
+        return snapshot.agents.filter {
+            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
+        }.count
+    }
+
+    private func selectFirstNeedingAttention() {
+        guard let agent = stream.snapshot?.agents.first(where: {
+            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
+        }) else { return }
+        activate(agent)
+    }
+
+    /// On the board a tap always selects: the controls half is what opens the
+    /// session, so nothing sends the phone to another app behind your back.
+    private func activateOnBoard(_ agent: AgentSnapshot.Agent) {
+        markSeen(agent)
+        selection.wrappedValue = agent.id
     }
 
     // MARK: - Selection
@@ -555,12 +629,8 @@ private struct AgentLiveRow: View {
     /// Unread finished sessions pulse until opened.
     @ViewBuilder
     private var glyph: some View {
-        let image = Image(systemName: AgentModeStyle.symbol(agent.mode))
-        if #available(iOS 17.0, *), isUnread {
-            image.symbolEffect(.pulse)
-        } else {
-            image
-        }
+        Image(systemName: AgentModeStyle.symbol(agent.mode))
+            .symbolEffect(.pulse, isActive: isUnread)
     }
 
     private var secondaryLine: String {

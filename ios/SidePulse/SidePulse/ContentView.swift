@@ -112,27 +112,59 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
     private var homeScreen: some View {
+        if horizontalSizeClass == .regular {
+            DuoSplit {
+                homePanels
+            } secondary: {
+                homePatterns
+            }
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    homePanelStack
+                    QuickPatternsPanel { pattern in
+                        Task { await write(pattern) }
+                    }
+                }
+                .padding(16)
+            }
+            .background(Color(.systemGroupedBackground))
+        }
+    }
+
+    private var homePanels: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                MacAgentsPanel(model: model)
+            homePanelStack
+                .padding(16)
+        }
+        .background(Color(.systemGroupedBackground))
+    }
 
-                HeaderPanel(model: model) {
-                    activeSheet = .token
-                    requestPushToken()
-                }
-
-                SidePulseDotSetupPanel(model: model) {
-                    activeSheet = .folderSetup
-                }
-
-                QuickPatternsPanel { pattern in
-                    Task { await write(pattern) }
-                }
+    private var homePatterns: some View {
+        ScrollView {
+            QuickPatternsPanel { pattern in
+                Task { await write(pattern) }
             }
             .padding(16)
         }
         .background(Color(.systemGroupedBackground))
+    }
+
+    private var homePanelStack: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            MacAgentsPanel(model: model)
+
+            HeaderPanel(model: model) {
+                activeSheet = .token
+                requestPushToken()
+            }
+
+            SidePulseDotSetupPanel(model: model) {
+                activeSheet = .folderSetup
+            }
+        }
     }
 
     /// Variant C: destinations, sessions and the selected session at once.
@@ -345,16 +377,22 @@ private struct SidePulseDotSetupPanel: View {
 
 private struct QuickPatternsPanel: View {
     let writePattern: (LEDPattern) -> Void
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var fold = DuoFold()
+    @State private var availableWidth: CGFloat = 0
 
-    /// An even number of columns so the grid divides at the fold. `.adaptive`
-    /// already lands on two at every compact width, including the iPhone Duo's
-    /// outer display; only the wide inner display needs the fixed count.
+    private static let minimumItemWidth: CGFloat = 150
+    private static let spacing: CGFloat = 10
+
+    /// As many columns as fit, but an even number on a display that folds, so
+    /// the crease runs between columns instead of through one.
     private var columns: [GridItem] {
-        guard horizontalSizeClass == .regular else {
-            return [GridItem(.adaptive(minimum: 150), spacing: 10)]
-        }
-        return Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
+        let count = duoColumnCount(
+            availableWidth: availableWidth,
+            minimumItemWidth: Self.minimumItemWidth,
+            spacing: Self.spacing,
+            fold: fold
+        )
+        return Array(repeating: GridItem(.flexible(), spacing: Self.spacing), count: count)
     }
 
     var body: some View {
@@ -373,6 +411,8 @@ private struct QuickPatternsPanel: View {
                 }
             }
         }
+        .duoFold($fold)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
     }
 }
 
@@ -438,8 +478,11 @@ private struct TokenSheet: View {
             }
             .navigationTitle("Push Token")
             .toolbar {
-                DoneToolbarItem(dismiss: dismiss)
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
+            .duoHorizontalSheetBar()
         }
     }
 }
@@ -476,8 +519,11 @@ private struct FolderSetupSheet: View {
             .padding(20)
             .navigationTitle("Set Up Folder")
             .toolbar {
-                DoneToolbarItem(dismiss: dismiss)
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
+            .duoHorizontalSheetBar()
         }
     }
 }
@@ -489,6 +535,7 @@ private struct SettingsView: View {
     @State private var diagnosticsExport: DiagnosticsExport?
     @State private var isShowingDiagnosticsError = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     var body: some View {
         settings
@@ -612,7 +659,7 @@ private struct SettingsView: View {
             Section("Raw LED Editor") {
                 TextEditor(text: $model.ledText)
                     .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 140)
+                    .frame(minHeight: verticalSizeClass == .compact ? 80 : 140)
 
                 Button {
                     Task { await writeLocalTest() }

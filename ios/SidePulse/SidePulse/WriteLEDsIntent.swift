@@ -1,7 +1,6 @@
 import AppIntents
 import Foundation
 
-@available(iOS 16.0, *)
 struct WriteLEDsIntent: AppIntent {
     static var title: LocalizedStringResource = "Write SidePulse LEDS.LED"
     static var description = IntentDescription("Writes the supplied LED program to LEDS.LED on the selected USB drive.")
@@ -25,7 +24,6 @@ struct WriteLEDsIntent: AppIntent {
     }
 }
 
-@available(iOS 16.0, *)
 struct SidePulseShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(

@@ -145,12 +145,17 @@ extension DemoData {
         ProcessInfo.processInfo.arguments.contains("-DemoActivity")
     }
 
-    @available(iOS 17.2, *)
     static func startLiveActivity() {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled,
-              Activity<AgentActivityAttributes>.activities.isEmpty,
-              let snapshot
-        else { return }
+        let authorization = ActivityAuthorizationInfo()
+        guard authorization.areActivitiesEnabled else {
+            EventLog.append("Demo Live Activity: activities disabled in Settings")
+            return
+        }
+        guard Activity<AgentActivityAttributes>.activities.isEmpty else {
+            EventLog.append("Demo Live Activity: one is already running")
+            return
+        }
+        guard let snapshot else { return }
         let rows = snapshot.agents.map {
             AgentActivityAttributes.AgentRow(
                 id: $0.id,
@@ -169,10 +174,15 @@ extension DemoData {
             agents: rows,
             updatedAt: snapshot.updatedAt
         )
-        _ = try? Activity.request(
-            attributes: AgentActivityAttributes(hostLabel: "studio"),
-            content: ActivityContent(state: state, staleDate: nil)
-        )
+        do {
+            let activity = try Activity.request(
+                attributes: AgentActivityAttributes(hostLabel: "studio"),
+                content: ActivityContent(state: state, staleDate: nil)
+            )
+            EventLog.append("Demo Live Activity started: \(activity.id.prefix(8))")
+        } catch {
+            EventLog.append("Demo Live Activity failed: \(error.localizedDescription)")
+        }
     }
 }
 #endif

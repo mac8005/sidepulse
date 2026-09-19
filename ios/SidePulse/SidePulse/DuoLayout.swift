@@ -50,39 +50,113 @@ enum DuoDestination: Hashable, CaseIterable {
     }
 }
 
-/// A sheet's "Done": an icon as well as the title, because the system only
-/// moves toolbar items with an icon into the vertical bar strip it uses on the
-/// iPhone Duo, and pinned where the SDK knows how, so it never falls into the
-/// overflow menu.
-struct DoneToolbarItem: ToolbarContent {
-    let dismiss: DismissAction
+// MARK: - The fold
 
-    var body: some ToolbarContent {
+/// What the folding region is doing right now. A phone that cannot fold
+/// reports `exists == false`, and every rule below then keeps today's layout.
+struct DuoFold: Equatable {
+    /// True on a folding display, even while it lies flat.
+    var exists = false
+    /// True only while the phone is folded far enough to divide the display.
+    var isActive = false
+    /// A crease running across the width splits the display into an upper and
+    /// a lower half — the phone standing on a desk like a little laptop.
+    var isHorizontal = false
+
+    /// The signature desk pose: upper half readable from across the room,
+    /// lower half within reach.
+    var isTabletop: Bool { isActive && isHorizontal }
+    /// Half-folded in landscape: the crease is a left/right divider.
+    var isBook: Bool { isActive && !isHorizontal }
+}
+
+extension View {
+    /// Reports the folding region without taking part in layout. Nothing
+    /// happens on a phone that does not fold.
+    @ViewBuilder
+    func duoFold(_ fold: Binding<DuoFold>) -> some View {
         if #available(iOS 27.1, *) {
-            ToolbarItem(placement: .topBarPinnedTrailing) {
-                button
-            }
+            modifier(DuoFoldReader(fold: fold))
         } else {
-            ToolbarItem(placement: .topBarTrailing) {
-                button
-            }
+            self
         }
     }
 
-    private var button: some View {
-        Button {
-            dismiss()
-        } label: {
-            Label("Done", systemImage: "checkmark")
+    /// 0 while the phone is shut, 1 once it is open, following the hinge in
+    /// between. Drive effects with it — never layout — and expect a constant 1
+    /// on every phone that has no hinge.
+    @ViewBuilder
+    func duoHingeOpenness(_ openness: Binding<Double>) -> some View {
+        if #available(iOS 27.1, *) {
+            modifier(DuoHingeOpenness(openness: openness))
+        } else {
+            self
         }
     }
 }
 
+@available(iOS 27.1, *)
+private struct DuoFoldReader: ViewModifier {
+    @Binding var fold: DuoFold
+
+    func body(content: Content) -> some View {
+        content.onGeometryChange(for: DuoFold.self) { proxy in
+            // `.includeInactive` also answers "could this display ever fold?",
+            // which is what the even column counts key off.
+            guard let region = proxy.reservedRegions(
+                kind: .division,
+                options: [.includeInactive]
+            ).first else {
+                return DuoFold()
+            }
+            return DuoFold(
+                exists: true,
+                isActive: region.isActive,
+                isHorizontal: region.frame.width >= region.frame.height
+            )
+        } action: { fold = $0 }
+    }
+}
+
+@available(iOS 27.1, *)
+private struct DuoHingeOpenness: ViewModifier {
+    @Binding var openness: Double
+
+    func body(content: Content) -> some View {
+        content.onHingeChange { _, context in
+            guard let hinge = context.hinge else {
+                openness = 1
+                return
+            }
+            withAnimation(.easeOut(duration: 0.25)) {
+                openness = min(1, max(0, hinge.angle.degrees / 180))
+            }
+        }
+    }
+}
+
+/// Column count for a grid the crease may run through: as many as fit, but an
+/// even number wherever a fold exists, so no column straddles it.
+func duoColumnCount(
+    availableWidth: CGFloat,
+    minimumItemWidth: CGFloat,
+    spacing: CGFloat,
+    fold: DuoFold
+) -> Int {
+    let fitting = Int((availableWidth + spacing) / (minimumItemWidth + spacing))
+    let count = max(1, fitting)
+    guard fold.exists, count > 1 else { return count }
+    return count - (count % 2)
+}
+
+// MARK: - Arrangement
+
 /// Two panes that follow the hardware: side by side when the container is
 /// wide, stacked when it is tall, and divided along the crease once the phone
-/// is half-folded. Before iOS 27.1 there are no folds, so the panes simply sit
-/// next to each other on the displays wide enough for both.
+/// is half-folded. iOS 27.0 has no arrangements, so there the panes simply sit
+/// next to each other when the width allows and stack when it does not.
 struct DuoSplit<Primary: View, Secondary: View>: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ViewBuilder var primary: Primary
     @ViewBuilder var secondary: Secondary
 
@@ -94,8 +168,14 @@ struct DuoSplit<Primary: View, Secondary: View>: View {
                 secondary
             }
             .arrangementViewStyle(.split)
-        } else {
+        } else if horizontalSizeClass == .regular {
             HStack(spacing: 0) {
+                primary
+                Divider()
+                secondary
+            }
+        } else {
+            VStack(spacing: 0) {
                 primary
                 Divider()
                 secondary
@@ -104,15 +184,39 @@ struct DuoSplit<Primary: View, Secondary: View>: View {
     }
 }
 
+// MARK: - Bars
+
 extension View {
     /// An inline navigation title wherever the system has moved the bars into
     /// the vertical strip at the side. A large title costs a fifth of the
-    /// iPhone Duo's short outer display, and the strip already names the screen
-    /// on its own.
+    /// iPhone Duo's short outer display, and the strip already names the
+    /// screen on its own.
     @ViewBuilder
     func duoCompactTitle() -> some View {
         if #available(iOS 27.1, *) {
             modifier(DuoCompactTitle())
+        } else {
+            self
+        }
+    }
+
+    /// A screen people watch rather than navigate: its own controls matter
+    /// more than the tab bar when the vertical strip runs short.
+    @ViewBuilder
+    func duoPrefersToolbarItems() -> some View {
+        if #available(iOS 27.1, *) {
+            toolbarVerticalCompressionBehavior(.prefersToolbarItems)
+        } else {
+            self
+        }
+    }
+
+    /// A sheet with a single button has nothing to fill a vertical bar with;
+    /// keep its button where sheets have always kept it.
+    @ViewBuilder
+    func duoHorizontalSheetBar() -> some View {
+        if #available(iOS 27.1, *) {
+            toolbarVerticalBehavior(.disabled)
         } else {
             self
         }

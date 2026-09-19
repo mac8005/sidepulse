@@ -112,10 +112,7 @@ final class LiveMonitorManager: ObservableObject {
     private var lastSubmittedDotAvailability: DotAvailabilityReportSignature?
     private var dotAvailabilityReporterRunning = false
 
-    var isSupported: Bool {
-        if #available(iOS 17.2, *) { return true }
-        return false
-    }
+    var isSupported: Bool { true }
 
     func startIfEnabled(model: AppModel) {
         guard model.liveMonitorEnabled else { return }
@@ -123,10 +120,6 @@ final class LiveMonitorManager: ObservableObject {
     }
 
     func start(model: AppModel) {
-        guard #available(iOS 17.2, *) else {
-            statusMessage = "Requires iOS 17.2 or later"
-            return
-        }
         guard !observersStarted else { return }
         observersStarted = true
         DotStatusMirror.shared.stream.onSnapshot = { [weak self] snapshot, baseURL in
@@ -205,7 +198,6 @@ final class LiveMonitorManager: ObservableObject {
             model.refreshEventLog()
             return
         }
-        guard #available(iOS 17.2, *) else { return }
         if !observersStarted {
             start(model: model)
         }
@@ -222,8 +214,7 @@ final class LiveMonitorManager: ObservableObject {
     /// even when APNs has not supplied or delivered an update token yet.
     func updateFromStream(_ snapshot: AgentSnapshot, baseURL: String) async {
         let model = AppModel.shared
-        guard #available(iOS 17.2, *),
-              model.liveMonitorEnabled,
+        guard model.liveMonitorEnabled,
               model.liveMonitorServerURL == baseURL,
               UIApplication.shared.applicationState == .active
         else { return }
@@ -381,7 +372,6 @@ final class LiveMonitorManager: ObservableObject {
     /// objects can remain in `Activity.activities`, and an ended activity may
     /// remain visible, but terminal objects are non-updatable and must never
     /// block a replacement or have their token reused.
-    @available(iOS 17.2, *)
     private func reconcileActivities(
         model: AppModel,
         source: String,
@@ -534,7 +524,6 @@ final class LiveMonitorManager: ObservableObject {
         }
     }
 
-    @available(iOS 17.2, *)
     private func consumeTerminalActivity(
         _ activity: Activity<AgentActivityAttributes>,
         state: ActivityState,
@@ -568,7 +557,6 @@ final class LiveMonitorManager: ObservableObject {
         return !intentional
     }
 
-    @available(iOS 17.2, *)
     private func handleTerminalTransition(
         _ activity: Activity<AgentActivityAttributes>,
         state: ActivityState,
@@ -590,7 +578,6 @@ final class LiveMonitorManager: ObservableObject {
         )
     }
 
-    @available(iOS 17.2, *)
     private func startActivityLocally(model: AppModel) async {
         guard !localActivityStartInProgress else { return }
         let authorization = ActivityAuthorizationInfo()
@@ -672,7 +659,6 @@ final class LiveMonitorManager: ObservableObject {
         }
     }
 
-    @available(iOS 17.2, *)
     private func scheduleReconcile(model: AppModel, after delay: TimeInterval) {
         guard scheduledReconcileTask == nil else { return }
         scheduledReconcileTask = Task { [weak self] in
@@ -734,7 +720,6 @@ final class LiveMonitorManager: ObservableObject {
         return label
     }
 
-    @available(iOS 17.2, *)
     private func sendReset(
         model: AppModel,
         activityID: String? = nil,
@@ -978,7 +963,6 @@ final class LiveMonitorManager: ObservableObject {
         return signatures
     }
 
-    @available(iOS 17.2, *)
     private func observe(activity: Activity<AgentActivityAttributes>, model: AppModel) {
         let initialState = activity.activityState
         guard isReusable(initialState) else {
@@ -1122,12 +1106,10 @@ final class LiveMonitorManager: ObservableObject {
             payload["dotCompletionAlertsEnabled"] = dotCompletionAlertsEnabled
         }
         if let reportedAt { payload["reportedAt"] = reportedAt }
-        if #available(iOS 17.2, *) {
-            addActivityContext(
-                activityState: activityState ?? currentActivityStateName(activityID: activityID),
-                to: &payload
-            )
-        }
+        addActivityContext(
+            activityState: activityState ?? currentActivityStateName(activityID: activityID),
+            to: &payload
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1203,12 +1185,10 @@ final class LiveMonitorManager: ObservableObject {
         return try await URLSession.shared.data(for: request)
     }
 
-    @available(iOS 17.2, *)
     private func reusableActivities() -> [Activity<AgentActivityAttributes>] {
         Activity<AgentActivityAttributes>.activities.filter { isReusable($0.activityState) }
     }
 
-    @available(iOS 17.2, *)
     private func rememberUpdateToken(
         _ observation: LiveActivityTokenObservation,
         for activity: Activity<AgentActivityAttributes>
@@ -1220,7 +1200,6 @@ final class LiveMonitorManager: ObservableObject {
         return true
     }
 
-    @available(iOS 17.2, *)
     private func isCurrentUpdateToken(
         _ observation: LiveActivityTokenObservation,
         for activity: Activity<AgentActivityAttributes>
@@ -1230,20 +1209,18 @@ final class LiveMonitorManager: ObservableObject {
             && latestUpdateTokenObservations[activity.id] == observation
     }
 
-    @available(iOS 17.2, *)
     private func isReusable(_ state: ActivityState) -> Bool {
         if state == .active || state == .stale {
             return true
         }
-        if #available(iOS 26.0, *), state == .pending {
+        if state == .pending {
             return true
         }
         return false
     }
 
-    @available(iOS 17.2, *)
     private func activityStateName(_ state: ActivityState) -> String {
-        if #available(iOS 26.0, *), state == .pending { return "pending" }
+        if state == .pending { return "pending" }
         if state == .active { return "active" }
         if state == .stale { return "stale" }
         if state == .ended { return "ended" }
@@ -1265,7 +1242,6 @@ final class LiveMonitorManager: ObservableObject {
         return true
     }
 
-    @available(iOS 17.2, *)
     private func currentActivityStateName(activityID: String? = nil) -> String {
         let activities = Activity<AgentActivityAttributes>.activities
         if let activityID,
@@ -1285,7 +1261,6 @@ final class LiveMonitorManager: ObservableObject {
         return "none"
     }
 
-    @available(iOS 17.2, *)
     private func addActivityContext(
         activityState: String,
         to payload: inout [String: Any]

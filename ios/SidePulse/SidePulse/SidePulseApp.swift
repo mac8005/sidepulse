@@ -13,7 +13,7 @@ struct SidePulseApp: App {
                     if DemoData.isEnabled {
                         AppModel.shared.liveMonitorServerURL = DemoData.serverURL
                         AppModel.shared.refreshFolderStatus()
-                        if #available(iOS 17.2, *), DemoData.wantsLiveActivity {
+                        if DemoData.wantsLiveActivity {
                             DemoData.startLiveActivity()
                         }
                         return

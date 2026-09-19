@@ -59,7 +59,6 @@ private extension Color {
 
 // MARK: - Widget
 
-@available(iOSApplicationExtension 16.2, *)
 struct AgentLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: AgentActivityAttributes.self) { context in
@@ -371,7 +370,6 @@ private struct AgentRowView: View {
     }
 }
 
-@available(iOSApplicationExtension 16.2, *)
 private struct LockScreenView: View {
     let context: ActivityViewContext<AgentActivityAttributes>
     @Environment(\.activityFamily) private var activityFamily

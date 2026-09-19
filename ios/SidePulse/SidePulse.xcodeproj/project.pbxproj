@@ -29,6 +29,7 @@
         9F000001000000000000003D /* UsageSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F000001000000000000013E /* UsageSection.swift */; };
         9F0000010000000000000050 /* DemoData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000150 /* DemoData.swift */; };
         9F0000010000000000000051 /* DuoLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000151 /* DuoLayout.swift */; };
+        9F0000010000000000000052 /* AgentsStatusBoard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000152 /* AgentsStatusBoard.swift */; };
         9F0000010000000000000045 /* SessionLinks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000145 /* SessionLinks.swift */; };
         9F0000010000000000000016 /* SidePulseWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000119 /* SidePulseWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
         9F0000010000000000000024 /* WatchRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000126 /* WatchRelay.swift */; };
@@ -162,6 +163,7 @@
         9F000001000000000000013E /* UsageSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSection.swift; sourceTree = "<group>"; };
         9F0000010000000000000150 /* DemoData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoData.swift; sourceTree = "<group>"; };
         9F0000010000000000000151 /* DuoLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuoLayout.swift; sourceTree = "<group>"; };
+        9F0000010000000000000152 /* AgentsStatusBoard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsStatusBoard.swift; sourceTree = "<group>"; };
         9F0000010000000000000145 /* SessionLinks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLinks.swift; sourceTree = "<group>"; };
         9F0000010000000000000119 /* SidePulseWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SidePulseWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
         9F0000010000000000000122 /* SidePulseWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePulseWatchApp.swift; sourceTree = "<group>"; };
@@ -271,6 +273,7 @@
                 9F000001000000000000013E /* UsageSection.swift */,
                 9F0000010000000000000150 /* DemoData.swift */,
                 9F0000010000000000000151 /* DuoLayout.swift */,
+                9F0000010000000000000152 /* AgentsStatusBoard.swift */,
                 9F0000010000000000000145 /* SessionLinks.swift */,
                 9F0000010000000000000134 /* DotStatusMirror.swift */,
                 9F0000010000000000000140 /* DotNotificationShared.swift */,
@@ -590,6 +593,7 @@
                 9F000001000000000000003D /* UsageSection.swift in Sources */,
                 9F0000010000000000000050 /* DemoData.swift in Sources */,
                 9F0000010000000000000051 /* DuoLayout.swift in Sources */,
+                9F0000010000000000000052 /* AgentsStatusBoard.swift in Sources */,
                 9F0000010000000000000045 /* SessionLinks.swift in Sources */,
                 9F0000010000000000000034 /* DotStatusMirror.swift in Sources */,
                 9F000001000000000000003F /* DotNotificationShared.swift in Sources */,
@@ -734,7 +738,7 @@
                 GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
                 GCC_WARN_UNUSED_FUNCTION = YES;
                 GCC_WARN_UNUSED_VARIABLE = YES;
-                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
                 SIDEPULSE_APP_BUNDLE_ID = io.sidepulse.app;
                 MTL_FAST_MATH = YES;
@@ -790,7 +794,7 @@
                 GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
                 GCC_WARN_UNUSED_FUNCTION = YES;
                 GCC_WARN_UNUSED_VARIABLE = YES;
-                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 MTL_ENABLE_DEBUG_INFO = NO;
                 SIDEPULSE_APP_BUNDLE_ID = io.sidepulse.app;
                 MTL_FAST_MATH = YES;
@@ -875,7 +879,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = SidePulseWidgets/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",
@@ -901,7 +905,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = SidePulseWidgets/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",
@@ -947,7 +951,7 @@
                 SWIFT_EMIT_LOC_STRINGS = YES;
                 SWIFT_VERSION = 5.0;
                 TARGETED_DEVICE_FAMILY = 4;
-                WATCHOS_DEPLOYMENT_TARGET = 10.0;
+                WATCHOS_DEPLOYMENT_TARGET = 26.0;
             };
             name = Debug;
         };
@@ -980,7 +984,7 @@
                 SWIFT_EMIT_LOC_STRINGS = YES;
                 SWIFT_VERSION = 5.0;
                 TARGETED_DEVICE_FAMILY = 4;
-                WATCHOS_DEPLOYMENT_TARGET = 10.0;
+                WATCHOS_DEPLOYMENT_TARGET = 26.0;
             };
             name = Release;
         };
@@ -1007,7 +1011,7 @@
                 SWIFT_EMIT_LOC_STRINGS = YES;
                 SWIFT_VERSION = 5.0;
                 TARGETED_DEVICE_FAMILY = 4;
-                WATCHOS_DEPLOYMENT_TARGET = 10.0;
+                WATCHOS_DEPLOYMENT_TARGET = 26.0;
             };
             name = Debug;
         };
@@ -1034,7 +1038,7 @@
                 SWIFT_EMIT_LOC_STRINGS = YES;
                 SWIFT_VERSION = 5.0;
                 TARGETED_DEVICE_FAMILY = 4;
-                WATCHOS_DEPLOYMENT_TARGET = 10.0;
+                WATCHOS_DEPLOYMENT_TARGET = 26.0;
             };
             name = Release;
         };
@@ -1048,7 +1052,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = SidePulseFocusIntent/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",
@@ -1075,7 +1079,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = SidePulseFocusIntent/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",
@@ -1102,7 +1106,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = DotNotificationService/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",
@@ -1130,7 +1134,7 @@
                 DEVELOPMENT_TEAM = "";
                 GENERATE_INFOPLIST_FILE = NO;
                 INFOPLIST_FILE = DotNotificationService/Info.plist;
-                IPHONEOS_DEPLOYMENT_TARGET = 17.2;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
                 LD_RUNPATH_SEARCH_PATHS = (
                     "$(inherited)",
                     "@executable_path/Frameworks",

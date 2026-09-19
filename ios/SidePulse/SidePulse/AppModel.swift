@@ -215,12 +215,6 @@ final class AppModel: ObservableObject {
             dotCompletionAlertsEnabled = false
             return
         }
-        guard #available(iOS 17.2, *) else {
-            disableDotCompletionAlerts(
-                "Completion notifications are off: this experimental feature requires iOS 17.2 or later."
-            )
-            return
-        }
         Task {
             do {
                 let center = UNUserNotificationCenter.current()
