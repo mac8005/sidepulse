@@ -77,6 +77,34 @@ above — and the percentage is printed next to the bar.
   still moving, `.variableColor` on the live connection pill, `numericText` on
   counters. Every one is switched off under Reduce Motion.
 
+## Toolchains
+
+Deployment floor is iOS 27.0 (watchOS 26.0), so ordinary modern API needs no
+guard. The iPhone Duo's own API is a different problem: it exists only in the
+**iOS 27.1 SDK**, and `#available` guards runtime, not compilation — code that
+merely *mentions* `ArrangementView`, `reservedRegions`, `onHingeChange`,
+`toolbarVertical*` or `ToolbarOverflowMenu` fails to build against the released
+Xcode that TestFlight builds use while 27.1 is in beta.
+
+Every one of those symbols is therefore wrapped twice, and only inside
+`DuoLayout.swift`:
+
+```swift
+#if canImport(SwiftUI, _version: 8.0.85)   // 8.0.84 = iOS 27.0 SDK, 8.0.85 = 27.1
+    if #available(iOS 27.1, *) { … }        // runtime
+    else { fallback }
+#else
+    fallback
+#endif
+```
+
+Call sites see only `duoFold`, `duoSplit`, `duoCompactTitle`,
+`duoPrefersToolbarItems`, `duoHorizontalSheetBar` and `DuoOverflow`, so the app
+compiles on Xcode 26.6, 27.0 and 27.1 with no `#if` anywhere else. Fallbacks are
+deliberately ordinary — a stacked or side-by-side `HStack`/`VStack`, a plain
+`Menu` for the overflow — never a second design. The widget's
+`isDynamicIslandLimitedInWidth` is iOS 27.0 API and needs no gate.
+
 ## Non-happy states
 
 | Situation | What the app shows |

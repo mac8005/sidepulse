@@ -101,6 +101,7 @@ final class UsageClient: ObservableObject {
     func fetch(baseURL: String) async {
 #if DEBUG && SIDEPULSE_MAIN_APP
         if DemoData.isEnabled {
+            guard DemoData.screen != "setup" else { return }
             snapshot = DemoData.usage
             failure = nil
             return

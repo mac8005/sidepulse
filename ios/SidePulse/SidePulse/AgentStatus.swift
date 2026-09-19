@@ -161,17 +161,14 @@ struct SessionRow: View {
                 // On a short display the title gets the whole first line and
                 // the state moves down beside the project, because a truncated
                 // title is the one thing that costs you the glance.
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(agent.name)
-                        .font(.body)
-                        .fontWeight(isUnread ? .semibold : .regular)
-                        .lineLimit(isDense ? 1 : 2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if !isDense {
-                        stateWord
-                    }
-                    elapsed
-                }
+                // The title owns the first line: a truncated title is the one
+                // thing that costs you the glance. State and age share the
+                // quiet line, together, on the trailing side.
+                Text(agent.name)
+                    .font(.body)
+                    .fontWeight(isUnread ? .semibold : .regular)
+                    .lineLimit(isDense ? 1 : 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 5) {
                     if let provider = agent.providerName {
@@ -187,9 +184,8 @@ struct SessionRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    if isDense {
-                        stateWord
-                    }
+                    stateWord
+                    elapsed
                 }
             }
         }
@@ -211,10 +207,10 @@ struct SessionRow: View {
     @ViewBuilder
     private var elapsed: some View {
         if let finishedAt = agent.finishedAt {
-            Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
+            Text(compactAge(since: finishedAt))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
-                .lineLimit(1)
+                .monospacedDigit()
                 .fixedSize()
         }
     }
@@ -231,6 +227,16 @@ struct SessionRow: View {
         guard let provider = agent.providerName else { return "Opens the session" }
         return "Opens this session in \(provider.capitalized)"
     }
+}
+
+/// "14s", "55m", "2h", "3d" — the system's relative style spells out
+/// "55 min, 0 sec" and eats a third of the row for no more meaning.
+func compactAge(since timestamp: Double) -> String {
+    let seconds = max(0, Date().timeIntervalSince1970 - timestamp)
+    if seconds < 60 { return "\(Int(seconds))s" }
+    if seconds < 3600 { return "\(Int(seconds / 60))m" }
+    if seconds < 86400 { return "\(Int(seconds / 3600))h" }
+    return "\(Int(seconds / 86400))d"
 }
 
 // MARK: - Sundries

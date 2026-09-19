@@ -95,12 +95,12 @@ private struct UsageProviderRow: View {
                     .background(.quaternary, in: Capsule())
             }
             Spacer(minLength: 0)
-            if let updatedAt = provider.usageUpdatedDate {
-                Text(updatedAt, style: .relative)
+            if let updatedAt = provider.updatedAt {
+                Text(compactAge(since: updatedAt))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .accessibilityLabel("Read")
+                    .monospacedDigit()
+                    .accessibilityLabel("Read \(compactAge(since: updatedAt)) ago")
             }
         }
     }

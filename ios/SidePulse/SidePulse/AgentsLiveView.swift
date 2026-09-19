@@ -212,7 +212,9 @@ struct BoardScreen: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                 Spacer(minLength: 0)
-                ConnectionPill(state: stream.state)
+                if !model.liveMonitorServerURL.isEmpty {
+                    ConnectionPill(state: stream.state)
+                }
             }
             Text(subtitle)
                 .font(.footnote)
@@ -226,6 +228,7 @@ struct BoardScreen: View {
     }
 
     private var headline: String {
+        guard !model.liveMonitorServerURL.isEmpty else { return "No Mac yet" }
         guard let snapshot = stream.snapshot else { return "Connecting…" }
         let grouping = AgentGrouping(agents: snapshot.agents, isUnread: isUnread)
         if grouping.needsYouCount > 0 {
@@ -236,6 +239,9 @@ struct BoardScreen: View {
     }
 
     private var subtitle: String {
+        guard !model.liveMonitorServerURL.isEmpty else {
+            return "Add the address of the Mac you want to watch"
+        }
         guard let snapshot = stream.snapshot else { return hostLabel }
         let age = Date().timeIntervalSince1970 - snapshot.updatedAt
         let asOf = age > 90
@@ -327,7 +333,7 @@ struct BoardScreen: View {
             .visibilityPriority(.high)
         }
 
-        ToolbarOverflowMenu {
+        DuoOverflow {
             Button("SidePulse Dot", systemImage: "light.beacon.max") { path.append(.dot) }
             Button("Settings", systemImage: "gearshape") { path.append(.settings) }
             Button("Refresh", systemImage: "arrow.clockwise") { Task { await refresh() } }

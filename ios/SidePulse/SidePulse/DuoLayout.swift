@@ -1,5 +1,14 @@
 import SwiftUI
 
+// Everything the iPhone Duo adds lives here, behind two gates.
+//
+// `#available(iOS 27.1, *)` is the runtime one. It is not enough on its own:
+// a symbol that only exists in the 27.1 SDK does not compile at all against an
+// older one, and the released Xcode is what builds for TestFlight while 27.1
+// is in beta. So the compile-time gate is the SwiftUI module version —
+// 8.0.84 ships in the iOS 27.0 SDK, 8.0.85 in 27.1 — and every call site below
+// keeps a fallback that is merely ordinary, never a second design.
+
 // MARK: - The fold
 
 /// What the folding region is doing right now. A phone that cannot fold
@@ -25,11 +34,15 @@ extension View {
     /// happens on a phone that does not fold.
     @ViewBuilder
     func duoFold(_ fold: Binding<DuoFold>) -> some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             modifier(DuoFoldReader(fold: fold))
         } else {
             self
         }
+#else
+        self
+#endif
     }
 
     /// 0 while the phone is shut, 1 once it is open, following the hinge in
@@ -37,14 +50,19 @@ extension View {
     /// on every phone that has no hinge.
     @ViewBuilder
     func duoHingeOpenness(_ openness: Binding<Double>) -> some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             modifier(DuoHingeOpenness(openness: openness))
         } else {
             self
         }
+#else
+        self
+#endif
     }
 }
 
+#if canImport(SwiftUI, _version: 8.0.85)
 @available(iOS 27.1, *)
 private struct DuoFoldReader: ViewModifier {
     @Binding var fold: DuoFold
@@ -84,6 +102,7 @@ private struct DuoHingeOpenness: ViewModifier {
         }
     }
 }
+#endif
 
 /// Column count for a grid the crease may run through: as many as fit, but an
 /// even number wherever a fold exists, so no column straddles it.
@@ -103,14 +122,15 @@ func duoColumnCount(
 
 /// Two panes that follow the hardware: side by side when the container is
 /// wide, stacked when it is tall, and divided along the crease once the phone
-/// is half-folded. iOS 27.0 has no arrangements, so there the panes simply sit
-/// next to each other when the width allows and stack when it does not.
+/// is half-folded. Without arrangements the panes simply sit next to each
+/// other when the width allows and stack when it does not.
 struct DuoSplit<Primary: View, Secondary: View>: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ViewBuilder var primary: Primary
     @ViewBuilder var secondary: Secondary
 
     var body: some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             ArrangementView {
                 primary
@@ -118,7 +138,17 @@ struct DuoSplit<Primary: View, Secondary: View>: View {
                 secondary
             }
             .arrangementViewStyle(.split)
-        } else if horizontalSizeClass == .regular {
+        } else {
+            stacked
+        }
+#else
+        stacked
+#endif
+    }
+
+    @ViewBuilder
+    private var stacked: some View {
+        if horizontalSizeClass == .regular {
             HStack(spacing: 0) {
                 primary
                 Divider()
@@ -143,33 +173,45 @@ extension View {
     /// upper half the board needs.
     @ViewBuilder
     func duoCompactTitle(force: Bool = false) -> some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             modifier(DuoCompactTitle(force: force))
         } else {
-            self
+            navigationBarTitleDisplayMode(force ? .inline : .automatic)
         }
+#else
+        navigationBarTitleDisplayMode(force ? .inline : .automatic)
+#endif
     }
 
     /// A screen people watch rather than navigate: its own controls matter
     /// more than the tab bar when the vertical strip runs short.
     @ViewBuilder
     func duoPrefersToolbarItems() -> some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             toolbarVerticalCompressionBehavior(.prefersToolbarItems)
         } else {
             self
         }
+#else
+        self
+#endif
     }
 
     /// A sheet with a single button has nothing to fill a vertical bar with;
     /// keep its button where sheets have always kept it.
     @ViewBuilder
     func duoHorizontalSheetBar() -> some View {
+#if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             toolbarVerticalBehavior(.disabled)
         } else {
             self
         }
+#else
+        self
+#endif
     }
 
     /// Apple's default is the vertical strip, and that is what ships.
@@ -177,7 +219,7 @@ extension View {
     /// by side for a decision.
     @ViewBuilder
     func duoStripBehavior() -> some View {
-#if DEBUG && SIDEPULSE_MAIN_APP
+#if DEBUG && SIDEPULSE_MAIN_APP && canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *), DuoStrip.prefersHorizontal {
             toolbarVerticalBehavior(.disabled)
         } else {
@@ -189,6 +231,7 @@ extension View {
     }
 }
 
+#if canImport(SwiftUI, _version: 8.0.85)
 @available(iOS 27.1, *)
 private struct DuoCompactTitle: ViewModifier {
     let force: Bool
@@ -198,6 +241,36 @@ private struct DuoCompactTitle: ViewModifier {
         content.navigationBarTitleDisplayMode(
             force || verticalEdge != nil ? .inline : .automatic
         )
+    }
+}
+#endif
+
+/// The one overflow the app has. On the iPhone Duo it is the system's own,
+/// which owns the ellipsis in the vertical strip; elsewhere it is an ordinary
+/// menu in the same place.
+struct DuoOverflow<Content: View>: ToolbarContent {
+    @ViewBuilder var content: Content
+
+    var body: some ToolbarContent {
+#if canImport(SwiftUI, _version: 8.0.85)
+        if #available(iOS 27.1, *) {
+            ToolbarOverflowMenu { content }
+        } else {
+            plainMenu
+        }
+#else
+        plainMenu
+#endif
+    }
+
+    private var plainMenu: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Menu {
+                content
+            } label: {
+                Label("More", systemImage: "ellipsis")
+            }
+        }
     }
 }
 
