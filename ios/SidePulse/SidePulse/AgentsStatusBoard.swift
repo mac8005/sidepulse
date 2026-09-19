@@ -125,10 +125,19 @@ struct AgentsStatusBoard: View {
     /// board shows as many as the upper half really holds and says how many
     /// it is keeping back. The container decides, not a constant.
     private var board: some View {
+        // ViewThatFits picks the first child that fits, so the candidates are
+        // spelled out rather than generated: a ForEach would hand it one.
         ViewThatFits(in: .vertical) {
-            ForEach(Array(stride(from: max(1, agents.count), through: 1, by: -1)), id: \.self) { limit in
-                stack(limit: limit)
-            }
+            stack(limit: 12)
+            stack(limit: 9)
+            stack(limit: 8)
+            stack(limit: 7)
+            stack(limit: 6)
+            stack(limit: 5)
+            stack(limit: 4)
+            stack(limit: 3)
+            stack(limit: 2)
+            stack(limit: 1)
         }
     }
 

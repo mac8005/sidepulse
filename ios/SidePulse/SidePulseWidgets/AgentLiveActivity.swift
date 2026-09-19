@@ -252,15 +252,19 @@ private struct FittedAgentRows: View {
     @ViewBuilder var row: (AgentActivityAttributes.AgentRow) -> AnyView
 
     var body: some View {
+        // ViewThatFits picks the first child that fits, so the candidates are
+        // spelled out rather than generated: a ForEach would hand it one.
         ViewThatFits(in: .vertical) {
-            ForEach(candidateCounts, id: \.self) { count in
-                stack(limit: count)
-            }
+            stack(limit: 12)
+            stack(limit: 9)
+            stack(limit: 7)
+            stack(limit: 6)
+            stack(limit: 5)
+            stack(limit: 4)
+            stack(limit: 3)
+            stack(limit: 2)
+            stack(limit: 1)
         }
-    }
-
-    private var candidateCounts: [Int] {
-        Array(stride(from: max(1, agents.count), through: 1, by: -1))
     }
 
     private func stack(limit: Int) -> some View {
