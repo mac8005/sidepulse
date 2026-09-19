@@ -128,16 +128,28 @@ struct DuoSplit<Primary: View, Secondary: View>: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ViewBuilder var primary: Primary
     @ViewBuilder var secondary: Secondary
+    @State private var fold = DuoFold()
+    @State private var isSideBySide = false
+
+    /// Open flat, the two panes would touch in the middle of the widescreen
+    /// display. Half-folded, the crease already keeps them apart. It is safe
+    /// area, not padding, so each pane's background still runs to its edge.
+    private var gutter: CGFloat { isSideBySide && !fold.isActive ? 16 : 0 }
 
     var body: some View {
 #if canImport(SwiftUI, _version: 8.0.85)
         if #available(iOS 27.1, *) {
             ArrangementView {
-                primary
+                primary.safeAreaPadding(.trailing, gutter)
             } secondary: {
-                secondary
+                secondary.safeAreaPadding(.leading, gutter)
             }
             .arrangementViewStyle(.split)
+            // Every pane in the app is a grouped list; the strip the crease
+            // keeps free between them should not show the window behind.
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .duoFold($fold)
+            .onGeometryChange(for: Bool.self) { $0.size.width > $0.size.height } action: { isSideBySide = $0 }
         } else {
             stacked
         }
