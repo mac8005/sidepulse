@@ -1,18 +1,19 @@
 import SwiftUI
 
-/// The tabletop half of the agents screen: what the Mac's agents are doing,
-/// set in type that survives being read from the other side of a desk. It goes
-/// on the upper half while the phone stands half-folded; the controls sit on
-/// the lower half, within reach.
+/// The tabletop half of the board: what the Mac's agents are doing, set in
+/// type that survives being read from the other side of a desk. It takes the
+/// upper half while the phone stands half-folded; the controls sit on the
+/// lower half, within reach.
 struct AgentsStatusBoard: View {
     let snapshot: AgentSnapshot?
     let hostLabel: String
     let isUnread: (AgentSnapshot.Agent) -> Bool
-    let selectedID: String?
-    let select: (AgentSnapshot.Agent) -> Void
-    /// 0 shut, 1 open — the board's glow follows the hinge as the phone is
-    /// opened. Effect only; nothing here moves because of it.
+    /// 0 shut, 1 open — the board's glow follows the hinge as the phone opens.
+    /// Effect only; nothing here moves because of it.
     var openness: Double = 1
+    let open: (AgentSnapshot.Agent) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Whatever wants a person comes first: the board is read from across a
     /// desk, so the top of it has to be the part worth walking over for.
@@ -26,58 +27,54 @@ struct AgentsStatusBoard: View {
     }
 
     private func rank(_ agent: AgentSnapshot.Agent) -> Int {
-        switch agent.mode {
-        case "blocked_error": return 0
-        case "waiting_for_input": return 1
-        default: break
+        let state = AgentState.of(agent, isUnread: isUnread(agent))
+        switch state.group {
+        case .needsYou: return agent.mode == "blocked_error" ? 0 : 1
+        case .working: return 2
+        case .settled: return 3
         }
-        if isUnread(agent) { return 2 }
-        return agent.finishedAt == nil ? 3 : 4
     }
 
-    private var attention: [AgentSnapshot.Agent] {
-        agents.filter { $0.mode == "waiting_for_input" || $0.mode == "blocked_error" }
+    private var grouping: AgentGrouping {
+        AgentGrouping(agents: snapshot?.agents ?? [], isUnread: isUnread)
     }
 
-    private var headline: (text: String, color: Color, symbol: String) {
-        guard let snapshot else {
+    private var headline: (text: String, tint: Color, symbol: String) {
+        guard snapshot != nil else {
             return ("Waiting for data", .secondary, "antenna.radiowaves.left.and.right.slash")
         }
-        if let first = attention.first {
-            let word = attention.count == 1 ? "session needs you" : "sessions need you"
-            return ("\(attention.count) \(word)", modeColor(first.mode), "questionmark.bubble.fill")
+        if grouping.needsYouCount > 0 {
+            let count = grouping.needsYouCount
+            return ("\(count) session\(count == 1 ? "" : "s") need\(count == 1 ? "s" : "") you",
+                    .orange, "hand.raised.fill")
         }
-        if snapshot.activeCount > 0 {
-            return ("\(snapshot.activeCount) working", modeColor("working"), "bolt.fill")
+        if grouping.activeCount > 0 {
+            return ("\(grouping.activeCount) working", .blue, "bolt.fill")
         }
-        let unread = agents.filter(isUnread).count
-        if unread > 0 {
-            return ("\(unread) finished, unread", modeColor("completed"), "checkmark.circle.fill")
-        }
-        return ("All quiet", .secondary, "moon.fill")
+        return ("All quiet", .green, "checkmark.circle.fill")
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             banner
             board
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 20)
-        .padding(.top, 12)
+        .padding(.top, 10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(.systemGroupedBackground))
     }
 
     private var banner: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             Image(systemName: headline.symbol)
                 .font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(headline.color)
+                .foregroundStyle(headline.tint)
+                .symbolEffect(.pulse, isActive: grouping.needsYouCount > 0 && !reduceMotion)
             VStack(alignment: .leading, spacing: 2) {
                 Text(headline.text)
                     .font(.title.weight(.bold))
-                    .foregroundStyle(.primary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
                 Text(hostLabel)
@@ -89,41 +86,46 @@ struct AgentsStatusBoard: View {
         }
         .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
                 .fill(Color(.secondarySystemGroupedBackground))
                 // The board lights up as the phone is opened.
-                .shadow(color: headline.color.opacity(0.45 * openness), radius: 18 * openness)
+                .shadow(color: headline.tint.opacity(0.4 * openness), radius: 16 * openness)
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(headline.text)
+        .accessibilityValue(hostLabel)
     }
 
     private var counters: some View {
-        HStack(spacing: 14) {
-            counter(agents.filter { $0.mode == "blocked_error" }.count, "blocked_error", "Blocked")
-            counter(attention.filter { $0.mode == "waiting_for_input" }.count, "waiting_for_input", "Asking")
-            counter(snapshot?.activeCount ?? 0, "working", "Active")
-            counter(agents.filter(isUnread).count, "completed", "New")
+        HStack(spacing: 16) {
+            counter(agents.filter { $0.mode == "blocked_error" }.count, .red, "Blocked")
+            counter(agents.filter { $0.mode == "waiting_for_input" }.count, .orange, "Asking")
+            counter(grouping.activeCount, .blue, "Working")
+            counter(agents.filter(isUnread).count, .green, "New")
         }
     }
 
     @ViewBuilder
-    private func counter(_ value: Int, _ mode: String, _ label: String) -> some View {
+    private func counter(_ value: Int, _ tint: Color, _ label: String) -> some View {
         if value > 0 {
             VStack(spacing: 1) {
                 Text("\(value)")
                     .font(.system(size: 30, weight: .bold, design: .rounded))
-                    .foregroundStyle(modeColor(mode))
+                    .foregroundStyle(tint)
                     .monospacedDigit()
                     .contentTransition(.numericText())
                 Text(label)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(value) \(label)")
         }
     }
 
     /// Only whole rows: a line sliced by the crease is unreadable, so the
-    /// board shows as many as the upper half really holds and says how many
-    /// it is keeping back. The container decides, not a constant.
+    /// board shows as many as the upper half really holds and says what it is
+    /// keeping back. The container decides, not a constant.
     private var board: some View {
         // ViewThatFits picks the first child that fits, so the candidates are
         // spelled out rather than generated: a ForEach would hand it one.
@@ -145,7 +147,7 @@ struct AgentsStatusBoard: View {
         VStack(spacing: 8) {
             ForEach(agents.prefix(limit)) { agent in
                 Button {
-                    select(agent)
+                    open(agent)
                 } label: {
                     row(agent)
                 }
@@ -164,36 +166,36 @@ struct AgentsStatusBoard: View {
     }
 
     private func row(_ agent: AgentSnapshot.Agent) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: AgentModeStyle.symbol(agent.mode))
-                .font(.system(size: 27, weight: .semibold))
-                .foregroundStyle(modeColor(agent.mode))
-                .symbolEffect(.pulse, isActive: isUnread(agent))
+        let state = AgentState.of(agent, isUnread: isUnread(agent))
+        return HStack(spacing: 14) {
+            Image(systemName: state.symbol)
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(state.tint)
+                .symbolEffect(.pulse, isActive: state.isLive && !reduceMotion)
                 .frame(width: 34)
 
             Text(agent.name)
-                .font(.title2.weight(isUnread(agent) ? .bold : .regular))
+                .font(.title2.weight(isUnread(agent) ? .semibold : .regular))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(AgentModeStyle.label(agent.mode))
+            Text(state.word)
                 .font(.title3.weight(.semibold))
-                .foregroundStyle(modeColor(agent.mode))
+                .foregroundStyle(state.tint)
                 .fixedSize()
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(rowFill(agent))
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                .fill(isUnread(agent)
+                      ? Color.green.opacity(0.14)
+                      : Color(.secondarySystemGroupedBackground))
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(
-                    selectedID == agent.id ? Color.accentColor : .clear,
-                    lineWidth: 2
-                )
-        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(agent.name)
+        .accessibilityValue(state.word)
+        .accessibilityHint("Opens the session")
     }
 
     /// Says what is being kept back, not just how much: with the urgent
@@ -202,66 +204,24 @@ struct AgentsStatusBoard: View {
     private func overflowLabel(limit: Int) -> String {
         let hidden = agents.dropFirst(limit)
         let waiting = hidden.filter {
-            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
+            AgentState.of($0, isUnread: isUnread($0)).group == .needsYou
         }.count
         return waiting > 0
             ? "+\(hidden.count) more · \(waiting) need you"
             : "+\(hidden.count) more · none need you"
     }
-
-    private func rowFill(_ agent: AgentSnapshot.Agent) -> Color {
-        if isUnread(agent) { return Color.green.opacity(0.16) }
-        return Color(.secondarySystemGroupedBackground)
-    }
-
-    private func modeColor(_ mode: String) -> Color {
-        let (r, g, b) = AgentModeStyle.rgb(mode)
-        return Color(red: r, green: g, blue: b)
-    }
 }
 
 /// The lower, reachable half in the tabletop pose: everything the board cannot
-/// do by itself — open the selected session, start a new one, read the usage
-/// meters, drive the Dot.
+/// do by itself — start a session, read the usage meters, reach the Dot.
 struct AgentsDeskControls: View {
     @ObservedObject var model: AppModel
     @ObservedObject var usage: UsageClient
-    let selected: AgentSnapshot.Agent?
     let links: [NewSessionLink]
-    let clearSelection: () -> Void
-    @State private var dotSettingsExpanded = false
+    let openDot: () -> Void
 
     var body: some View {
         List {
-            Section("Selected session") {
-                if let selected {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(selected.name)
-                            .font(.headline)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(
-                            [selected.cwd, selected.detail]
-                                .compactMap { $0 }
-                                .joined(separator: " · ")
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                    Button {
-                        openAgentSession(selected)
-                    } label: {
-                        Label(
-                            "Open in \(selected.provider?.capitalized ?? "provider")",
-                            systemImage: "arrow.up.forward.app"
-                        )
-                    }
-                    Button("Clear selection", systemImage: "xmark.circle", action: clearSelection)
-                } else {
-                    Text("Tap a session on the upper half.")
-                        .foregroundStyle(.secondary)
-                }
-            }
-
             if !links.isEmpty {
                 Section {
                     Menu {
@@ -269,7 +229,9 @@ struct AgentsDeskControls: View {
                             Button(link.label) { openFirstAvailable(link.candidates) }
                         }
                     } label: {
-                        Label("New session", systemImage: "plus.circle")
+                        Label("New session", systemImage: "plus.circle.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     }
                 }
             }
@@ -277,9 +239,12 @@ struct AgentsDeskControls: View {
             UsageSection(usage: usage)
 
             Section {
-                DisclosureGroup("Dot settings", isExpanded: $dotSettingsExpanded) {
-                    DotBehaviorControls(model: model)
+                Button {
+                    openDot()
+                } label: {
+                    DotStatusRow(model: model)
                 }
+                .buttonStyle(.plain)
             }
         }
     }

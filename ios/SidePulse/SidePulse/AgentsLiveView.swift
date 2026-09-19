@@ -1,62 +1,49 @@
 import SwiftUI
 import UIKit
 
-/// Realtime agent monitor: streams snapshots from the Mac over the local
-/// network / Tailscale while the app is in the foreground. The stream is
-/// owned by `DotStatusMirror`, which drives a plugged-in Dot from it.
+/// The root of the app: what the agents on the Mac are doing, grouped by the
+/// only question that matters at a glance — does anything want me. The stream
+/// behind it is owned by `DotStatusMirror`, which drives a plugged-in Dot from
+/// the same snapshot.
 ///
-/// Narrow displays get one list, exactly as before. Where there is room for
-/// two panes — the iPhone Duo's inner display, an iPad — the sessions keep the
-/// primary pane and the second one carries what used to be buried below them.
-struct AgentsLiveView: View {
-    enum Layout {
-        /// One list when narrow, two panes when the display has room.
-        case adaptive
-        /// Sessions only; the surrounding shell supplies the other columns.
-        case listOnly
-    }
-
+/// A narrow display shows one scroll. Where there is room for two panes — the
+/// iPhone Duo's inner display, an iPad — the sessions keep the primary pane
+/// and the usage meters and the Dot move beside them instead of below.
+struct BoardScreen: View {
     private struct SeenAcknowledgement: Decodable {
         let ok: Bool
         let marked: Bool
     }
 
     @ObservedObject var model: AppModel
-    var layout: Layout = .adaptive
-    /// Set by a shell that owns the detail column itself (the three-column
-    /// variant); otherwise the screen keeps its own selection.
-    var externalSelection: Binding<String?>?
+    @Binding var path: [Route]
 
     @ObservedObject private var stream = DotStatusMirror.shared.stream
     @ObservedObject private var usage = UsageClient.shared
     @ObservedObject private var sessionLinks = SessionLinksClient.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    /// Completions tapped this app session, keyed by the row's finish time
-    /// so the dimming applies only to the completion the user actually
-    /// opened — a session that finishes another turn re-arms as unread.
+    /// Completions tapped this app session, keyed by the row's finish time so
+    /// the dimming applies only to the completion the user actually opened — a
+    /// session that finishes another turn re-arms as unread.
     @State private var locallySeen: [String: Double] = [:]
-    @State private var dotSettingsExpanded = false
-    @State private var ownSelection: String?
     @State private var fold = DuoFold()
     @State private var hingeOpenness: Double = 1
     @State private var containerHeight: CGFloat = 0
 
     var body: some View {
         content
-            .navigationTitle("Mac Agents")
+            .navigationTitle("Agents")
             .toolbar { toolbar }
             .duoCompactTitle(force: fold.isTabletop)
             .duoPrefersToolbarItems()
             .duoFold($fold)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
             .duoHingeOpenness($hingeOpenness)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
+            .refreshable { await refresh() }
             .task {
-                // Normally already running from the scene going active; harmless
-                // to repeat.
+                // Normally already running from the scene going active;
+                // harmless to repeat.
                 DotStatusMirror.shared.start(model: model)
-#if DEBUG && SIDEPULSE_MAIN_APP
-                if let id = DemoData.selectedAgentID { selection.wrappedValue = id }
-#endif
             }
             .task(id: model.liveMonitorServerURL) {
                 await usage.poll(baseURL: model.liveMonitorServerURL)
@@ -70,52 +57,226 @@ struct AgentsLiveView: View {
 
     private var isWide: Bool { horizontalSizeClass == .regular }
 
-    /// A narrow container that is also short is a glance surface: one summary
-    /// line instead of a card, one line per title, tighter rows, so the
-    /// sessions that matter are all on screen at once. The iPhone Duo's outer
-    /// display is 200 pt shorter than an iPhone 17 Pro and lands here; so do
-    /// the small phones and any phone held sideways, which want it just as
-    /// much. A full-height phone keeps the roomier list.
-    private var isGlance: Bool {
+    /// A narrow container that is also short is a glance surface: the summary
+    /// collapses into one line, titles keep to one line and the rows tighten,
+    /// so everything that matters is on screen at once. The iPhone Duo's outer
+    /// display lands here, and so does any phone held sideways.
+    private var isDense: Bool {
         horizontalSizeClass == .compact && containerHeight > 0 && containerHeight < 720
     }
 
     @ViewBuilder
     private var content: some View {
-        switch layout {
-        case .listOnly:
-            sessionsPane
-        case .adaptive:
-            if fold.isTabletop {
-                // Standing on a desk: a board that reads from a distance above
-                // the crease, everything you touch below it.
-                DuoSplit {
-                    AgentsStatusBoard(
-                        snapshot: stream.snapshot,
-                        hostLabel: hostLabel,
-                        isUnread: isUnread,
-                        selectedID: selection.wrappedValue,
-                        select: activateOnBoard,
-                        openness: hingeOpenness
-                    )
-                } secondary: {
-                    AgentsDeskControls(
-                        model: model,
-                        usage: usage,
-                        selected: selectedAgent,
-                        links: sessionLinks.links,
-                        clearSelection: { selection.wrappedValue = nil }
-                    )
+        if fold.isTabletop {
+            // Standing on a desk: a board that reads from across the room
+            // above the crease, everything you touch below it.
+            DuoSplit {
+                AgentsStatusBoard(
+                    snapshot: stream.snapshot,
+                    hostLabel: hostLabel,
+                    isUnread: isUnread,
+                    openness: hingeOpenness
+                ) { agent in
+                    markSeen(agent)
+                    openAgentSession(agent)
                 }
-            } else if isWide {
-                DuoSplit {
-                    sessionsPane
-                } secondary: {
-                    secondaryPane
+            } secondary: {
+                AgentsDeskControls(
+                    model: model,
+                    usage: usage,
+                    links: sessionLinks.links,
+                    openDot: { path.append(.dot) }
+                )
+            }
+        } else if isWide {
+            DuoSplit {
+                sessions
+            } secondary: {
+                AgentsDashboard(model: model, usage: usage, openDot: { path.append(.dot) })
+            }
+        } else {
+            sessions
+        }
+    }
+
+    private var sessions: some View {
+        List {
+            Section { summary }
+                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                .listRowBackground(Color.clear)
+
+            if let snapshot = stream.snapshot {
+                if snapshot.agents.isEmpty {
+                    BoardMessage(
+                        symbol: "moon.zzz.fill",
+                        title: "All quiet",
+                        message: "No agent is running on \(hostLabel) right now."
+                    )
+                } else {
+                    let grouping = AgentGrouping(agents: snapshot.agents, isUnread: isUnread)
+                    ForEach(grouping.sections, id: \.group) { section in
+                        Section {
+                            ForEach(section.agents) { agent in
+                                row(agent)
+                            }
+                        } header: {
+                            sectionHeader(section.group, count: section.agents.count)
+                        }
+                    }
                 }
             } else {
-                narrowList
+                connectionState
             }
+
+            if !isWide {
+                UsageSection(usage: usage, isDense: isDense)
+                dotSectionLink
+            }
+        }
+        .listSectionSpacing(isDense ? .compact : .default)
+    }
+
+    @ViewBuilder
+    private func row(_ agent: AgentSnapshot.Agent) -> some View {
+        Button {
+            markSeen(agent)
+            openAgentSession(agent)
+        } label: {
+            SessionRow(agent: agent, isUnread: isUnread(agent), isDense: isDense)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(isUnread(agent) ? Color.green.opacity(0.12) : nil)
+        .listRowInsets(isDense
+                       ? EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                       : nil)
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            if isUnread(agent) {
+                Button {
+                    markSeen(agent)
+                } label: {
+                    Label("Mark seen", systemImage: "checkmark.circle")
+                }
+                .tint(.green)
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button {
+                markSeen(agent)
+                openAgentSession(agent)
+            } label: {
+                Label("Open", systemImage: "arrow.up.forward.app")
+            }
+            .tint(.blue)
+        }
+        .contextMenu {
+            Button("Open session", systemImage: "arrow.up.forward.app") {
+                markSeen(agent)
+                openAgentSession(agent)
+            }
+            if isUnread(agent) {
+                Button("Mark as seen", systemImage: "checkmark.circle") { markSeen(agent) }
+            }
+            if let cwd = agent.cwd {
+                Button("Copy project path", systemImage: "doc.on.doc") {
+                    UIPasteboard.general.string = cwd
+                }
+            }
+        }
+    }
+
+    private func sectionHeader(_ group: AgentState.Group, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: group.symbol)
+                .foregroundStyle(group.tint)
+            Text(group.title)
+            Text("\(count)")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .font(.subheadline.weight(.semibold))
+        .textCase(nil)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(group.title), \(count) session\(count == 1 ? "" : "s")")
+    }
+
+    // MARK: - Summary and states
+
+    /// The one line that answers "does anything need me?", with an honest
+    /// reading age beside it.
+    private var summary: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(headline)
+                    .font(isDense ? .title3.weight(.semibold) : .title2.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 0)
+                ConnectionPill(state: stream.state)
+            }
+            Text(subtitle)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(headline)
+        .accessibilityValue(subtitle)
+    }
+
+    private var headline: String {
+        guard let snapshot = stream.snapshot else { return "Connecting…" }
+        let grouping = AgentGrouping(agents: snapshot.agents, isUnread: isUnread)
+        if grouping.needsYouCount > 0 {
+            return "\(grouping.needsYouCount) need\(grouping.needsYouCount == 1 ? "s" : "") you"
+        }
+        if grouping.activeCount > 0 { return "\(grouping.activeCount) working" }
+        return "All quiet"
+    }
+
+    private var subtitle: String {
+        guard let snapshot = stream.snapshot else { return hostLabel }
+        let age = Date().timeIntervalSince1970 - snapshot.updatedAt
+        let asOf = age > 90
+            ? " · as of \(Date(timeIntervalSince1970: snapshot.updatedAt).formatted(date: .omitted, time: .shortened))"
+            : ""
+        return "\(hostLabel) · \(snapshot.agents.count) session\(snapshot.agents.count == 1 ? "" : "s")\(asOf)"
+    }
+
+    /// Nothing has arrived yet: say which of the three reasons it is, and what
+    /// to do about it, rather than showing an empty list.
+    @ViewBuilder
+    private var connectionState: some View {
+        switch stream.state {
+        case .failed(let message):
+            BoardMessage(
+                symbol: "antenna.radiowaves.left.and.right.slash",
+                title: "Can't reach \(hostLabel)",
+                message: message,
+                tint: .orange
+            ) {
+                Button("Open Settings", systemImage: "gearshape") { path.append(.settings) }
+            }
+        case .idle where model.liveMonitorServerURL.isEmpty:
+            SetupChecklist { path.append(.settings) }
+        default:
+            BoardMessage(
+                symbol: "dot.radiowaves.left.and.right",
+                title: "Connecting to \(hostLabel)",
+                message: "Waiting for the first snapshot from the monitor on your Mac."
+            )
+        }
+    }
+
+    private var dotSectionLink: some View {
+        Section {
+            Button {
+                path.append(.dot)
+            } label: {
+                DotStatusRow(model: model)
+            }
+            .buttonStyle(.plain)
         }
     }
 
@@ -123,164 +284,29 @@ struct AgentsLiveView: View {
         URL(string: model.liveMonitorServerURL)?.host ?? "the Mac"
     }
 
-    /// Everything in one scroll, the way the phone has always shown it.
-    private var narrowList: some View {
-        List {
-            if !isGlance {
-                Section {
-                    header
-                }
-            }
-
-            agentsSection
-
-            UsageSection(usage: usage)
-
-            Section {
-                DisclosureGroup("Dot settings", isExpanded: $dotSettingsExpanded) {
-                    DotBehaviorControls(model: model)
-                }
-            }
-        }
-    }
-
-    private var sessionsPane: some View {
-        List {
-            Section {
-                header
-            }
-
-            agentsSection
-        }
-    }
-
-    @ViewBuilder
-    private var secondaryPane: some View {
-        switch DuoVariant.current {
-        case .b:
-            AgentsDashboard(model: model, usage: usage)
-        default:
-            if let agent = selectedAgent {
-                AgentSessionDetail(
-                    agent: agent,
-                    updatedAt: stream.snapshot?.updatedAt,
-                    isUnread: isUnread(agent),
-                    close: { selection.wrappedValue = nil }
-                )
-            } else {
-                AgentsDashboard(model: model, usage: usage)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var agentsSection: some View {
-        Section {
-            if let snapshot = stream.snapshot, !snapshot.agents.isEmpty {
-                ForEach(snapshot.agents) { agent in
-                    AgentLiveRow(
-                        agent: agent,
-                        isUnread: isUnread(agent),
-                        isSelected: selection.wrappedValue == agent.id,
-                        isGlance: isGlance
-                    ) {
-                        activate(agent)
-                    }
-                    .listRowBackground(rowBackground(agent))
-                    .listRowInsets(glanceInsets)
-                }
-            } else if stream.snapshot != nil {
-                Text("All quiet — no active agents.")
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("Waiting for data…")
-                    .foregroundStyle(.secondary)
-            }
-        } header: {
-            if isGlance {
-                glanceHeader
-            } else {
-                Text("Agents")
-            }
-        }
-    }
-
-    private var glanceInsets: EdgeInsets? {
-        isGlance ? EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16) : nil
-    }
-
-    /// The connection card compressed into the section header: same facts,
-    /// about a hundred points cheaper.
-    @ViewBuilder
-    private var glanceHeader: some View {
-        HStack(spacing: 6) {
-            switch stream.state {
-            case .live:
-                Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.green)
-            case .connecting:
-                Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.orange)
-            case .failed:
-                Image(systemName: "exclamationmark.triangle").foregroundStyle(.red)
-            case .idle:
-                Image(systemName: "pause.circle").foregroundStyle(.secondary)
-            }
-            if let snapshot = stream.snapshot {
-                let needing = snapshot.agents.filter {
-                    $0.mode == "waiting_for_input" || $0.mode == "blocked_error"
-                }.count
-                if needing > 0 {
-                    Text("\(needing) need you")
-                        .foregroundStyle(.orange)
-                }
-                let unread = snapshot.agents.filter(isUnread).count
-                if unread > 0 {
-                    Text("· \(unread) new")
-                        .foregroundStyle(.green)
-                }
-                Text("· \(snapshot.activeCount) active")
-            } else {
-                Text("Waiting for data…")
-            }
-            Spacer(minLength: 0)
-        }
-        .font(.footnote.weight(.semibold))
-        .textCase(nil)
-    }
-
-    @ViewBuilder
-    private func rowBackground(_ agent: AgentSnapshot.Agent) -> some View {
-        if selection.wrappedValue == agent.id, showsDetailPane {
-            Color.accentColor.opacity(0.18)
-        } else if isUnread(agent) {
-            Color.green.opacity(0.16)
-        }
-    }
-
     // MARK: - Toolbar
 
-    /// Every item carries a title and an icon: the icon is what lets the
-    /// system move it into the vertical bar strip it uses on the iPhone Duo,
-    /// and the title is what labels it in the overflow menu. The attention
-    /// item wears a badge rather than spelling its count out, so it stays
-    /// legible at the width of that strip.
+    /// Every item carries a title and a symbol, so the system can move it into
+    /// the vertical strip the iPhone Duo uses and still name it in the
+    /// overflow menu. The strip stays light on purpose: a primary action, a
+    /// status item that appears only when it has something to say, and one
+    /// system overflow for the rest.
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        // The count of sessions waiting for a person is the one thing this
-        // screen must never hide, so it is pinned and wears a badge instead
-        // of spelling the number out beside a symbol.
-        ToolbarItem(placement: .topBarPinnedTrailing) {
-            Button {
-                selectFirstNeedingAttention()
-            } label: {
-                Label("Needs you", systemImage: "bell.badge")
+        if attentionCount > 0 {
+            ToolbarItem(placement: .topBarPinnedTrailing) {
+                Button {
+                    openFirstNeedingAttention()
+                } label: {
+                    Label("Needs you", systemImage: "bell.badge")
+                }
+                .badge(attentionCount)
             }
-            .badge(attentionCount)
-            .disabled(attentionCount == 0)
+            .visibilityPriority(.high)
         }
-        .visibilityPriority(.high)
 
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            if !sessionLinks.links.isEmpty {
+        if !sessionLinks.links.isEmpty {
+            ToolbarItem(placement: .topBarTrailing) {
                 // Hands off to the provider's own app; the daemon says where.
                 Menu {
                     ForEach(sessionLinks.links) { link in
@@ -290,75 +316,34 @@ struct AgentsLiveView: View {
                     Label("New session", systemImage: "plus")
                 }
             }
-
-            if layout == .adaptive {
-                NavigationLink(value: Route.settings) {
-                    Label("Settings", systemImage: "gearshape")
-                }
-            }
+            .visibilityPriority(.high)
         }
-        // Setup before action: Settings is the first thing to give way when a
-        // Live Activity takes its share of the strip.
-        .visibilityPriority(.low)
 
-        // The one rarely used action goes straight into the system overflow;
-        // the ellipsis belongs to it and to nothing else.
         ToolbarOverflowMenu {
-            Button("Refresh usage", systemImage: "arrow.clockwise") {
-                Task { await usage.fetch(baseURL: model.liveMonitorServerURL) }
-            }
+            Button("SidePulse Dot", systemImage: "light.beacon.max") { path.append(.dot) }
+            Button("Settings", systemImage: "gearshape") { path.append(.settings) }
+            Button("Refresh", systemImage: "arrow.clockwise") { Task { await refresh() } }
         }
     }
 
-    /// Sessions that have stopped and are waiting for a person.
     private var attentionCount: Int {
         guard let snapshot = stream.snapshot else { return 0 }
-        return snapshot.agents.filter {
-            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
-        }.count
+        return AgentGrouping(agents: snapshot.agents, isUnread: isUnread).needsYouCount
     }
 
-    private func selectFirstNeedingAttention() {
-        guard let agent = stream.snapshot?.agents.first(where: {
-            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
-        }) else { return }
-        activate(agent)
-    }
-
-    /// On the board a tap always selects: the controls half is what opens the
-    /// session, so nothing sends the phone to another app behind your back.
-    private func activateOnBoard(_ agent: AgentSnapshot.Agent) {
+    private func openFirstNeedingAttention() {
+        guard let snapshot = stream.snapshot,
+              let agent = snapshot.agents.first(where: {
+                  AgentState.of($0, isUnread: isUnread($0)).group == .needsYou
+              })
+        else { return }
         markSeen(agent)
-        selection.wrappedValue = agent.id
+        openAgentSession(agent)
     }
 
-    // MARK: - Selection
-
-    private var selection: Binding<String?> {
-        externalSelection ?? $ownSelection
-    }
-
-    /// True when a second pane is showing the session, so a tap should select
-    /// it instead of leaving for the provider's app.
-    private var showsDetailPane: Bool {
-        switch layout {
-        case .listOnly: return true
-        case .adaptive: return isWide && DuoVariant.current != .b
-        }
-    }
-
-    private var selectedAgent: AgentSnapshot.Agent? {
-        guard let id = selection.wrappedValue else { return nil }
-        return stream.snapshot?.agents.first { $0.id == id }
-    }
-
-    private func activate(_ agent: AgentSnapshot.Agent) {
-        markSeen(agent)
-        if showsDetailPane {
-            selection.wrappedValue = agent.id
-        } else {
-            openAgentSession(agent)
-        }
+    private func refresh() async {
+        await usage.fetch(baseURL: model.liveMonitorServerURL)
+        DotStatusMirror.shared.start(model: model)
     }
 
     // MARK: - Unread bookkeeping
@@ -389,8 +374,8 @@ struct AgentsLiveView: View {
         request.timeoutInterval = 10
         Task {
             // The daemon owns this state. If it never heard the tap, drop the
-            // local override rather than showing "read" over a row every
-            // other surface still reports as unread.
+            // local override rather than showing "read" over a row every other
+            // surface still reports as unread.
             var acknowledged = false
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
@@ -412,59 +397,164 @@ struct AgentsLiveView: View {
         guard locallySeen[id] == finishedAt else { return }
         locallySeen[id] = nil
     }
+}
 
-    @ViewBuilder
-    private var header: some View {
-        HStack {
-            switch stream.state {
-            case .live:
-                Label("Live", systemImage: "dot.radiowaves.left.and.right")
-                    .foregroundStyle(.green)
-            case .connecting:
-                Label("Connecting…", systemImage: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.orange)
-            case .failed(let message):
-                Label(message, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            case .idle:
-                Label("Idle", systemImage: "pause.circle")
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if let snapshot = stream.snapshot {
-                let unread = snapshot.agents.filter(isUnread).count
-                if unread > 0 {
-                    Label("\(unread) new", systemImage: "bell.badge.fill")
-                        .font(.caption.bold())
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Color.green, in: Capsule())
-                }
-                Text("\(snapshot.activeCount) active")
-                    .font(.subheadline.bold())
-            }
+// MARK: - Connection
+
+/// Live / connecting / unreachable, in a word and a glyph.
+struct ConnectionPill: View {
+    let state: AgentStreamClient.ConnectionState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .symbolEffect(.variableColor, isActive: isLive && !reduceMotion)
+            Text(word)
         }
-        .font(.subheadline)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(tint.opacity(0.14), in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connection")
+        .accessibilityValue(word)
+    }
+
+    private var isLive: Bool {
+        if case .live = state { return true }
+        if case .connecting = state { return true }
+        return false
+    }
+
+    private var word: String {
+        switch state {
+        case .live: return "Live"
+        case .connecting: return "Connecting"
+        case .failed: return "Offline"
+        case .idle: return "Paused"
+        }
+    }
+
+    private var symbol: String {
+        switch state {
+        case .live: return "dot.radiowaves.left.and.right"
+        case .connecting: return "arrow.triangle.2.circlepath"
+        case .failed: return "antenna.radiowaves.left.and.right.slash"
+        case .idle: return "pause.circle"
+        }
+    }
+
+    private var tint: Color {
+        switch state {
+        case .live: return .green
+        case .connecting: return .orange
+        case .failed: return .red
+        case .idle: return .secondary
+        }
+    }
+}
+
+/// Anything the list cannot show: empty, connecting, unreachable.
+struct BoardMessage<Actions: View>: View {
+    let symbol: String
+    let title: String
+    let message: String
+    var tint: Color = .secondary
+    @ViewBuilder var actions: () -> Actions
+
+    init(
+        symbol: String,
+        title: String,
+        message: String,
+        tint: Color = .secondary,
+        @ViewBuilder actions: @escaping () -> Actions = { EmptyView() }
+    ) {
+        self.symbol = symbol
+        self.title = title
+        self.message = message
+        self.tint = tint
+        self.actions = actions
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: symbol)
+                .font(.largeTitle)
+                .foregroundStyle(tint)
+            Text(title)
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            actions()
+                .buttonStyle(.bordered)
+                .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+        .listRowBackground(Color.clear)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// First run: three things to do, not a blank screen.
+struct SetupChecklist: View {
+    let openSettings: () -> Void
+
+    var body: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Point SidePulse at your Mac")
+                    .font(.headline)
+                checklist("1", "Run `sidepulse live-activity` on the Mac you want to watch.")
+                checklist("2", "Put its address in Settings — the app talks to it over your network.")
+                checklist("3", "Optional: plug in a SidePulse Dot to see the same state as light.")
+                Button("Open Settings", systemImage: "gearshape", action: openSettings)
+                    .buttonStyle(.borderedProminent)
+                    .padding(.top, 4)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func checklist(_ number: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(number)
+                .font(.caption.weight(.bold).monospacedDigit())
+                .foregroundStyle(.white)
+                .frame(width: 18, height: 18)
+                .background(Color.accentColor, in: Circle())
+            Text(text)
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
 // MARK: - Second pane
 
-/// Usage meters and the Dot, side by side with the sessions instead of far
-/// below them, on displays wide enough to show both.
+/// Usage meters and the Dot, beside the sessions instead of far below them,
+/// wherever the display has room for both.
 struct AgentsDashboard: View {
     @ObservedObject var model: AppModel
     @ObservedObject var usage: UsageClient
-    @ObservedObject private var mirror = DotStatusMirror.shared
+    let openDot: () -> Void
 
     var body: some View {
         List {
             UsageSection(usage: usage)
 
             Section {
-                DotBehaviorControls(model: model)
+                Button {
+                    openDot()
+                } label: {
+                    DotStatusRow(model: model)
+                }
+                .buttonStyle(.plain)
             } header: {
                 Text("SidePulse Dot")
             }
@@ -472,115 +562,7 @@ struct AgentsDashboard: View {
     }
 }
 
-/// What a session is doing, and the way into it — the pane the sessions list
-/// feeds when the display is wide enough to keep both on screen.
-struct AgentSessionDetail: View {
-    let agent: AgentSnapshot.Agent
-    var updatedAt: Double?
-    var isUnread: Bool
-    /// Returns the pane to the usage / Dot dashboard. Absent where the shell
-    /// owns the column itself.
-    var close: (() -> Void)?
-
-    var body: some View {
-        List {
-            Section {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .top) {
-                        Text(agent.name)
-                            .font(.title3.weight(.semibold))
-                            .fixedSize(horizontal: false, vertical: true)
-                        if let close {
-                            Spacer(minLength: 8)
-                            Button(action: close) {
-                                Label("Close session", systemImage: "xmark.circle.fill")
-                                    .labelStyle(.iconOnly)
-                                    .font(.title3)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        Label(
-                            AgentModeStyle.label(agent.mode),
-                            systemImage: AgentModeStyle.symbol(agent.mode)
-                        )
-                        .font(.subheadline.bold())
-                        .foregroundStyle(modeColor)
-
-                        if let provider = agent.provider {
-                            Text(provider.capitalized)
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color(.tertiarySystemFill))
-                                .clipShape(Capsule())
-                        }
-
-                        if isUnread {
-                            Text("NEW")
-                                .font(.caption2.bold())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green, in: Capsule())
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-
-            Section("Session") {
-                if let cwd = agent.cwd {
-                    LabeledContent("Project", value: cwd)
-                }
-                if let detail = agent.detail {
-                    LabeledContent("Activity", value: detail)
-                }
-                if let finishedAt = agent.finishedAt {
-                    LabeledContent("Finished") {
-                        Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
-                            + Text(" ago")
-                    }
-                }
-                if let updatedAt {
-                    LabeledContent("Last update") {
-                        Text(Date(timeIntervalSince1970: updatedAt), style: .relative)
-                            + Text(" ago")
-                    }
-                }
-            }
-
-            Section {
-                Button {
-                    openAgentSession(agent)
-                } label: {
-                    Label(openLabel, systemImage: "arrow.up.forward.app")
-                }
-            } footer: {
-                Text(
-                    agent.deepLink == nil
-                        ? "Opens the provider's app; this session has no conversation link yet."
-                        : "Opens this conversation directly."
-                )
-            }
-        }
-    }
-
-    private var openLabel: String {
-        guard let provider = agent.provider else { return "Open session" }
-        return "Open in \(provider.capitalized)"
-    }
-
-    private var modeColor: Color {
-        let (r, g, b) = AgentModeStyle.rgb(agent.mode)
-        return Color(red: r, green: g, blue: b)
-    }
-}
-
-// MARK: - Row
+// MARK: - Session opening
 
 /// A Remote-Control session deep-links to the exact conversation; otherwise
 /// fall back to opening the provider app.
@@ -589,128 +571,14 @@ func openAgentSession(_ agent: AgentSnapshot.Agent) {
         openFirstAvailable([url])
         return
     }
-    let provider = agent.provider ?? String(agent.id.split(separator: ":").first ?? "")
-    let candidates: [URL]
-    switch provider {
+    switch agent.providerName {
     case "claude":
-        candidates = [URL(string: "claude://")!, URL(string: "https://claude.ai")!]
+        openFirstAvailable([URL(string: "claude://")!, URL(string: "https://claude.ai")!])
     case "codex":
-        candidates = [URL(string: "chatgpt://")!, URL(string: "https://chatgpt.com")!]
+        openFirstAvailable([URL(string: "chatgpt://")!, URL(string: "https://chatgpt.com")!])
     case "paseo":
-        candidates = [URL(string: "paseo://")!]
+        openFirstAvailable([URL(string: "paseo://")!])
     default:
-        return
-    }
-    openFirstAvailable(candidates)
-}
-
-private struct AgentLiveRow: View {
-    let agent: AgentSnapshot.Agent
-    let isUnread: Bool
-    let isSelected: Bool
-    var isGlance = false
-    let activate: () -> Void
-
-    var body: some View {
-        Button {
-            activate()
-        } label: {
-            rowContent
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var rowContent: some View {
-        HStack(spacing: 0) {
-            // Unread sessions carry a green edge bar so they are obvious
-            // even at a glance down a long list.
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(isUnread ? Color.green : Color.clear)
-                .frame(width: 4)
-                .padding(.trailing, isUnread ? 8 : 0)
-            details
-        }
-    }
-
-    private var details: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .top, spacing: 10) {
-                glyph
-                    .font(.system(size: 13))
-                    .foregroundStyle(color(agent.mode))
-                    .frame(width: 16)
-                    .padding(.top, 3)
-                VStack(alignment: .leading, spacing: 3) {
-                    if isUnread {
-                        Text("NEW")
-                            .font(.caption2.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.green, in: Capsule())
-                    }
-                    Text(agent.name)
-                        .font(isUnread ? .body.weight(.bold) : .body)
-                        // A short display shows more sessions than it shows
-                        // words: one line each, truncated.
-                        .lineLimit(isGlance ? 1 : nil)
-                        .fixedSize(horizontal: false, vertical: !isGlance)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            HStack(spacing: 6) {
-                if let provider = agent.provider {
-                    Text(provider.capitalized)
-                        .font(.caption2.bold())
-                        .lineLimit(1)
-                        .fixedSize()
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color(.tertiarySystemFill))
-                        .clipShape(Capsule())
-                }
-                Text(secondaryLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 6)
-                Text(AgentModeStyle.label(agent.mode))
-                    .font(.caption.bold())
-                    .foregroundStyle(color(agent.mode))
-                    .fixedSize()
-                if let finishedAt = agent.finishedAt {
-                    Text(Date(timeIntervalSince1970: finishedAt), style: .relative)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                } else if isSelected {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                } else {
-                    Image(systemName: "arrow.up.forward.app")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .padding(.leading, 20)
-        }
-    }
-
-    /// Unread finished sessions pulse until opened.
-    @ViewBuilder
-    private var glyph: some View {
-        Image(systemName: AgentModeStyle.symbol(agent.mode))
-            .symbolEffect(.pulse, isActive: isUnread)
-    }
-
-    private var secondaryLine: String {
-        let parts = [agent.cwd, agent.detail].compactMap { $0 }
-        return parts.isEmpty ? AgentModeStyle.label(agent.mode) : parts.joined(separator: " · ")
-    }
-
-    private func color(_ mode: String) -> Color {
-        let (r, g, b) = AgentModeStyle.rgb(mode)
-        return Color(red: r, green: g, blue: b)
+        break
     }
 }

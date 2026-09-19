@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 #if canImport(ActivityKit)
 import ActivityKit
 #endif
@@ -60,6 +61,21 @@ enum AgentModeStyle {
         case "blocked_error": return "exclamationmark.triangle.fill"
         case "idle_ready": return "moon.fill"
         default: return "circle.fill"
+        }
+    }
+
+    /// The app's state colours, shared with the Live Activity so a card and
+    /// the list read the same. System colours carry their own light, dark and
+    /// Increased Contrast variants.
+    static func tint(_ mode: String) -> Color {
+        switch mode {
+        case "blocked_error": return .red
+        case "waiting_for_input": return .orange
+        case "working": return .blue
+        case "tool_running": return .indigo
+        case "long_task_progress": return .purple
+        case "completed": return .green
+        default: return .secondary
         }
     }
 

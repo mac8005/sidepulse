@@ -46,14 +46,13 @@ private struct ModeGroups {
 }
 
 private extension Color {
-    static let statusWorking = Color(red: 0.25, green: 0.85, blue: 0.95)
-    static let statusWaiting = Color(red: 1.0, green: 0.62, blue: 0.11)
-    static let statusBlocked = Color(red: 1.0, green: 0.28, blue: 0.29)
-    static let statusDone = Color(red: 0.29, green: 0.87, blue: 0.42)
+    static let statusWorking = Color.blue
+    static let statusWaiting = Color.orange
+    static let statusBlocked = Color.red
+    static let statusDone = Color.green
 
     static func forMode(_ mode: String) -> Color {
-        let (r, g, b) = AgentModeStyle.rgb(mode)
-        return Color(red: r, green: g, blue: b)
+        AgentModeStyle.tint(mode)
     }
 }
 

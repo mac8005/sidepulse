@@ -1,18 +1,25 @@
 import SwiftUI
 
-/// "Usage" section of the Mac Agents screen: one row per provider with a
-/// meter per rate-limit window and a live countdown to its reset.
+/// What is left of each agent's rate limits. One card per provider, one meter
+/// per window: the percentage and the countdown to its reset sit on the same
+/// line as the label, so a glance answers "can I still work today".
 struct UsageSection: View {
     @ObservedObject var usage: UsageClient
+    var isDense = false
 
     var body: some View {
         Section {
             if let snapshot = usage.snapshot, !snapshot.providers.isEmpty {
                 ForEach(snapshot.providers) { provider in
-                    UsageProviderRow(provider: provider, usage: usage)
+                    UsageProviderRow(provider: provider, usage: usage, isDense: isDense)
                 }
+            } else if let message = usage.snapshot?.error ?? usage.failure {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             } else {
-                Text(usage.snapshot?.error ?? usage.failure ?? "Waiting for data…")
+                Label("Reading usage…", systemImage: "gauge.with.needle")
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
         } header: {
@@ -24,12 +31,12 @@ struct UsageSection: View {
 
     @ViewBuilder
     private var footer: some View {
-        if usage.snapshot?.providers.contains(where: { $0.tokenCost != nil }) == true {
-            Text("CodexBar API-price estimates from local logs on the monitored Mac, across accounts. Not your subscription bill.")
-        }
-        if let message = usage.snapshot?.error ?? usage.failure, usage.snapshot?.providers.isEmpty == false {
+        if let message = usage.snapshot?.error ?? usage.failure,
+           usage.snapshot?.providers.isEmpty == false {
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
+        } else if usage.snapshot?.providers.contains(where: { $0.tokenCost != nil }) == true, !isDense {
+            Text("API-price estimates read from local logs on the monitored Mac, across accounts. Not your subscription bill.")
         }
     }
 }
@@ -37,29 +44,15 @@ struct UsageSection: View {
 private struct UsageProviderRow: View {
     let provider: UsageSnapshot.Provider
     @ObservedObject var usage: UsageClient
+    var isDense = false
     @State private var confirmingReset = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Text(provider.label)
-                    .font(.body.weight(.semibold))
-                if let plan = provider.plan, !plan.isEmpty {
-                    Text(plan.uppercased())
-                        .font(.caption2.bold())
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color(.tertiarySystemFill))
-                        .clipShape(Capsule())
-                }
-                Spacer()
-            }
+        VStack(alignment: .leading, spacing: isDense ? 8 : 10) {
+            header
 
-            if let updatedAt = provider.usageUpdatedDate {
-                Text("Usage updated \(updatedAt, format: .dateTime.month().day().hour().minute())")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            ForEach(provider.windows) { window in
+                UsageMeter(window: window, isDense: isDense)
             }
 
             if let error = provider.error, provider.windows.isEmpty {
@@ -68,23 +61,15 @@ private struct UsageProviderRow: View {
                     .foregroundStyle(.orange)
             }
 
-            ForEach(provider.windows) { window in
-                UsageWindowRow(window: window)
-            }
-
-            if let cost = provider.tokenCost {
-                UsageTokenCostRows(cost: cost)
-            } else if let error = provider.tokenCostError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if !isDense, let cost = provider.tokenCost {
+                UsageCost(cost: cost)
             }
 
             if let credits = provider.resetCredits {
                 resetCredits(credits)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, isDense ? 2 : 4)
         .confirmationDialog(
             "Use one free Codex reset now?",
             isPresented: $confirmingReset,
@@ -98,6 +83,28 @@ private struct UsageProviderRow: View {
         }
     }
 
+    private var header: some View {
+        HStack(spacing: 6) {
+            Text(provider.label)
+                .font(.headline)
+            if let plan = provider.plan, !plan.isEmpty {
+                Text(plan.uppercased())
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+            }
+            Spacer(minLength: 0)
+            if let updatedAt = provider.usageUpdatedDate {
+                Text(updatedAt, style: .relative)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .accessibilityLabel("Read")
+            }
+        }
+    }
+
     /// Only Codex reports reset credits; a zero count still tells the user
     /// there is nothing to fall back on when the weekly meter runs out.
     @ViewBuilder
@@ -105,14 +112,7 @@ private struct UsageProviderRow: View {
         HStack(spacing: 8) {
             if credits > 0 {
                 Label {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("\(credits) free reset\(credits == 1 ? "" : "s") available")
-                        if let expiresAt = provider.resetCreditsExpireAt {
-                            Text("First expires \(Date(timeIntervalSince1970: expiresAt), format: .dateTime.day().month())")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .fixedSize(horizontal: false, vertical: true)
+                    Text("\(credits) free reset\(credits == 1 ? "" : "s")")
                 } icon: {
                     Image(systemName: "arrow.counterclockwise.circle.fill")
                 }
@@ -123,15 +123,13 @@ private struct UsageProviderRow: View {
                     confirmingReset = true
                 } label: {
                     if usage.isApplyingReset {
-                        ProgressView()
-                            .controlSize(.mini)
+                        ProgressView().controlSize(.mini)
                     } else {
-                        Text("Apply")
-                            .font(.caption.bold())
+                        Text("Apply").font(.caption.weight(.semibold))
                     }
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
+                .controlSize(.small)
                 .disabled(usage.isApplyingReset)
             } else {
                 Label("No free resets", systemImage: "arrow.counterclockwise.circle")
@@ -147,79 +145,48 @@ private struct UsageProviderRow: View {
     }
 }
 
-private struct UsageTokenCostRows: View {
-    let cost: UsageSnapshot.TokenCost
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Est. API cost · USD")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            period(cost.todayLabel, value: cost.today)
-            period("Last 30 days", value: cost.last30Days)
-            if cost.partial {
-                Text("Partial estimate: some history or model prices are missing.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if cost.stale {
-                Text("Refresh unavailable. Last estimate: \(Date(timeIntervalSince1970: cost.updatedAt), format: .dateTime.month().day().hour().minute())")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.top, 4)
-    }
-
-    private func period(_ label: String, value: UsageSnapshot.TokenCost.Period) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(label)
-                if let tokens = value.tokens {
-                    Text("\(tokens, format: .number.notation(.compactName).precision(.significantDigits(1...3))) tokens")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 4)
-            if let amount = value.costUSD {
-                Text("≈ \(amount, format: .currency(code: "USD"))")
-                    .fontWeight(.semibold)
-                    .monospacedDigit()
-                    .fixedSize()
-            } else {
-                Text("Not priced")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .font(.caption)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct UsageWindowRow: View {
+/// One rate-limit window: label, countdown, percentage, bar. The colour is a
+/// threshold, and the percentage next to it says the same thing in numbers.
+private struct UsageMeter: View {
     let window: UsageSnapshot.Window
+    var isDense = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(window.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let resetsAt = window.resetsAt {
-                    (Text("resets in ") + Text(Date(timeIntervalSince1970: resetsAt), style: .relative))
-                        .font(.caption)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let resetsAt = window.resetsAt, !isDense {
+                    Text(Date(timeIntervalSince1970: resetsAt), style: .relative)
+                        .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
                 Text("\(window.usedPercent)%")
-                    .font(.caption.bold().monospacedDigit())
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
                     .foregroundStyle(tint)
             }
-            ProgressView(value: Double(window.usedPercent), total: 100)
-                .tint(tint)
+            Capsule()
+                .fill(.quaternary)
+                .frame(height: isDense ? 5 : 7)
+                .overlay(alignment: .leading) {
+                    GeometryReader { proxy in
+                        Capsule()
+                            .fill(tint)
+                            .frame(width: proxy.size.width * fraction)
+                    }
+                }
+                .clipShape(Capsule())
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(window.label)
+        .accessibilityValue(accessibilityValue)
+    }
+
+    private var fraction: Double {
+        min(1, max(0, Double(window.usedPercent) / 100))
     }
 
     private var tint: Color {
@@ -228,5 +195,54 @@ private struct UsageWindowRow: View {
         case ..<85: return .orange
         default: return .red
         }
+    }
+
+    private var accessibilityValue: String {
+        var value = "\(window.usedPercent) percent used"
+        if let resetsAt = window.resetsAt {
+            let minutes = Int((resetsAt - Date().timeIntervalSince1970) / 60)
+            if minutes > 0 {
+                value += minutes < 120
+                    ? ", resets in \(minutes) minutes"
+                    : ", resets in \(minutes / 60) hours"
+            }
+        }
+        return value
+    }
+}
+
+private struct UsageCost: View {
+    let cost: UsageSnapshot.TokenCost
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            period(cost.todayLabel, cost.today)
+            period("Last 30 days", cost.last30Days)
+            if cost.partial || cost.stale {
+                Text(cost.stale
+                     ? "Last estimate \(Date(timeIntervalSince1970: cost.updatedAt), format: .dateTime.hour().minute())"
+                     : "Partial estimate: some history or model prices are missing.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func period(_ label: String, _ value: UsageSnapshot.TokenCost.Period) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            if let amount = value.costUSD {
+                Text(amount, format: .currency(code: "USD"))
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
+            } else {
+                Text("Not priced").foregroundStyle(.tertiary)
+            }
+        }
+        .font(.caption)
+        .accessibilityElement(children: .combine)
     }
 }

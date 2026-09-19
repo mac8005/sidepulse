@@ -30,6 +30,8 @@
         9F0000010000000000000050 /* DemoData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000150 /* DemoData.swift */; };
         9F0000010000000000000051 /* DuoLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000151 /* DuoLayout.swift */; };
         9F0000010000000000000052 /* AgentsStatusBoard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000152 /* AgentsStatusBoard.swift */; };
+        9F0000010000000000000053 /* AgentStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000153 /* AgentStatus.swift */; };
+        9F0000010000000000000054 /* DotScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000154 /* DotScreen.swift */; };
         9F0000010000000000000045 /* SessionLinks.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000145 /* SessionLinks.swift */; };
         9F0000010000000000000016 /* SidePulseWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000119 /* SidePulseWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
         9F0000010000000000000024 /* WatchRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0000010000000000000126 /* WatchRelay.swift */; };
@@ -164,6 +166,8 @@
         9F0000010000000000000150 /* DemoData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoData.swift; sourceTree = "<group>"; };
         9F0000010000000000000151 /* DuoLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuoLayout.swift; sourceTree = "<group>"; };
         9F0000010000000000000152 /* AgentsStatusBoard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentsStatusBoard.swift; sourceTree = "<group>"; };
+        9F0000010000000000000153 /* AgentStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStatus.swift; sourceTree = "<group>"; };
+        9F0000010000000000000154 /* DotScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DotScreen.swift; sourceTree = "<group>"; };
         9F0000010000000000000145 /* SessionLinks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionLinks.swift; sourceTree = "<group>"; };
         9F0000010000000000000119 /* SidePulseWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SidePulseWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
         9F0000010000000000000122 /* SidePulseWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidePulseWatchApp.swift; sourceTree = "<group>"; };
@@ -274,6 +278,8 @@
                 9F0000010000000000000150 /* DemoData.swift */,
                 9F0000010000000000000151 /* DuoLayout.swift */,
                 9F0000010000000000000152 /* AgentsStatusBoard.swift */,
+                9F0000010000000000000153 /* AgentStatus.swift */,
+                9F0000010000000000000154 /* DotScreen.swift */,
                 9F0000010000000000000145 /* SessionLinks.swift */,
                 9F0000010000000000000134 /* DotStatusMirror.swift */,
                 9F0000010000000000000140 /* DotNotificationShared.swift */,
@@ -594,6 +600,8 @@
                 9F0000010000000000000050 /* DemoData.swift in Sources */,
                 9F0000010000000000000051 /* DuoLayout.swift in Sources */,
                 9F0000010000000000000052 /* AgentsStatusBoard.swift in Sources */,
+                9F0000010000000000000053 /* AgentStatus.swift in Sources */,
+                9F0000010000000000000054 /* DotScreen.swift in Sources */,
                 9F0000010000000000000045 /* SessionLinks.swift in Sources */,
                 9F0000010000000000000034 /* DotStatusMirror.swift in Sources */,
                 9F000001000000000000003F /* DotNotificationShared.swift in Sources */,

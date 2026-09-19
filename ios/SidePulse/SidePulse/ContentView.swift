@@ -2,18 +2,15 @@ import SwiftUI
 import UIKit
 import UserNotifications
 
+/// Where the app starts and the only navigation it has: the board, with the
+/// Dot and Settings one push away. There is no landing screen in front of the
+/// thing people opened the app to see.
 @MainActor
 struct ContentView: View {
     @StateObject private var model: AppModel
-    @ObservedObject private var stream = DotStatusMirror.shared.stream
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var isShowingFolderPicker = false
     @State private var activeSheet: ActiveSheet?
-    /// The app opens straight into Mac Agents; the home screen sits behind it.
-    @State private var path: [Route] = [.agents]
-    /// Only the three-column shell uses these.
-    @State private var duoDestination: DuoDestination? = .agents
-    @State private var selectedAgentID: String?
+    @State private var path: [Route] = []
 
     init() {
         _model = StateObject(wrappedValue: AppModel.shared)
@@ -28,8 +25,8 @@ struct ContentView: View {
     private mutating func applyDemoScreen() {
 #if DEBUG && SIDEPULSE_MAIN_APP
         switch DemoData.screen {
-        case "home": _path = State(initialValue: [])
-        case "settings": _path = State(initialValue: [.agents, .settings])
+        case "dot": _path = State(initialValue: [.dot])
+        case "settings": _path = State(initialValue: [.settings])
         case "token": _activeSheet = State(initialValue: .token)
         case "folder": _activeSheet = State(initialValue: .folderSetup)
         default: break
@@ -38,11 +35,26 @@ struct ContentView: View {
     }
 
     var body: some View {
-        shell
+        NavigationStack(path: $path) {
+            BoardScreen(model: model, path: $path)
+                .navigationDestination(for: Route.self) { route in
+                    switch route {
+                    case .dot:
+                        DotScreen(model: model, showFolderPicker: showFolderPicker)
+                    case .settings:
+                        SettingsView(
+                            model: model,
+                            requestPushToken: requestPushToken,
+                            showFolderPicker: showFolderPicker,
+                            showToken: { activeSheet = .token }
+                        )
+                    }
+                }
+        }
+        .duoStripBehavior()
         .onOpenURL { url in
             if url.host == "agents" {
-                path = [.agents]
-                duoDestination = .agents
+                path = []
             }
         }
         .sheet(item: $activeSheet) { sheet in
@@ -50,9 +62,7 @@ struct ContentView: View {
             case .token:
                 TokenSheet(model: model, requestPushToken: requestPushToken)
             case .folderSetup:
-                FolderSetupSheet {
-                    showFolderPicker()
-                }
+                FolderSetupSheet { showFolderPicker() }
             }
         }
         .sheet(isPresented: $isShowingFolderPicker) {
@@ -69,157 +79,7 @@ struct ContentView: View {
                 isShowingFolderPicker = false
             }
         }
-        .onAppear {
-            model.refreshFolderStatus()
-        }
-    }
-
-    // MARK: - Shell
-
-    @ViewBuilder
-    private var shell: some View {
-        if horizontalSizeClass == .regular, DuoVariant.current == .c {
-            threeColumnShell
-        } else {
-            NavigationStack(path: $path) {
-                homeScreen
-                    .navigationTitle("SidePulse")
-                    .duoCompactTitle()
-                    .navigationDestination(for: Route.self) { route in
-                        switch route {
-                        case .agents:
-                            AgentsLiveView(model: model)
-                        case .settings:
-                            SettingsView(
-                                model: model,
-                                requestPushToken: requestPushToken,
-                                showFolderPicker: showFolderPicker
-                            )
-                        }
-                    }
-                    .toolbar {
-                        ToolbarItem(placement: .topBarTrailing) {
-                            NavigationLink(value: Route.settings) {
-                                // Title and icon both: the system needs the
-                                // icon to move the item into the vertical bar
-                                // strip, and the title to label it in the
-                                // overflow menu.
-                                Label("Settings", systemImage: "gearshape")
-                            }
-                        }
-                    }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var homeScreen: some View {
-        if horizontalSizeClass == .regular {
-            DuoSplit {
-                homePanels
-            } secondary: {
-                homePatterns
-            }
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    homePanelStack
-                    QuickPatternsPanel { pattern in
-                        Task { await write(pattern) }
-                    }
-                }
-                .padding(16)
-            }
-            .background(Color(.systemGroupedBackground))
-        }
-    }
-
-    private var homePanels: some View {
-        ScrollView {
-            homePanelStack
-                .padding(16)
-        }
-        .background(Color(.systemGroupedBackground))
-    }
-
-    private var homePatterns: some View {
-        ScrollView {
-            QuickPatternsPanel { pattern in
-                Task { await write(pattern) }
-            }
-            .padding(16)
-        }
-        .background(Color(.systemGroupedBackground))
-    }
-
-    private var homePanelStack: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            MacAgentsPanel(model: model)
-
-            HeaderPanel(model: model) {
-                activeSheet = .token
-                requestPushToken()
-            }
-
-            SidePulseDotSetupPanel(model: model) {
-                activeSheet = .folderSetup
-            }
-        }
-    }
-
-    /// Variant C: destinations, sessions and the selected session at once.
-    private var threeColumnShell: some View {
-        NavigationSplitView {
-            List(DuoDestination.allCases, id: \.self, selection: $duoDestination) { destination in
-                Label(destination.title, systemImage: destination.symbol)
-            }
-            .navigationTitle("SidePulse")
-        } content: {
-            switch duoDestination ?? .agents {
-            case .agents:
-                AgentsLiveView(
-                    model: model,
-                    layout: .listOnly,
-                    externalSelection: $selectedAgentID
-                )
-            case .dashboard:
-                AgentsDashboard(model: model, usage: .shared)
-                    .navigationTitle("Usage & Dot")
-            case .home:
-                homeScreen
-                    .navigationTitle("SidePulse")
-            case .settings:
-                SettingsView(
-                    model: model,
-                    requestPushToken: requestPushToken,
-                    showFolderPicker: showFolderPicker
-                )
-            }
-        } detail: {
-            if let agent = selectedDuoAgent {
-                AgentSessionDetail(
-                    agent: agent,
-                    updatedAt: stream.snapshot?.updatedAt,
-                    isUnread: agent.unread == true && agent.finishedAt != nil
-                )
-                .navigationTitle("Session")
-            } else {
-                VStack(spacing: 8) {
-                    Image(systemName: "sidebar.squares.right")
-                        .font(.largeTitle)
-                        .foregroundStyle(.tertiary)
-                    Text("Select a session")
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(.systemGroupedBackground))
-            }
-        }
-    }
-
-    private var selectedDuoAgent: AgentSnapshot.Agent? {
-        guard let selectedAgentID else { return nil }
-        return stream.snapshot?.agents.first { $0.id == selectedAgentID }
+        .onAppear { model.refreshFolderStatus() }
     }
 
     private func requestPushToken() {
@@ -229,7 +89,6 @@ struct ContentView: View {
                     model.recordError(error)
                     return
                 }
-
                 UIApplication.shared.registerForRemoteNotifications()
                 model.lastMessage = "Registering with APNs"
             }
@@ -242,43 +101,10 @@ struct ContentView: View {
             isShowingFolderPicker = true
         }
     }
-
-    private func write(_ pattern: LEDPattern) async {
-        let pushBase = ReceivedPush(
-            source: "Quick Pattern",
-            title: pattern.displayName,
-            body: pattern.detail,
-            patternName: pattern.name,
-            ledText: pattern.ledText,
-            payloadSummary: "{\"pattern\":\"\(pattern.name)\"}",
-            writeStatus: .received
-        )
-
-        guard model.hasFolderAccess else {
-            var push = pushBase
-            push.writeStatus = .noFolder
-            model.recordReceivedPush(push)
-            activeSheet = .folderSetup
-            return
-        }
-
-        do {
-            let targetURL = try await DriveWriter.shared.write(pattern.ledText)
-            var push = pushBase
-            push.body = "Wrote \(targetURL.lastPathComponent)"
-            push.writeStatus = .wrote
-            model.recordReceivedPush(push)
-        } catch {
-            var push = pushBase
-            push.writeStatus = .failed
-            push.errorMessage = error.localizedDescription
-            model.recordReceivedPush(push)
-        }
-    }
 }
 
 enum Route: Hashable {
-    case agents
+    case dot
     case settings
 }
 
@@ -288,250 +114,19 @@ private enum ActiveSheet: Identifiable {
 
     var id: String {
         switch self {
-        case .token:
-            return "token"
-        case .folderSetup:
-            return "folderSetup"
+        case .token: return "token"
+        case .folderSetup: return "folderSetup"
         }
     }
 }
 
-private struct HeaderPanel: View {
-    @ObservedObject var model: AppModel
-    let getToken: () -> Void
-
-    var body: some View {
-        Panel {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Label("SidePulse", systemImage: "dot.radiowaves.left.and.right")
-                            .font(.title2.weight(.semibold))
-                        Text("Push inbox and SidePulse Dot writer")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    StatusPill(isConnected: model.hasFolderAccess)
-                }
-
-                Button {
-                    getToken()
-                } label: {
-                    Label(model.pushToken.isEmpty ? "Get Push Token" : "Show Push Token", systemImage: "key.horizontal")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-    }
-}
-
-private struct StatusPill: View {
-    let isConnected: Bool
-
-    var body: some View {
-        Label(isConnected ? "Folder connected" : "No folder", systemImage: isConnected ? "checkmark.circle.fill" : "exclamationmark.circle")
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(isConnected ? Color.green : Color.orange)
-            .lineLimit(1)
-    }
-}
-
-private struct SidePulseDotSetupPanel: View {
-    @ObservedObject var model: AppModel
-    let openSetup: () -> Void
-
-    var body: some View {
-        Panel {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: "externaldrive")
-                        .font(.title2)
-                        .foregroundStyle(model.hasFolderAccess ? Color.green : Color.accentColor)
-                        .frame(width: 34, height: 34)
-
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("SidePulse Dot Folder")
-                            .font(.headline)
-                        Text(model.selectedFolderPath)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-
-                Button {
-                    openSetup()
-                } label: {
-                    Label(model.hasFolderAccess ? "Change LED Folder" : "Set Up SidePulse Dot Folder", systemImage: "folder.badge.plus")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-    }
-}
-
-private struct QuickPatternsPanel: View {
-    let writePattern: (LEDPattern) -> Void
-    @State private var fold = DuoFold()
-    @State private var availableWidth: CGFloat = 0
-
-    private static let minimumItemWidth: CGFloat = 150
-    private static let spacing: CGFloat = 10
-
-    /// As many columns as fit, but an even number on a display that folds, so
-    /// the crease runs between columns instead of through one.
-    private var columns: [GridItem] {
-        let count = duoColumnCount(
-            availableWidth: availableWidth,
-            minimumItemWidth: Self.minimumItemWidth,
-            spacing: Self.spacing,
-            fold: fold
-        )
-        return Array(repeating: GridItem(.flexible(), spacing: Self.spacing), count: count)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Quick Patterns")
-                .font(.headline)
-
-            LazyVGrid(columns: columns, spacing: 10) {
-                ForEach(LEDPatternCatalog.patterns) { pattern in
-                    Button {
-                        writePattern(pattern)
-                    } label: {
-                        PatternButtonLabel(pattern: pattern)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .duoFold($fold)
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { availableWidth = $0 }
-    }
-}
-
-private struct PatternButtonLabel: View {
-    let pattern: LEDPattern
-
-    var body: some View {
-        Panel {
-            HStack(spacing: 10) {
-                Circle()
-                    .fill(Color(hex: pattern.tintHex))
-                    .frame(width: 12, height: 12)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(pattern.displayName)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Text(pattern.name)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-        }
-    }
-}
-
-private struct TokenSheet: View {
-    @ObservedObject var model: AppModel
-    let requestPushToken: () -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Push Token") {
-                    if model.pushToken.isEmpty {
-                        Text("No token yet")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(model.pushToken)
-                            .font(.system(.footnote, design: .monospaced))
-                            .textSelection(.enabled)
-
-                        Button {
-                            UIPasteboard.general.string = model.pushToken
-                            model.lastMessage = "Copied push token"
-                        } label: {
-                            Label("Copy Token", systemImage: "doc.on.doc")
-                        }
-                    }
-
-                    Button {
-                        requestPushToken()
-                    } label: {
-                        Label("Request Token", systemImage: "bell.badge")
-                    }
-                }
-            }
-            .navigationTitle("Push Token")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-            .duoHorizontalSheetBar()
-        }
-    }
-}
-
-private struct FolderSetupSheet: View {
-    let openPicker: () -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 18) {
-                Label("SidePulse Dot Device in Files", systemImage: "externaldrive")
-                    .font(.title3.weight(.semibold))
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("1. Attach the SidePulse Dot USB drive to this iPhone or iPad.")
-                    Text("2. Open Files and select the SidePulse Dot USB drive folder containing LEDS.LED.")
-                    Text("3. SidePulse will remember that folder for later pushes and Shortcuts.")
-                }
-                .font(.body)
-                .foregroundStyle(.secondary)
-
-                Button {
-                    dismiss()
-                    openPicker()
-                } label: {
-                    Label("Open Files", systemImage: "folder")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-
-                Spacer()
-            }
-            .padding(20)
-            .navigationTitle("Set Up Folder")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-            .duoHorizontalSheetBar()
-        }
-    }
-}
+// MARK: - Settings
 
 private struct SettingsView: View {
     @ObservedObject var model: AppModel
     let requestPushToken: () -> Void
     let showFolderPicker: () -> Void
+    let showToken: () -> Void
     @State private var diagnosticsExport: DiagnosticsExport?
     @State private var isShowingDiagnosticsError = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -548,181 +143,141 @@ private struct SettingsView: View {
             }
     }
 
-    /// One long form on a phone; on a display wide enough for two panes the
-    /// device settings and the server / diagnostics half sit side by side, so
-    /// neither needs scrolling past the other.
+    /// One form on a phone; on a display wide enough for two panes the Mac
+    /// half and the phone half sit side by side instead of one long scroll.
     @ViewBuilder
     private var settings: some View {
         if horizontalSizeClass == .regular {
             DuoSplit {
-                Form { deviceSections }
+                Form { macSections }
             } secondary: {
-                Form { serverSections }
+                Form { phoneSections }
             }
         } else {
             Form {
-                deviceSections
-                serverSections
+                macSections
+                phoneSections
             }
         }
     }
 
     @ViewBuilder
-    private var deviceSections: some View {
-            Section("Push Token") {
-                Button {
-                    requestPushToken()
-                } label: {
-                    Label("Get Push Token", systemImage: "key.horizontal")
+    private var macSections: some View {
+        Section {
+            TextField("http://your-mac.local:8787", text: $model.liveMonitorServerURL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Toggle("Live Activity for agents", isOn: $model.liveMonitorEnabled)
+                .onChange(of: model.liveMonitorEnabled) { _, enabled in
+                    if enabled { LiveMonitorManager.shared.start(model: model) }
                 }
+        } header: {
+            Text("Monitored Mac")
+        } footer: {
+            Text("Run `sidepulse live-activity` on that Mac. It streams agent status to this phone and keeps the Lock Screen card current.")
+        }
 
-                if model.pushToken.isEmpty {
-                    Text("No token yet")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(model.pushToken)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
-
-                    Button {
-                        UIPasteboard.general.string = model.pushToken
-                        model.lastMessage = "Copied push token"
-                    } label: {
-                        Label("Copy Token", systemImage: "doc.on.doc")
-                    }
-                }
+        Section("Notifications") {
+            Button {
+                requestPushToken()
+            } label: {
+                Label("Register for push", systemImage: "bell.badge")
             }
-
-            Section("SidePulse Dot") {
-                LabeledContent("Folder", value: model.selectedFolderPath)
-
-                Button {
-                    showFolderPicker()
-                } label: {
-                    Label("Set Up LED Folder", systemImage: "folder.badge.plus")
-                }
-
-                DotBehaviorControls(model: model)
+            LabeledContent("Push token") {
+                Text(model.pushToken.isEmpty ? "None yet" : "Registered")
+                    .foregroundStyle(.secondary)
             }
-
-            Section {
-                Toggle("Use a daily schedule", isOn: $model.dndScheduleEnabled)
-
-                if model.dndScheduleEnabled {
-                    DndTimePicker("Start", time: $model.dndStartTime)
-                    DndTimePicker("End", time: $model.dndEndTime)
-                }
-            } header: {
-                Text("DND Schedule")
-            } footer: {
-                Text("The schedule switches DND on/off; you can override it at any time.")
+            Button {
+                showToken()
+            } label: {
+                Label("Show token", systemImage: "key.horizontal")
             }
+            .disabled(model.pushToken.isEmpty)
+        }
 
+        Section("SidePulse Dot") {
+            LabeledContent("Folder") {
+                Text(model.selectedFolderPath)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Button {
+                showFolderPicker()
+            } label: {
+                Label("Choose folder", systemImage: "folder.badge.plus")
+            }
+        }
     }
 
     @ViewBuilder
-    private var serverSections: some View {
-            Section("Live Monitor (Mac Agents)") {
-                LiveMonitorSection(model: model)
-            }
-
-            Section("Advanced Server") {
-                TextField("Proxy base URL", text: $model.serverBaseURL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-
-                SecureField("Shared secret", text: $model.sharedSecret)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                if let endpoint = model.pushEndpointURL {
-                    Text(endpoint)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
+    private var phoneSections: some View {
+        Section {
+            TextField("Proxy base URL", text: $model.serverBaseURL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            SecureField("Shared secret", text: $model.sharedSecret)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            if let curlExample = model.curlExample {
+                Button {
+                    UIPasteboard.general.string = curlExample
+                    model.lastMessage = "Copied curl example"
+                } label: {
+                    Label("Copy curl example", systemImage: "terminal")
                 }
+            }
+        } header: {
+            Text("Push proxy")
+        } footer: {
+            Text("Optional: lets anything that can send an HTTP request light the Dot.")
+        }
 
-                if let curlExample = model.curlExample {
-                    Text(curlExample)
+        Section {
+            TextEditor(text: $model.ledText)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: verticalSizeClass == .compact ? 80 : 120)
+            Button {
+                Task { await writeLocalTest() }
+            } label: {
+                Label("Write to the Dot", systemImage: "square.and.arrow.down")
+            }
+        } header: {
+            Text("Raw LED program")
+        }
+
+        Section("Diagnostics") {
+            Button {
+                shareDiagnostics()
+            } label: {
+                Label("Share log", systemImage: "square.and.arrow.up")
+            }
+            .accessibilityHint("Shares a text file with recent events and current Dot settings")
+            .popover(item: $diagnosticsExport) { export in
+                DiagnosticsShareSheet(url: export.url)
+            }
+            Button {
+                model.refreshEventLog()
+            } label: {
+                Label("Refresh log", systemImage: "arrow.clockwise")
+            }
+            Button(role: .destructive) {
+                model.clearEventLog()
+            } label: {
+                Label("Clear log", systemImage: "trash")
+            }
+            if model.eventLog.isEmpty {
+                Text("No events").foregroundStyle(.secondary)
+            } else {
+                ForEach(model.eventLog.reversed().prefix(40), id: \.self) { line in
+                    Text(line)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
-
-                    Button {
-                        UIPasteboard.general.string = curlExample
-                        model.lastMessage = "Copied curl example"
-                    } label: {
-                        Label("Copy Curl", systemImage: "terminal")
-                    }
                 }
             }
-
-            Section("Raw LED Editor") {
-                TextEditor(text: $model.ledText)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: verticalSizeClass == .compact ? 80 : 140)
-
-                Button {
-                    Task { await writeLocalTest() }
-                } label: {
-                    Label("Write to USB", systemImage: "square.and.arrow.down")
-                }
-
-                if let shortcutURL = model.shortcutWriteURL {
-                    Button {
-                        UIPasteboard.general.string = shortcutURL
-                        model.lastMessage = "Copied Shortcut URL"
-                    } label: {
-                        Label("Copy Shortcut URL", systemImage: "link.badge.plus")
-                    }
-                }
-            }
-
-            Section("Diagnostics") {
-                Button {
-                    shareDiagnostics()
-                } label: {
-                    Label("Share Diagnostics Log", systemImage: "square.and.arrow.up")
-                }
-                .accessibilityHint("Share a text file with recent events and current Dot settings")
-                .popover(item: $diagnosticsExport) { export in
-                    DiagnosticsShareSheet(url: export.url)
-                }
-
-                Text("Includes recent events and current settings. Review the file before sharing.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                Button {
-                    model.refreshEventLog()
-                } label: {
-                    Label("Refresh Log", systemImage: "arrow.clockwise")
-                }
-
-                Button(role: .destructive) {
-                    model.clearEventLog()
-                } label: {
-                    Label("Clear Log", systemImage: "trash")
-                }
-
-                if model.eventLog.isEmpty {
-                    Text("No events")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(model.eventLog.reversed(), id: \.self) { line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-
-            Section("Inbox") {
-                Button(role: .destructive) {
-                    model.clearReceivedPushes()
-                } label: {
-                    Label("Clear Received Pushes", systemImage: "tray.and.arrow.down")
-                }
-            }
+        }
     }
 
     private func shareDiagnostics() {
@@ -797,106 +352,93 @@ private struct DiagnosticsShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
-private struct Panel<Content: View>: View {
-    @ViewBuilder let content: () -> Content
+// MARK: - Sheets
 
-    var body: some View {
-        content()
-            .padding(14)
-            .background(Color(.secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-private extension Color {
-    init(hex: String) {
-        let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var value: UInt64 = 0
-        Scanner(string: cleaned).scanHexInt64(&value)
-
-        let red: UInt64
-        let green: UInt64
-        let blue: UInt64
-
-        switch cleaned.count {
-        case 6:
-            red = (value >> 16) & 0xff
-            green = (value >> 8) & 0xff
-            blue = value & 0xff
-        default:
-            red = 0x3b
-            green = 0x82
-            blue = 0xf6
-        }
-
-        self.init(
-            .sRGB,
-            red: Double(red) / 255,
-            green: Double(green) / 255,
-            blue: Double(blue) / 255,
-            opacity: 1
-        )
-    }
-
-    func rgbHex(fallback: String) -> String {
-        let color = UIColor(self)
-        var red: CGFloat = 0
-        var green: CGFloat = 0
-        var blue: CGFloat = 0
-        var alpha: CGFloat = 0
-        guard color.getRed(&red, green: &green, blue: &blue, alpha: &alpha) else {
-            return fallback
-        }
-        let components = [red, green, blue].map {
-            min(255, max(0, Int(($0 * 255).rounded())))
-        }
-        return String(
-            format: "#%02X%02X%02X",
-            components[0],
-            components[1],
-            components[2]
-        )
-    }
-}
-
-private struct LiveMonitorSection: View {
+private struct TokenSheet: View {
     @ObservedObject var model: AppModel
-    @ObservedObject private var monitor = LiveMonitorManager.shared
+    let requestPushToken: () -> Void
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        TextField("Monitor server URL", text: $model.liveMonitorServerURL)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .keyboardType(.URL)
-
-        Toggle("Live Activity for Mac agents", isOn: $model.liveMonitorEnabled)
-            .onChange(of: model.liveMonitorEnabled) { enabled in
-                if enabled {
-                    LiveMonitorManager.shared.start(model: model)
+        NavigationStack {
+            Form {
+                Section("Push token") {
+                    if model.pushToken.isEmpty {
+                        Text("No token yet").foregroundStyle(.secondary)
+                    } else {
+                        Text(model.pushToken)
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                        Button {
+                            UIPasteboard.general.string = model.pushToken
+                            model.lastMessage = "Copied push token"
+                        } label: {
+                            Label("Copy token", systemImage: "doc.on.doc")
+                        }
+                    }
+                    Button {
+                        requestPushToken()
+                    } label: {
+                        Label("Request token", systemImage: "bell.badge")
+                    }
                 }
             }
-            .disabled(!monitor.isSupported)
-
-        if !monitor.isSupported {
-            Text("Requires iOS 17.2 or later.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            .navigationTitle("Push Token")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .duoHorizontalSheetBar()
         }
-
-        Text(monitor.statusMessage)
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-
-        Text("Runs `sidepulse live-activity` on the Mac. The Mac starts a Live Activity on this phone whenever agents become active and streams their status to the Lock Screen and Dynamic Island.")
-            .font(.caption)
-            .foregroundStyle(.tertiary)
     }
 }
 
-/// Dot behavior controls shared by the Mac Agents screen and Settings.
+private struct FolderSetupSheet: View {
+    let openPicker: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Label("The Dot in Files", systemImage: "externaldrive")
+                    .font(.title3.weight(.semibold))
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("1. Attach the SidePulse Dot to this iPhone.")
+                    Text("2. Open Files and pick the drive's folder — the one that holds LEDS.LED.")
+                    Text("3. SidePulse remembers it for pushes and Shortcuts.")
+                }
+                .font(.body)
+                .foregroundStyle(.secondary)
+                Button {
+                    dismiss()
+                    openPicker()
+                } label: {
+                    Label("Open Files", systemImage: "folder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+            }
+            .padding(20)
+            .navigationTitle("Set Up Folder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .duoHorizontalSheetBar()
+        }
+    }
+}
+
+// MARK: - Dot behaviour
+
+/// The Dot's behaviour, shared by the Dot screen and the desk controls.
 struct DotBehaviorControls: View {
     @ObservedObject var model: AppModel
-    @ObservedObject private var mirror = DotStatusMirror.shared
     @State private var isAppearanceExpanded = false
 
     var body: some View {
@@ -905,11 +447,9 @@ struct DotBehaviorControls: View {
         Slider(value: brightnessPercentage, in: 0...100, step: 1) {
             Text("SidePulse Dot brightness")
         } minimumValueLabel: {
-            Image(systemName: "sun.min")
-                .accessibilityHidden(true)
+            Image(systemName: "sun.min").accessibilityHidden(true)
         } maximumValueLabel: {
-            Image(systemName: "sun.max")
-                .accessibilityHidden(true)
+            Image(systemName: "sun.max").accessibilityHidden(true)
         }
         .accessibilityLabel("SidePulse Dot brightness")
         .accessibilityValue(brightnessLabel)
@@ -926,7 +466,7 @@ struct DotBehaviorControls: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-            Picker("Color palette", selection: palette) {
+            Picker("Colour palette", selection: palette) {
                 ForEach(DotPalette.allCases) { palette in
                     Text(palette.label).tag(palette.rawValue)
                 }
@@ -936,45 +476,14 @@ struct DotBehaviorControls: View {
             }
             .pickerStyle(.menu)
 
-            ColorPicker(
-                "Working",
-                selection: appearanceColor(
-                    \DotAppearance.workingColor,
-                    fallback: DotAppearance.defaultWorkingColor
-                ),
-                supportsOpacity: false
-            )
+            ColorPicker("Working", selection: appearanceColor(\DotAppearance.workingColor, fallback: DotAppearance.defaultWorkingColor), supportsOpacity: false)
+            ColorPicker("Needs input", selection: appearanceColor(\DotAppearance.needsInputColor, fallback: DotAppearance.defaultNeedsInputColor), supportsOpacity: false)
+            ColorPicker("Finished", selection: appearanceColor(\DotAppearance.finishedColor, fallback: DotAppearance.defaultFinishedColor), supportsOpacity: false)
 
-            ColorPicker(
-                "Needs input",
-                selection: appearanceColor(
-                    \DotAppearance.needsInputColor,
-                    fallback: DotAppearance.defaultNeedsInputColor
-                ),
-                supportsOpacity: false
-            )
-
-            ColorPicker(
-                "Finished",
-                selection: appearanceColor(
-                    \DotAppearance.finishedColor,
-                    fallback: DotAppearance.defaultFinishedColor
-                ),
-                supportsOpacity: false
-            )
-
-            Button("Reset Appearance") {
-                model.resetDotAppearance()
-            }
+            Button("Reset appearance") { model.resetDotAppearance() }
         }
 
-        Toggle("Show finished", isOn: $model.showFinishedEnabled)
-
-        if model.showFinishedEnabled {
-            Text("Keeps one LED in the Finished color for unread sessions while the other continues showing active work.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
+        Toggle("Keep finished sessions lit", isOn: $model.showFinishedEnabled)
 
         Toggle("Completion notifications", isOn: Binding(
             get: { model.dotCompletionAlertsEnabled },
@@ -987,28 +496,13 @@ struct DotBehaviorControls: View {
                 .foregroundStyle(.orange)
         }
 
-        Text("Experimental: sends a soundless notification and tries to update the Dot in the background. Requires notification alerts.")
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-
-        Toggle("DND On", isOn: $model.dndEnabled)
-
+        Toggle("Do Not Disturb", isOn: $model.dndEnabled)
         Toggle("Off during iOS Focus", isOn: $model.focusDndEnabled)
-
-        if model.focusDndEnabled {
-            Text("Counts every Focus that shares its status with SidePulse (iOS Settings › Focus › Sleep / Do Not Disturb › Focus Status).")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-
-        Text(mirror.statusText)
-            .font(.footnote)
-            .foregroundStyle(.secondary)
+        Toggle("Daily schedule", isOn: $model.dndScheduleEnabled)
 
         if model.dndScheduleEnabled {
-            Text("Schedule: \(model.dndStartTime)–\(model.dndEndTime)")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+            DndTimePicker("Start", time: $model.dndStartTime)
+            DndTimePicker("End", time: $model.dndEndTime)
         }
     }
 
@@ -1049,10 +543,10 @@ struct DotBehaviorControls: View {
         fallback: String
     ) -> Binding<Color> {
         Binding {
-            Color(hex: model.dotAppearance[keyPath: keyPath])
+            Color(dotHex: model.dotAppearance[keyPath: keyPath])
         } set: { color in
             var appearance = model.dotAppearance
-            appearance[keyPath: keyPath] = color.rgbHex(fallback: fallback)
+            appearance[keyPath: keyPath] = color.dotHex(fallback: fallback)
             model.dotAppearance = appearance
         }
     }
@@ -1090,37 +584,5 @@ private struct DndTimePicker: View {
             let components = Calendar.current.dateComponents([.hour, .minute], from: newValue)
             time = DndSchedule.format(hour: components.hour ?? 0, minute: components.minute ?? 0)
         }
-    }
-}
-
-private struct MacAgentsPanel: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        NavigationLink(value: Route.agents) {
-            HStack {
-                Image(systemName: "desktopcomputer")
-                    .font(.title3)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Mac Agents")
-                        .font(.headline)
-                    Text("Live view of agents on \(hostLabel)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(14)
-            .background(Color(.secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var hostLabel: String {
-        URL(string: model.liveMonitorServerURL)?.host ?? "the Mac"
     }
 }
