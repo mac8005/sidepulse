@@ -170,7 +170,7 @@ struct SessionRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(showsEmoji ? agent.titleWithoutEmoji : agent.name)
+                Text(agent.titleWithoutEmoji)
                     .font(.body)
                     .fontWeight(isUnread ? .semibold : .regular)
                     .lineLimit(isDense && state.group != .needsAttention ? 1 : 2)

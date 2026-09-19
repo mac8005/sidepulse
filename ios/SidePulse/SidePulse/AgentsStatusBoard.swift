@@ -11,6 +11,7 @@ struct AgentsStatusBoard: View {
     /// 0 shut, 1 open — the board's glow follows the hinge as the phone opens.
     /// Effect only; nothing here moves because of it.
     var openness: Double = 1
+    var showsEmoji = true
     let open: (AgentSnapshot.Agent) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -172,7 +173,18 @@ struct AgentsStatusBoard: View {
                 .symbolEffect(.pulse, isActive: state.isLive && !reduceMotion)
                 .frame(width: 26)
 
-            Text(agent.name)
+            if showsEmoji, let emoji = agent.leadingEmoji {
+                Text(emoji)
+                    .font(.system(size: 17))
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color(.tertiarySystemFill))
+                    )
+                    .accessibilityHidden(true)
+            }
+
+            Text(agent.titleWithoutEmoji)
                 .font(.title3)
                 .fontWeight(isUnread(agent) ? .semibold : .regular)
                 .lineLimit(1)
@@ -190,7 +202,7 @@ struct AgentsStatusBoard: View {
                 .fill(Color(.secondarySystemGroupedBackground))
         )
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(agent.name)
+        .accessibilityLabel(agent.titleWithoutEmoji)
         .accessibilityValue(state.word)
         .accessibilityHint("Opens the session")
     }

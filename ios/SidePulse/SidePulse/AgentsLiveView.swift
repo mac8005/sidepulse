@@ -75,7 +75,8 @@ struct BoardScreen: View {
                     snapshot: stream.snapshot,
                     hostLabel: hostLabel,
                     isUnread: isUnread,
-                    openness: hingeOpenness
+                    openness: hingeOpenness,
+                    showsEmoji: model.showSessionEmoji
                 ) { agent in
                     markSeen(agent)
                     openAgentSession(agent)
