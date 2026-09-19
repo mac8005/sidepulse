@@ -14,7 +14,26 @@ struct AgentsStatusBoard: View {
     /// opened. Effect only; nothing here moves because of it.
     var openness: Double = 1
 
-    private var agents: [AgentSnapshot.Agent] { snapshot?.agents ?? [] }
+    /// Whatever wants a person comes first: the board is read from across a
+    /// desk, so the top of it has to be the part worth walking over for.
+    private var agents: [AgentSnapshot.Agent] {
+        (snapshot?.agents ?? []).enumerated()
+            .sorted { lhs, rhs in
+                let left = rank(lhs.element), right = rank(rhs.element)
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }
+            .map(\.element)
+    }
+
+    private func rank(_ agent: AgentSnapshot.Agent) -> Int {
+        switch agent.mode {
+        case "blocked_error": return 0
+        case "waiting_for_input": return 1
+        default: break
+        }
+        if isUnread(agent) { return 2 }
+        return agent.finishedAt == nil ? 3 : 4
+    }
 
     private var attention: [AgentSnapshot.Agent] {
         agents.filter { $0.mode == "waiting_for_input" || $0.mode == "blocked_error" }
@@ -102,42 +121,59 @@ struct AgentsStatusBoard: View {
         }
     }
 
+    /// Only whole rows: a line sliced by the crease is unreadable, so the
+    /// board shows as many as the upper half really holds and says how many
+    /// it is keeping back. The container decides, not a constant.
     private var board: some View {
-        ScrollView {
-            VStack(spacing: 8) {
-                ForEach(agents) { agent in
-                    Button {
-                        select(agent)
-                    } label: {
-                        row(agent)
-                    }
-                    .buttonStyle(.plain)
-                }
+        ViewThatFits(in: .vertical) {
+            ForEach(Array(stride(from: max(1, agents.count), through: 1, by: -1)), id: \.self) { limit in
+                stack(limit: limit)
             }
         }
-        .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private func stack(limit: Int) -> some View {
+        VStack(spacing: 8) {
+            ForEach(agents.prefix(limit)) { agent in
+                Button {
+                    select(agent)
+                } label: {
+                    row(agent)
+                }
+                .buttonStyle(.plain)
+            }
+            if agents.count > limit {
+                HStack {
+                    Text("+\(agents.count - limit) more, all quiet")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+            }
+        }
     }
 
     private func row(_ agent: AgentSnapshot.Agent) -> some View {
         HStack(spacing: 14) {
             Image(systemName: AgentModeStyle.symbol(agent.mode))
-                .font(.system(size: 22, weight: .semibold))
+                .font(.system(size: 27, weight: .semibold))
                 .foregroundStyle(modeColor(agent.mode))
                 .symbolEffect(.pulse, isActive: isUnread(agent))
-                .frame(width: 30)
+                .frame(width: 34)
 
             Text(agent.name)
-                .font(.title3.weight(isUnread(agent) ? .bold : .regular))
+                .font(.title2.weight(isUnread(agent) ? .bold : .regular))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(AgentModeStyle.label(agent.mode))
-                .font(.headline)
+                .font(.title3.weight(.semibold))
                 .foregroundStyle(modeColor(agent.mode))
                 .fixedSize()
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 14)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(rowFill(agent))

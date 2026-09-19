@@ -69,35 +69,22 @@ struct AgentLiveActivity: Widget {
         } dynamicIsland: { context in
             let groups = ModeGroups(agents: context.state.agents)
             return DynamicIsland {
+                // Where the island is a narrow vertical strip — the iPhone
+                // Duo's outer display — the side regions have no width to
+                // spend, so the whole card is built in the bottom region and
+                // stacks instead.
                 DynamicIslandExpandedRegion(.leading) {
-                    HStack(spacing: 5) {
-                        Image(systemName: groups.symbol.name)
-                            .font(.caption2)
-                            .foregroundStyle(groups.symbol.color)
-                        Text(context.attributes.hostLabel)
-                            .font(.caption.bold())
-                            .foregroundStyle(.primary)
-                    }
-                    .padding(.leading, 2)
+                    IslandExpandedLeading(groups: groups, host: context.attributes.hostLabel)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    StatusChips(groups: groups)
-                        .padding(.trailing, 2)
+                    IslandExpandedTrailing(groups: groups)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    // The expanded island caps at 160pt; four single-line rows
-                    // fit, so recently finished sessions show below the active
-                    // ones instead of hiding behind "+n more".
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(context.state.agents.prefix(4)) { agent in
-                            AgentRowView(agent: agent)
-                        }
-                        if context.state.agents.count > 4 {
-                            Text("+\(context.state.agents.count - 4) more")
-                                .font(.caption2)
-                                .foregroundStyle(.white.opacity(0.5))
-                        }
-                    }
+                    IslandExpandedBottom(
+                        groups: groups,
+                        host: context.attributes.hostLabel,
+                        agents: context.state.agents
+                    )
                     .widgetURL(URL(string: "sidepulse://agents"))
                 }
             } compactLeading: {
@@ -123,18 +110,26 @@ struct AgentLiveActivity: Widget {
 private struct IslandCompactLeading: View {
     let groups: ModeGroups
     let activeCount: Int
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
 
     var body: some View {
-        HStack(spacing: 3) {
+        // A side strip has room for one glyph, nothing beside it.
+        if isNarrow {
             Image(systemName: groups.symbol.name)
-                .font(.system(size: 12, weight: .semibold))
-            if activeCount > 0 {
-                Text("\(activeCount)")
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .contentTransition(.numericText())
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(groups.symbol.color)
+        } else {
+            HStack(spacing: 3) {
+                Image(systemName: groups.symbol.name)
+                    .font(.system(size: 12, weight: .semibold))
+                if activeCount > 0 {
+                    Text("\(activeCount)")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .contentTransition(.numericText())
+                }
             }
+            .foregroundStyle(groups.symbol.color)
         }
-        .foregroundStyle(groups.symbol.color)
     }
 }
 
@@ -142,8 +137,34 @@ private struct IslandCompactLeading: View {
 /// so "one working, three done" reads at a glance without expanding.
 private struct IslandCompactTrailing: View {
     let groups: ModeGroups
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
 
     var body: some View {
+        if isNarrow {
+            // One number, no icon beside it: the count of sessions that have
+            // stopped and want a person.
+            narrowBody
+        } else {
+            wideBody
+        }
+    }
+
+    @ViewBuilder
+    private var narrowBody: some View {
+        let waiting = groups.blocked + groups.waiting + groups.unreadDone
+        if waiting > 0 {
+            Text("\(waiting)")
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(groups.symbol.color)
+                .contentTransition(.numericText())
+        } else {
+            Circle()
+                .fill(Color.white.opacity(0.18))
+                .frame(width: 6, height: 6)
+        }
+    }
+
+    private var wideBody: some View {
         // Never hand WidgetKit an empty compact region: with nothing to
         // report the island fails to present at all, leaving only the Lock
         // Screen card. The count still means unread and nothing else.
@@ -177,9 +198,12 @@ private struct IslandCompactTrailing: View {
 private struct IslandMinimal: View {
     let groups: ModeGroups
     let activeCount: Int
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
 
     var body: some View {
-        let done = groups.unreadDone
+        // "3/2" needs width the side strip does not have; there the most
+        // urgent count stands alone.
+        let done = isNarrow ? 0 : groups.unreadDone
         ZStack {
             if activeCount > 0 && done > 0 {
                 // Both at once: "3/2" — active in the state color, finished
@@ -212,6 +236,109 @@ private struct IslandMinimal: View {
                 Image(systemName: groups.symbol.name)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(groups.symbol.color)
+            }
+        }
+    }
+}
+
+/// As many whole rows as the container really has room for, and an honest
+/// "+n more" for the rest. Nothing here assumes an island height: the first
+/// candidate that fits wins, so the same code serves the phone's wide island,
+/// the narrow strip on the iPhone Duo's outer display and the Lock Screen.
+private struct FittedAgentRows: View {
+    let agents: [AgentActivityAttributes.AgentRow]
+    var spacing: CGFloat = 4
+    var overflowFont: Font = .caption2
+    @ViewBuilder var row: (AgentActivityAttributes.AgentRow) -> AnyView
+
+    var body: some View {
+        ViewThatFits(in: .vertical) {
+            ForEach(candidateCounts, id: \.self) { count in
+                stack(limit: count)
+            }
+        }
+    }
+
+    private var candidateCounts: [Int] {
+        Array(stride(from: max(1, agents.count), through: 1, by: -1))
+    }
+
+    private func stack(limit: Int) -> some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            ForEach(agents.prefix(limit)) { agent in
+                row(agent)
+            }
+            if agents.count > limit {
+                Text("+\(agents.count - limit) more")
+                    .font(overflowFont)
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+        }
+    }
+}
+
+private struct IslandExpandedLeading: View {
+    let groups: ModeGroups
+    let host: String
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
+
+    var body: some View {
+        if isNarrow {
+            // The strip's side regions are too narrow for a host name; the
+            // bottom region carries the whole card there.
+            EmptyView()
+        } else {
+            HStack(spacing: 5) {
+                Image(systemName: groups.symbol.name)
+                    .font(.caption2)
+                    .foregroundStyle(groups.symbol.color)
+                Text(host)
+                    .font(.caption.bold())
+                    .foregroundStyle(.primary)
+            }
+            .padding(.leading, 2)
+        }
+    }
+}
+
+private struct IslandExpandedTrailing: View {
+    let groups: ModeGroups
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
+
+    var body: some View {
+        if isNarrow {
+            EmptyView()
+        } else {
+            StatusChips(groups: groups)
+                .padding(.trailing, 2)
+        }
+    }
+}
+
+private struct IslandExpandedBottom: View {
+    let groups: ModeGroups
+    let host: String
+    let agents: [AgentActivityAttributes.AgentRow]
+    @Environment(\.isDynamicIslandLimitedInWidth) private var isNarrow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: isNarrow ? 5 : 4) {
+            if isNarrow {
+                // Header and counts stack instead of sitting left and right.
+                HStack(spacing: 4) {
+                    Image(systemName: groups.symbol.name)
+                        .font(.caption2)
+                        .foregroundStyle(groups.symbol.color)
+                    Text(host)
+                        .font(.caption2.bold())
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                StatusChips(groups: groups)
+            }
+
+            FittedAgentRows(agents: agents) { agent in
+                AnyView(AgentRowView(agent: agent))
             }
         }
     }
@@ -398,8 +525,8 @@ private struct LockScreenView: View {
                 StatusChips(groups: groups)
                     .fixedSize()
             }
-            ForEach(context.state.agents.prefix(3)) { agent in
-                WatchAgentRowView(agent: agent)
+            FittedAgentRows(agents: context.state.agents, spacing: 2, overflowFont: .system(size: 9)) { agent in
+                AnyView(WatchAgentRowView(agent: agent))
             }
         }
         .padding(.horizontal, 8)
@@ -426,15 +553,8 @@ private struct LockScreenView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                VStack(alignment: .leading, spacing: 5) {
-                    ForEach(context.state.agents.prefix(5)) { agent in
-                        AgentRowView(agent: agent)
-                    }
-                    if context.state.agents.count > 5 {
-                        Text("+\(context.state.agents.count - 5) more")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
+                FittedAgentRows(agents: context.state.agents, spacing: 5) { agent in
+                    AnyView(AgentRowView(agent: agent))
                 }
             }
         }

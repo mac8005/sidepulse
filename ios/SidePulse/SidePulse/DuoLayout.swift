@@ -191,10 +191,12 @@ extension View {
     /// the vertical strip at the side. A large title costs a fifth of the
     /// iPhone Duo's short outer display, and the strip already names the
     /// screen on its own.
+    /// `force` is for the tabletop pose, where the bars stay horizontal but a
+    /// large title would eat the part of the upper half the board needs.
     @ViewBuilder
-    func duoCompactTitle() -> some View {
+    func duoCompactTitle(force: Bool = false) -> some View {
         if #available(iOS 27.1, *) {
-            modifier(DuoCompactTitle())
+            modifier(DuoCompactTitle(force: force))
         } else {
             self
         }
@@ -225,9 +227,12 @@ extension View {
 
 @available(iOS 27.1, *)
 private struct DuoCompactTitle: ViewModifier {
+    let force: Bool
     @Environment(\.toolbarVerticalEdge) private var verticalEdge
 
     func body(content: Content) -> some View {
-        content.navigationBarTitleDisplayMode(verticalEdge == nil ? .automatic : .inline)
+        content.navigationBarTitleDisplayMode(
+            force || verticalEdge != nil ? .inline : .automatic
+        )
     }
 }

@@ -39,14 +39,16 @@ struct AgentsLiveView: View {
     @State private var ownSelection: String?
     @State private var fold = DuoFold()
     @State private var hingeOpenness: Double = 1
+    @State private var containerHeight: CGFloat = 0
 
     var body: some View {
         content
             .navigationTitle("Mac Agents")
             .toolbar { toolbar }
-            .duoCompactTitle()
+            .duoCompactTitle(force: fold.isTabletop)
             .duoPrefersToolbarItems()
             .duoFold($fold)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
             .duoHingeOpenness($hingeOpenness)
             .task {
                 // Normally already running from the scene going active; harmless
@@ -67,6 +69,14 @@ struct AgentsLiveView: View {
     // MARK: - Layout
 
     private var isWide: Bool { horizontalSizeClass == .regular }
+
+    /// A narrow container that is also short — the iPhone Duo's outer display
+    /// is 200 pt shorter than an iPhone's — is a glance surface: one summary
+    /// line instead of a card, one line per title, tighter rows, so the
+    /// sessions that matter are all on screen at once.
+    private var isGlance: Bool {
+        horizontalSizeClass == .compact && containerHeight > 0 && containerHeight < 760
+    }
 
     @ViewBuilder
     private var content: some View {
@@ -114,8 +124,10 @@ struct AgentsLiveView: View {
     /// Everything in one scroll, the way the phone has always shown it.
     private var narrowList: some View {
         List {
-            Section {
-                header
+            if !isGlance {
+                Section {
+                    header
+                }
             }
 
             agentsSection
@@ -161,17 +173,19 @@ struct AgentsLiveView: View {
 
     @ViewBuilder
     private var agentsSection: some View {
-        Section("Agents") {
+        Section {
             if let snapshot = stream.snapshot, !snapshot.agents.isEmpty {
                 ForEach(snapshot.agents) { agent in
                     AgentLiveRow(
                         agent: agent,
                         isUnread: isUnread(agent),
-                        isSelected: selection.wrappedValue == agent.id
+                        isSelected: selection.wrappedValue == agent.id,
+                        isGlance: isGlance
                     ) {
                         activate(agent)
                     }
                     .listRowBackground(rowBackground(agent))
+                    .listRowInsets(glanceInsets)
                 }
             } else if stream.snapshot != nil {
                 Text("All quiet — no active agents.")
@@ -180,7 +194,55 @@ struct AgentsLiveView: View {
                 Text("Waiting for data…")
                     .foregroundStyle(.secondary)
             }
+        } header: {
+            if isGlance {
+                glanceHeader
+            } else {
+                Text("Agents")
+            }
         }
+    }
+
+    private var glanceInsets: EdgeInsets? {
+        isGlance ? EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16) : nil
+    }
+
+    /// The connection card compressed into the section header: same facts,
+    /// about a hundred points cheaper.
+    @ViewBuilder
+    private var glanceHeader: some View {
+        HStack(spacing: 6) {
+            switch stream.state {
+            case .live:
+                Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.green)
+            case .connecting:
+                Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.orange)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.red)
+            case .idle:
+                Image(systemName: "pause.circle").foregroundStyle(.secondary)
+            }
+            if let snapshot = stream.snapshot {
+                let needing = snapshot.agents.filter {
+                    $0.mode == "waiting_for_input" || $0.mode == "blocked_error"
+                }.count
+                if needing > 0 {
+                    Text("\(needing) need you")
+                        .foregroundStyle(.orange)
+                }
+                let unread = snapshot.agents.filter(isUnread).count
+                if unread > 0 {
+                    Text("· \(unread) new")
+                        .foregroundStyle(.green)
+                }
+                Text("· \(snapshot.activeCount) active")
+            } else {
+                Text("Waiting for data…")
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.footnote.weight(.semibold))
+        .textCase(nil)
     }
 
     @ViewBuilder
@@ -544,6 +606,7 @@ private struct AgentLiveRow: View {
     let agent: AgentSnapshot.Agent
     let isUnread: Bool
     let isSelected: Bool
+    var isGlance = false
     let activate: () -> Void
 
     var body: some View {
@@ -586,7 +649,10 @@ private struct AgentLiveRow: View {
                     }
                     Text(agent.name)
                         .font(isUnread ? .body.weight(.bold) : .body)
-                        .fixedSize(horizontal: false, vertical: true)
+                        // A short display shows more sessions than it shows
+                        // words: one line each, truncated.
+                        .lineLimit(isGlance ? 1 : nil)
+                        .fixedSize(horizontal: false, vertical: !isGlance)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
