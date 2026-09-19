@@ -153,7 +153,7 @@ struct AgentsStatusBoard: View {
             }
             if agents.count > limit {
                 HStack {
-                    Text("+\(agents.count - limit) more, all quiet")
+                    Text(overflowLabel(limit: limit))
                         .font(.headline)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
@@ -194,6 +194,19 @@ struct AgentsStatusBoard: View {
                     lineWidth: 2
                 )
         )
+    }
+
+    /// Says what is being kept back, not just how much: with the urgent
+    /// sessions sorted to the top, "none need you" is the line that lets
+    /// someone walk away from the desk.
+    private func overflowLabel(limit: Int) -> String {
+        let hidden = agents.dropFirst(limit)
+        let waiting = hidden.filter {
+            $0.mode == "waiting_for_input" || $0.mode == "blocked_error" || isUnread($0)
+        }.count
+        return waiting > 0
+            ? "+\(hidden.count) more · \(waiting) need you"
+            : "+\(hidden.count) more · none need you"
     }
 
     private func rowFill(_ agent: AgentSnapshot.Agent) -> Color {
