@@ -172,8 +172,7 @@ final class AppModel: ObservableObject {
         self.serverBaseURL = defaults.string(forKey: Defaults.serverBaseURL) ?? "http://127.0.0.1:8787"
         self.sharedSecret = defaults.string(forKey: Defaults.sharedSecret) ?? ""
         self.liveMonitorEnabled = defaults.bool(forKey: Defaults.liveMonitorEnabled)
-        self.liveMonitorServerURL = defaults.string(forKey: Defaults.liveMonitorServerURL)
-            ?? "http://macmini8005:8787"
+        self.liveMonitorServerURL = defaults.string(forKey: Defaults.liveMonitorServerURL) ?? ""
         self.dotCompletionAlertsEnabled = defaults.bool(forKey: Defaults.dotCompletionAlertsEnabled)
         self.dotBrightness = DotBrightness.configuredValue
         let savedAnimation = defaults.string(forKey: Defaults.dotAnimation)

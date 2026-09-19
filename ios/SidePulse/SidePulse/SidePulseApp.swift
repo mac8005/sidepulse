@@ -11,7 +11,8 @@ struct SidePulseApp: App {
                 .task {
 #if DEBUG && SIDEPULSE_MAIN_APP
                     if DemoData.isEnabled {
-                        AppModel.shared.liveMonitorServerURL = DemoData.serverURL
+                        AppModel.shared.liveMonitorServerURL =
+                            DemoData.screen == "setup" ? "" : DemoData.serverURL
                         AppModel.shared.refreshFolderStatus()
                         if DemoData.wantsLiveActivity {
                             DemoData.startLiveActivity()

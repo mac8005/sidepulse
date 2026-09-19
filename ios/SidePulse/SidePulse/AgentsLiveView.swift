@@ -248,24 +248,32 @@ struct BoardScreen: View {
     /// to do about it, rather than showing an empty list.
     @ViewBuilder
     private var connectionState: some View {
-        switch stream.state {
-        case .failed(let message):
-            BoardMessage(
-                symbol: "antenna.radiowaves.left.and.right.slash",
-                title: "Can't reach \(hostLabel)",
-                message: message,
-                tint: .orange
-            ) {
-                Button("Open Settings", systemImage: "gearshape") { path.append(.settings) }
-            }
-        case .idle where model.liveMonitorServerURL.isEmpty:
+        if model.liveMonitorServerURL.isEmpty {
             SetupChecklist { path.append(.settings) }
-        default:
-            BoardMessage(
-                symbol: "dot.radiowaves.left.and.right",
-                title: "Connecting to \(hostLabel)",
-                message: "Waiting for the first snapshot from the monitor on your Mac."
-            )
+        } else {
+            switch stream.state {
+            case .failed(let message):
+                BoardMessage(
+                    symbol: "antenna.radiowaves.left.and.right.slash",
+                    title: "Can't reach \(hostLabel)",
+                    message: message,
+                    tint: .orange
+                ) {
+                    Button("Open Settings", systemImage: "gearshape") { path.append(.settings) }
+                }
+            case .idle:
+                BoardMessage(
+                    symbol: "pause.circle",
+                    title: "Paused",
+                    message: "SidePulse streams only while it is in front. Pull down to reconnect."
+                )
+            default:
+                BoardMessage(
+                    symbol: "dot.radiowaves.left.and.right",
+                    title: "Connecting to \(hostLabel)",
+                    message: "Waiting for the first snapshot from the monitor on your Mac."
+                )
+            }
         }
     }
 
@@ -281,7 +289,7 @@ struct BoardScreen: View {
     }
 
     private var hostLabel: String {
-        URL(string: model.liveMonitorServerURL)?.host ?? "the Mac"
+        URL(string: model.liveMonitorServerURL)?.host ?? "your Mac"
     }
 
     // MARK: - Toolbar

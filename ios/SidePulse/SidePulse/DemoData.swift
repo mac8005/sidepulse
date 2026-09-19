@@ -13,8 +13,8 @@ enum DemoData {
     /// Activity read the host out of this URL.
     static let serverURL = "http://studio.local:8787"
 
-    /// `-DemoScreen home|agents|settings|token|folder` opens the app straight
-    /// on one screen, so every screen can be captured without tapping.
+    /// `-DemoScreen dot|settings|token|folder|setup` opens the app straight on
+    /// one screen, so every screen can be captured without tapping.
     static var screen: String? {
         let arguments = ProcessInfo.processInfo.arguments
         guard let index = arguments.firstIndex(of: "-DemoScreen"),
