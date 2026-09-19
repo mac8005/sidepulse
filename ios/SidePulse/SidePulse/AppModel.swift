@@ -129,6 +129,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The daemon gives each session an emoji as a memory hook; some people
+    /// want the list without them.
+    @Published var showSessionEmoji: Bool {
+        didSet { UserDefaults.standard.set(showSessionEmoji, forKey: Defaults.showSessionEmoji) }
+    }
+
     @Published var lastMessage: String = "Ready"
     @Published var eventLog: [String] = []
     @Published var receivedPushes: [ReceivedPush] {
@@ -159,6 +165,7 @@ final class AppModel: ObservableObject {
         static let dndEndTime = "dndEndTime"
         static let dndLastScheduleTransition = "dndLastScheduleTransition"
         static let focusDndEnabled = "focusDndEnabled"
+        static let showSessionEmoji = "showSessionEmoji"
     }
 
     private init() {
@@ -192,6 +199,7 @@ final class AppModel: ObservableObject {
         self.dndEndTime = defaults.string(forKey: Defaults.dndEndTime) ?? DndSchedule.defaultEndTime
         self.dndLastScheduleTransition = defaults.string(forKey: Defaults.dndLastScheduleTransition) ?? ""
         self.focusDndEnabled = defaults.bool(forKey: Defaults.focusDndEnabled)
+        self.showSessionEmoji = defaults.object(forKey: Defaults.showSessionEmoji) as? Bool ?? true
         self.receivedPushes = Self.loadReceivedPushes()
         self.eventLog = EventLog.entries()
         persistDotAppearance(dotAppearance)

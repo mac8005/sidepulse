@@ -5,17 +5,18 @@ exists to answer one question from across a room: **does anything need me?**
 
 ## Principles
 
-1. **State first.** The first line of the app is a sentence — "4 need you",
-   "3 working", "All quiet" — not a list you have to read.
-2. **Never colour alone.** Every state carries a word, a glyph and a colour.
-   Take the colour away and the screen still works.
-3. **One level of navigation.** The board is the root. The Dot and Settings
-   are one push away. Nothing sits in front of the thing you opened the app for.
-4. **Calm surfaces.** Content lives on plain grouped backgrounds. Liquid Glass
-   is the system's layer — bars, sheets, controls — and the app does not imitate
-   it or stack its own glass on top of it.
-5. **Honest about time.** A snapshot older than ninety seconds says when it is
-   from. A meter says when it resets. Nothing pretends to be live that is not.
+1. **State first.** The top line is a sober status line — "2 need attention ·
+   3 working · 9 sessions" — with the host and the reading time under it.
+2. **Colour is information, not decoration.** Neutral by default. Exactly one
+   accent, the app tint, for interactive things and the unread dot. Semantic
+   colour only where the owner has to act: red for blocked, orange for needs
+   input, on a small glyph and the state word — never as a fill.
+3. **System list styling.** Inset-grouped lists, hairline separators, standard
+   row heights and section headers. No floating cards, no glows, no shadows.
+4. **One level of navigation.** The board is the root; the Dot and Settings are
+   one push away.
+5. **Honest about time.** "Updated 09:41" under the status line; ages in
+   monospaced digits; meters say when they reset.
 6. **The hardware is part of the design.** The fold, the hinge angle and the
    vertical bar strip are inputs, not obstacles.
 
@@ -49,23 +50,25 @@ usage meters and the Dot move beside it — the same content, not more.
 
 ## State palette
 
-System colours, because they already carry the light, dark, Increased Contrast
-and colour-blind-friendly variants Apple ships. Defined once in
-`AgentModeStyle.tint(_:)` and shared with the Live Activity.
+Three hues on a normal screen: the label greys, the app tint, and — only when
+something has stopped for a person — red or orange.
 
-| State | Word | Glyph | Colour | Group |
-| --- | --- | --- | --- | --- |
-| `blocked_error` | Blocked | `exclamationmark.triangle.fill` | red | Needs you |
-| `waiting_for_input` | Asking | `questionmark.bubble.fill` | orange | Needs you |
-| finished, not yet opened | New | `checkmark.circle.fill` | green | Needs you |
-| `working` | Working | `bolt.fill` | blue | Working |
-| `tool_running` | Running | `wrench.and.screwdriver.fill` | indigo | Working |
-| `long_task_progress` | Long task | `hourglass` | purple | Working |
-| `completed` | Finished | `checkmark.circle.fill` | green | Finished & idle |
-| `idle_ready` | Idle | `moon.fill` | secondary | Finished & idle |
+| State | Word | Glyph | Colour |
+| --- | --- | --- | --- |
+| `blocked_error` | Blocked | `exclamationmark.triangle.fill` | red |
+| `waiting_for_input` | Needs input | `questionmark.circle.fill` | orange |
+| `working` / `tool_running` / `long_task_progress` | Working / Running / Long task | `circle.dotted`, pulsing | secondary label |
+| `completed` | Finished | `checkmark` | secondary label |
+| `idle_ready` | Idle | `minus` | secondary label |
+| finished, not yet opened | — | a tint dot at the leading edge, as Mail marks unread | app tint |
 
-Meters use thresholds, not a gradient: green under 60 %, orange under 85 %, red
-above — and the percentage is printed next to the bar.
+Usage meters are 3 pt bars in the label colour, orange from 80 %, red from
+95 %; percentages are right-aligned monospaced digits.
+
+Session emoji come from the daemon and stay in the data. They are shown in
+their own 26 pt neutral tile at the leading edge so titles remain pure text and
+the columns line up, and **Settings › Appearance › Show session emoji** turns
+them off.
 
 ## Type, space, motion
 

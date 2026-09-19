@@ -14,11 +14,11 @@ struct UsageSection: View {
                     UsageProviderRow(provider: provider, usage: usage, isDense: isDense)
                 }
             } else if let message = usage.snapshot?.error ?? usage.failure {
-                Label(message, systemImage: "exclamationmark.triangle")
+                Text(message)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
-                Label("Reading usage…", systemImage: "gauge.with.needle")
+                Text("Reading usage…")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -86,13 +86,11 @@ private struct UsageProviderRow: View {
     private var header: some View {
         HStack(spacing: 6) {
             Text(provider.label)
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
             if let plan = provider.plan, !plan.isEmpty {
-                Text(plan.uppercased())
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(.quaternary, in: Capsule())
+                Text(plan.capitalized)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
             if let updatedAt = provider.updatedAt {
@@ -117,7 +115,7 @@ private struct UsageProviderRow: View {
                     Image(systemName: "arrow.counterclockwise.circle.fill")
                 }
                 .font(.caption)
-                .foregroundStyle(.green)
+                .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
                 Button {
                     confirmingReset = true
@@ -165,12 +163,13 @@ private struct UsageMeter: View {
                         .lineLimit(1)
                 }
                 Text("\(window.usedPercent)%")
-                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .font(.subheadline.monospacedDigit())
                     .foregroundStyle(tint)
+                    .frame(width: 44, alignment: .trailing)
             }
             Capsule()
                 .fill(.quaternary)
-                .frame(height: isDense ? 5 : 7)
+                .frame(height: 3)
                 .overlay(alignment: .leading) {
                     GeometryReader { proxy in
                         Capsule()
@@ -189,10 +188,12 @@ private struct UsageMeter: View {
         min(1, max(0, Double(window.usedPercent) / 100))
     }
 
+    /// Neutral until it matters: orange once a window is nearly spent, red
+    /// once it all but is.
     private var tint: Color {
         switch window.usedPercent {
-        case ..<60: return .green
-        case ..<85: return .orange
+        case ..<80: return .secondary
+        case ..<95: return .orange
         default: return .red
         }
     }
@@ -236,7 +237,6 @@ private struct UsageCost: View {
             Spacer(minLength: 4)
             if let amount = value.costUSD {
                 Text(amount, format: .currency(code: "USD"))
-                    .fontWeight(.semibold)
                     .monospacedDigit()
             } else {
                 Text("Not priced").foregroundStyle(.tertiary)

@@ -22,7 +22,7 @@ struct DotPreview: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .background(
-            RoundedRectangle(cornerRadius: Metrics.innerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color(.tertiarySystemFill))
         )
         .onAppear {
@@ -238,7 +238,7 @@ struct QuickPatternsGrid: View {
                     .frame(minHeight: 44)
                     .padding(.horizontal, 12)
                     .background(
-                        RoundedRectangle(cornerRadius: Metrics.innerRadius, style: .continuous)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(Color(.tertiarySystemFill))
                     )
                 }

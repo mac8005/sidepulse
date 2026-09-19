@@ -108,9 +108,9 @@ struct BoardScreen: View {
             if let snapshot = stream.snapshot {
                 if snapshot.agents.isEmpty {
                     BoardMessage(
-                        symbol: "moon.zzz.fill",
-                        title: "All quiet",
-                        message: "No agent is running on \(hostLabel) right now."
+                        symbol: "checkmark.circle",
+                        title: "No active sessions",
+                        message: "Nothing is running on \(hostLabel)."
                     )
                 } else {
                     let grouping = AgentGrouping(agents: snapshot.agents, isUnread: isUnread)
@@ -142,10 +142,14 @@ struct BoardScreen: View {
             markSeen(agent)
             openAgentSession(agent)
         } label: {
-            SessionRow(agent: agent, isUnread: isUnread(agent), isDense: isDense)
+            SessionRow(
+                agent: agent,
+                isUnread: isUnread(agent),
+                showsEmoji: model.showSessionEmoji,
+                isDense: isDense
+            )
         }
         .buttonStyle(.plain)
-        .listRowBackground(isUnread(agent) ? Color.green.opacity(0.12) : nil)
         // The vertical strip already takes width from the trailing edge, so
         // the row gives some back there.
         .listRowInsets(isDense
@@ -156,9 +160,8 @@ struct BoardScreen: View {
                 Button {
                     markSeen(agent)
                 } label: {
-                    Label("Mark seen", systemImage: "checkmark.circle")
+                    Label("Mark read", systemImage: "envelope.open")
                 }
-                .tint(.green)
             }
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -168,7 +171,6 @@ struct BoardScreen: View {
             } label: {
                 Label("Open", systemImage: "arrow.up.forward.app")
             }
-            .tint(.blue)
         }
         .contextMenu {
             Button("Open session", systemImage: "arrow.up.forward.app") {
@@ -176,7 +178,7 @@ struct BoardScreen: View {
                 openAgentSession(agent)
             }
             if isUnread(agent) {
-                Button("Mark as seen", systemImage: "checkmark.circle") { markSeen(agent) }
+                Button("Mark as read", systemImage: "envelope.open") { markSeen(agent) }
             }
             if let cwd = agent.cwd {
                 Button("Copy project path", systemImage: "doc.on.doc") {
@@ -187,17 +189,12 @@ struct BoardScreen: View {
     }
 
     private func sectionHeader(_ group: AgentState.Group, count: Int) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: group.symbol)
-                .foregroundStyle(group.tint)
+        HStack {
             Text(group.title)
+            Spacer(minLength: 0)
             Text("\(count)")
                 .monospacedDigit()
-                .foregroundStyle(.secondary)
-            Spacer(minLength: 0)
         }
-        .font(.subheadline.weight(.semibold))
-        .textCase(nil)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(group.title), \(count) session\(count == 1 ? "" : "s")")
     }
@@ -207,21 +204,22 @@ struct BoardScreen: View {
     /// The one line that answers "does anything need me?", with an honest
     /// reading age beside it.
     private var summary: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(headline)
-                    .font(isDense ? .title3.weight(.semibold) : .title2.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(headline)
+                .font(.headline)
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            HStack(spacing: 5) {
                 if !model.liveMonitorServerURL.isEmpty {
-                    ConnectionPill(state: stream.state)
+                    ConnectionDot(state: stream.state)
                 }
+                Text(subtitle)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
             }
-            Text(subtitle)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
@@ -230,14 +228,16 @@ struct BoardScreen: View {
     }
 
     private var headline: String {
-        guard !model.liveMonitorServerURL.isEmpty else { return "No Mac yet" }
-        guard let snapshot = stream.snapshot else { return "Connecting…" }
+        guard !model.liveMonitorServerURL.isEmpty else { return "No Mac configured" }
+        guard let snapshot = stream.snapshot else { return "Connecting" }
         let grouping = AgentGrouping(agents: snapshot.agents, isUnread: isUnread)
-        if grouping.needsYouCount > 0 {
-            return "\(grouping.needsYouCount) need\(grouping.needsYouCount == 1 ? "s" : "") you"
+        var parts: [String] = []
+        if grouping.needsAttentionCount > 0 {
+            parts.append("\(grouping.needsAttentionCount) need attention")
         }
-        if grouping.activeCount > 0 { return "\(grouping.activeCount) working" }
-        return "All quiet"
+        if grouping.workingCount > 0 { parts.append("\(grouping.workingCount) working") }
+        parts.append("\(snapshot.agents.count) session\(snapshot.agents.count == 1 ? "" : "s")")
+        return parts.joined(separator: " · ")
     }
 
     private var subtitle: String {
@@ -245,11 +245,8 @@ struct BoardScreen: View {
             return "Add the address of the Mac you want to watch"
         }
         guard let snapshot = stream.snapshot else { return hostLabel }
-        let age = Date().timeIntervalSince1970 - snapshot.updatedAt
-        let asOf = age > 90
-            ? " · as of \(Date(timeIntervalSince1970: snapshot.updatedAt).formatted(date: .omitted, time: .shortened))"
-            : ""
-        return "\(hostLabel) · \(snapshot.agents.count) session\(snapshot.agents.count == 1 ? "" : "s")\(asOf)"
+        let updated = Date(timeIntervalSince1970: snapshot.updatedAt)
+        return "\(hostLabel) · Updated \(updated.formatted(date: .omitted, time: .shortened))"
     }
 
     /// Nothing has arrived yet: say which of the three reasons it is, and what
@@ -263,7 +260,7 @@ struct BoardScreen: View {
             case .failed(let message):
                 BoardMessage(
                     symbol: "antenna.radiowaves.left.and.right.slash",
-                    title: "Can't reach \(hostLabel)",
+                    title: "Can’t reach \(hostLabel)",
                     message: message,
                     tint: .orange
                 ) {
@@ -273,13 +270,13 @@ struct BoardScreen: View {
                 BoardMessage(
                     symbol: "pause.circle",
                     title: "Paused",
-                    message: "SidePulse streams only while it is in front. Pull down to reconnect."
+                    message: "SidePulse streams while it is in front. Pull down to reconnect."
                 )
             default:
                 BoardMessage(
                     symbol: "dot.radiowaves.left.and.right",
                     title: "Connecting to \(hostLabel)",
-                    message: "Waiting for the first snapshot from the monitor on your Mac."
+                    message: "Waiting for the first snapshot from the monitor."
                 )
             }
         }
@@ -344,13 +341,13 @@ struct BoardScreen: View {
 
     private var attentionCount: Int {
         guard let snapshot = stream.snapshot else { return 0 }
-        return AgentGrouping(agents: snapshot.agents, isUnread: isUnread).needsYouCount
+        return AgentGrouping(agents: snapshot.agents, isUnread: isUnread).needsAttentionCount
     }
 
     private func openFirstNeedingAttention() {
         guard let snapshot = stream.snapshot,
               let agent = snapshot.agents.first(where: {
-                  AgentState.of($0, isUnread: isUnread($0)).group == .needsYou
+                  AgentState.of($0, isUnread: isUnread($0)).group == .needsAttention
               })
         else { return }
         markSeen(agent)
@@ -417,57 +414,34 @@ struct BoardScreen: View {
 
 // MARK: - Connection
 
-/// Live / connecting / unreachable, in a word and a glyph.
-struct ConnectionPill: View {
+/// Connected or not, as a small dot — the kind Mail puts beside a mailbox.
+struct ConnectionDot: View {
     let state: AgentStreamClient.ConnectionState
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: symbol)
-                .symbolEffect(.variableColor, isActive: isLive && !reduceMotion)
-            Text(word)
-        }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(tint)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(tint.opacity(0.14), in: Capsule())
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Connection")
-        .accessibilityValue(word)
-    }
-
-    private var isLive: Bool {
-        if case .live = state { return true }
-        if case .connecting = state { return true }
-        return false
+        Circle()
+            .fill(tint)
+            .frame(width: 6, height: 6)
+            .accessibilityElement()
+            .accessibilityLabel("Connection")
+            .accessibilityValue(word)
     }
 
     private var word: String {
         switch state {
-        case .live: return "Live"
+        case .live: return "Connected"
         case .connecting: return "Connecting"
         case .failed: return "Offline"
         case .idle: return "Paused"
         }
     }
 
-    private var symbol: String {
-        switch state {
-        case .live: return "dot.radiowaves.left.and.right"
-        case .connecting: return "arrow.triangle.2.circlepath"
-        case .failed: return "antenna.radiowaves.left.and.right.slash"
-        case .idle: return "pause.circle"
-        }
-    }
-
     private var tint: Color {
         switch state {
-        case .live: return .green
-        case .connecting: return .orange
+        case .live: return .secondary
+        case .connecting: return .secondary.opacity(0.5)
         case .failed: return .red
-        case .idle: return .secondary
+        case .idle: return .secondary.opacity(0.35)
         }
     }
 }
@@ -497,7 +471,7 @@ struct BoardMessage<Actions: View>: View {
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: symbol)
-                .font(.largeTitle)
+                .font(.title)
                 .foregroundStyle(tint)
             Text(title)
                 .font(.headline)
@@ -524,11 +498,11 @@ struct SetupChecklist: View {
     var body: some View {
         Section {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Point SidePulse at your Mac")
+                Text("Set up SidePulse")
                     .font(.headline)
                 checklist("1", "Run `sidepulse live-activity` on the Mac you want to watch.")
-                checklist("2", "Put its address in Settings — the app talks to it over your network.")
-                checklist("3", "Optional: plug in a SidePulse Dot to see the same state as light.")
+                checklist("2", "Enter its address in Settings.")
+                checklist("3", "Optional: connect a SidePulse Dot to mirror the state as light.")
                 Button("Open Settings", systemImage: "gearshape", action: openSettings)
                     .buttonStyle(.borderedProminent)
                     .padding(.top, 4)
@@ -540,10 +514,9 @@ struct SetupChecklist: View {
     private func checklist(_ number: String, _ text: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(number)
-                .font(.caption.weight(.bold).monospacedDigit())
-                .foregroundStyle(.white)
-                .frame(width: 18, height: 18)
-                .background(Color.accentColor, in: Circle())
+                .font(.footnote.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 16, alignment: .trailing)
             Text(text)
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)

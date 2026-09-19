@@ -178,6 +178,10 @@ private struct SettingsView: View {
             Text("Run `sidepulse live-activity` on that Mac. It streams agent status to this phone and keeps the Lock Screen card current.")
         }
 
+        Section("Appearance") {
+            Toggle("Show session emoji", isOn: $model.showSessionEmoji)
+        }
+
         Section("Notifications") {
             Button {
                 requestPushToken()

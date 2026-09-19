@@ -71,10 +71,6 @@ enum AgentModeStyle {
         switch mode {
         case "blocked_error": return .red
         case "waiting_for_input": return .orange
-        case "working": return .blue
-        case "tool_running": return .indigo
-        case "long_task_progress": return .purple
-        case "completed": return .green
         default: return .secondary
         }
     }

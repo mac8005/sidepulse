@@ -2,39 +2,23 @@ import SwiftUI
 
 // MARK: - State vocabulary
 
-/// One vocabulary for "what is this session doing". Every state carries a
-/// word, a glyph and a colour, so nothing here is ever told by colour alone —
-/// which is also what keeps it readable in Increased Contrast and to anyone
-/// who does not see the difference between orange and green.
+/// What a session is doing, in a word and a glyph. Colour is deliberately
+/// scarce: only the two states that want a person carry one, so a red or an
+/// orange line on this screen always means the same thing. Everything else is
+/// label grey, which is why the word and the symbol have to do the work.
 struct AgentState {
     /// Sessions sort into three questions: does anything want me, is anything
-    /// running, and what is finished. Everything on the board follows it.
+    /// running, and what is done.
     enum Group: Int, CaseIterable, Comparable {
-        case needsYou
+        case needsAttention
         case working
-        case settled
+        case finished
 
         var title: String {
             switch self {
-            case .needsYou: return "Needs you"
+            case .needsAttention: return "Needs attention"
             case .working: return "Working"
-            case .settled: return "Finished & idle"
-            }
-        }
-
-        var symbol: String {
-            switch self {
-            case .needsYou: return "hand.raised.fill"
-            case .working: return "bolt.fill"
-            case .settled: return "checkmark.circle.fill"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .needsYou: return .orange
-            case .working: return .blue
-            case .settled: return .green
+            case .finished: return "Finished"
             }
         }
 
@@ -43,63 +27,64 @@ struct AgentState {
 
     var word: String
     var symbol: String
-    var tint: Color
+    /// `nil` means the label colour: the state is information, not an alarm.
+    var accent: Color?
     /// A state that is still moving; the glyph breathes while it is.
     var isLive: Bool
     var group: Group
 
-    /// System colours rather than hand-mixed ones: they already carry the
-    /// light, dark and Increased Contrast variants Apple ships.
+    var tint: Color { accent ?? .secondary }
+
     static func forMode(_ mode: String) -> AgentState {
         switch mode {
         case "blocked_error":
             return AgentState(word: "Blocked", symbol: "exclamationmark.triangle.fill",
-                              tint: AgentModeStyle.tint(mode), isLive: false, group: .needsYou)
+                              accent: .red, isLive: false, group: .needsAttention)
         case "waiting_for_input":
-            return AgentState(word: "Asking", symbol: "questionmark.bubble.fill",
-                              tint: AgentModeStyle.tint(mode), isLive: true, group: .needsYou)
+            return AgentState(word: "Needs input", symbol: "questionmark.circle.fill",
+                              accent: .orange, isLive: false, group: .needsAttention)
         case "working":
-            return AgentState(word: "Working", symbol: "bolt.fill",
-                              tint: AgentModeStyle.tint(mode), isLive: true, group: .working)
+            return AgentState(word: "Working", symbol: "circle.dotted",
+                              accent: nil, isLive: true, group: .working)
         case "tool_running":
-            return AgentState(word: "Running", symbol: "wrench.and.screwdriver.fill",
-                              tint: AgentModeStyle.tint(mode), isLive: true, group: .working)
+            return AgentState(word: "Running", symbol: "circle.dotted",
+                              accent: nil, isLive: true, group: .working)
         case "long_task_progress":
-            return AgentState(word: "Long task", symbol: "hourglass",
-                              tint: AgentModeStyle.tint(mode), isLive: true, group: .working)
+            return AgentState(word: "Long task", symbol: "circle.dotted",
+                              accent: nil, isLive: true, group: .working)
         case "completed":
-            return AgentState(word: "Finished", symbol: "checkmark.circle.fill",
-                              tint: AgentModeStyle.tint(mode), isLive: false, group: .settled)
+            return AgentState(word: "Finished", symbol: "checkmark",
+                              accent: nil, isLive: false, group: .finished)
         case "idle_ready":
-            return AgentState(word: "Idle", symbol: "moon.fill",
-                              tint: .secondary, isLive: false, group: .settled)
+            return AgentState(word: "Idle", symbol: "minus",
+                              accent: nil, isLive: false, group: .finished)
         default:
-            return AgentState(word: "Unknown", symbol: "circle.dashed",
-                              tint: .secondary, isLive: false, group: .settled)
+            return AgentState(word: "Unknown", symbol: "questionmark",
+                              accent: nil, isLive: false, group: .finished)
         }
     }
 
-    /// A finished session nobody has looked at yet is not settled — it is
-    /// waiting for a person, and belongs at the top with the rest of them.
+    /// A finished session nobody has opened is not done with you yet, so it
+    /// keeps the attention group — but it is marked the way Mail marks unread
+    /// post, with a dot, not with a colour over the whole row.
     static func of(_ agent: AgentSnapshot.Agent, isUnread: Bool) -> AgentState {
         var state = forMode(agent.mode)
         if isUnread {
-            state.word = "New"
-            state.tint = .green
-            state.group = .needsYou
+            state.group = .needsAttention
         }
         return state
     }
 }
 
 extension AgentSnapshot.Agent {
-    /// "Claude · orchard · Editing 3 files" — the quiet line under the title.
-    var subtitle: String {
-        [projectName, detail].compactMap { $0 }.joined(separator: " · ")
+    /// "Claude · orchard · Asked a question" — plain text, no chips.
+    var metadata: String {
+        [providerName?.capitalized, projectName, detail]
+            .compactMap { $0 }
+            .joined(separator: " · ")
     }
 
-    /// The last path component is what people call the project; the rest is
-    /// noise on a phone-width row.
+    /// The last path component is what people call the project.
     var projectName: String? {
         guard let cwd, !cwd.isEmpty else { return nil }
         let name = cwd.split(separator: "/").last.map(String.init)
@@ -109,6 +94,24 @@ extension AgentSnapshot.Agent {
     var providerName: String? {
         provider ?? id.split(separator: ":").first.map(String.init)
     }
+
+    /// The daemon gives every session an emoji as a memory hook. It belongs in
+    /// its own slot, not inside the title, so the titles stay pure text and
+    /// the column edges line up.
+    var leadingEmoji: String? {
+        guard let first = name.first,
+              first.unicodeScalars.contains(where: {
+                  $0.properties.isEmojiPresentation
+                      || ($0.properties.isEmoji && $0.value > 0x238C)
+              })
+        else { return nil }
+        return String(first)
+    }
+
+    var titleWithoutEmoji: String {
+        guard leadingEmoji != nil else { return name }
+        return String(name.dropFirst()).trimmingCharacters(in: .whitespaces)
+    }
 }
 
 // MARK: - Grouped sessions
@@ -117,8 +120,8 @@ extension AgentSnapshot.Agent {
 /// order inside it.
 struct AgentGrouping {
     var sections: [(group: AgentState.Group, agents: [AgentSnapshot.Agent])] = []
-    var needsYouCount = 0
-    var activeCount = 0
+    var needsAttentionCount = 0
+    var workingCount = 0
 
     init(agents: [AgentSnapshot.Agent], isUnread: (AgentSnapshot.Agent) -> Bool) {
         var buckets: [AgentState.Group: [AgentSnapshot.Agent]] = [:]
@@ -129,92 +132,82 @@ struct AgentGrouping {
             guard let agents = buckets[group], !agents.isEmpty else { return nil }
             return (group, agents)
         }
-        needsYouCount = buckets[.needsYou]?.count ?? 0
-        activeCount = buckets[.working]?.count ?? 0
+        needsAttentionCount = buckets[.needsAttention]?.count ?? 0
+        workingCount = buckets[.working]?.count ?? 0
     }
 }
 
 // MARK: - Row
 
-/// One session. Title on top, a quiet line under it, the state on the right —
-/// the same shape everywhere the app lists sessions.
+/// One session, in the shape the system's own lists use: a title, a quiet line
+/// of metadata under it, and the state on the trailing edge.
 struct SessionRow: View {
     let agent: AgentSnapshot.Agent
     let isUnread: Bool
-    /// Short displays give each session one line of title and tighter rows.
+    var showsEmoji = true
+    /// Short displays give the calm sessions a single line of title.
     var isDense = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ScaledMetric(relativeTo: .body) private var glyphWidth: CGFloat = 19
 
     private var state: AgentState { AgentState.of(agent, isUnread: isUnread) }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 9) {
-            Image(systemName: state.symbol)
-                .font(.body)
-                .foregroundStyle(state.tint)
-                .symbolEffect(.pulse, isActive: state.isLive && !reduceMotion)
-                .frame(width: glyphWidth, alignment: .center)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Circle()
+                .fill(isUnread ? Color.accentColor : .clear)
+                .frame(width: 7, height: 7)
                 .accessibilityHidden(true)
 
+            if showsEmoji, let emoji = agent.leadingEmoji {
+                Text(emoji)
+                    .font(.system(size: 14))
+                    .frame(width: 26, height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color(.tertiarySystemFill))
+                    )
+                    .accessibilityHidden(true)
+            }
+
             VStack(alignment: .leading, spacing: 2) {
-                // On a short display the title gets the whole first line and
-                // the state moves down beside the project, because a truncated
-                // title is the one thing that costs you the glance.
-                // The title owns the first line: a truncated title is the one
-                // thing that costs you the glance. State and age share the
-                // quiet line, together, on the trailing side.
-                Text(agent.name)
+                Text(showsEmoji ? agent.titleWithoutEmoji : agent.name)
                     .font(.body)
                     .fontWeight(isUnread ? .semibold : .regular)
-                    // A session that wants a person is worth reading in full,
-                    // even on the short display; the calm ones are not.
-                    .lineLimit(isDense && state.group != .needsYou ? 1 : 2)
+                    .lineLimit(isDense && state.group != .needsAttention ? 1 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                HStack(spacing: 5) {
-                    if let provider = agent.providerName {
-                        Text(provider.capitalized)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(.quaternary, in: Capsule())
-                    }
-                    Text(agent.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    stateWord
-                    elapsed
+                Text(agent.metadata)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: state.symbol)
+                        .symbolEffect(.pulse, isActive: state.isLive && !reduceMotion)
+                        .imageScale(.small)
+                    Text(state.word)
+                }
+                .font(.footnote)
+                .foregroundStyle(state.accent ?? .secondary)
+
+                if let finishedAt = agent.finishedAt {
+                    Text(compactAge(since: finishedAt))
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
                 }
             }
+            .fixedSize()
         }
-        .padding(.vertical, isDense ? 1 : 5)
+        .padding(.vertical, isDense ? 1 : 3)
         .contentShape(.rect)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(agent.name)
+        .accessibilityLabel(agent.titleWithoutEmoji)
         .accessibilityValue(accessibilityValue)
         .accessibilityHint(accessibilityHint)
-    }
-
-    private var stateWord: some View {
-        Text(state.word)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(state.tint)
-            .fixedSize()
-    }
-
-    @ViewBuilder
-    private var elapsed: some View {
-        if let finishedAt = agent.finishedAt {
-            Text(compactAge(since: finishedAt))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .monospacedDigit()
-                .fixedSize()
-        }
     }
 
     private var accessibilityValue: String {
@@ -241,24 +234,6 @@ func compactAge(since timestamp: Double) -> String {
     return "\(Int(seconds / 86400))d"
 }
 
-// MARK: - Sundries
-
-/// Rounded rectangles that sit inside the hardware's corners look right when
-/// their radius follows the same curve; one value, used everywhere.
 enum Metrics {
-    static let cardRadius: CGFloat = 16
-    static let innerRadius: CGFloat = 10
     static let rhythm: CGFloat = 12
-}
-
-extension View {
-    /// A plain grouped card. Content never sits on glass — that layer belongs
-    /// to the system's bars and controls.
-    func cardSurface(radius: CGFloat = Metrics.cardRadius) -> some View {
-        padding(Metrics.rhythm)
-            .background(
-                RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .fill(Color(.secondarySystemGroupedBackground))
-            )
-    }
 }

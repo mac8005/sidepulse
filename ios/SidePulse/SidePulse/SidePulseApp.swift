@@ -14,6 +14,7 @@ struct SidePulseApp: App {
                         AppModel.shared.liveMonitorServerURL =
                             DemoData.screen == "setup" ? "" : DemoData.serverURL
                         AppModel.shared.refreshFolderStatus()
+                        if DemoData.hidesEmoji { AppModel.shared.showSessionEmoji = false }
                         if DemoData.wantsLiveActivity {
                             DemoData.startLiveActivity()
                         }

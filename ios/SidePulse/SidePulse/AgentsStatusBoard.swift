@@ -29,9 +29,9 @@ struct AgentsStatusBoard: View {
     private func rank(_ agent: AgentSnapshot.Agent) -> Int {
         let state = AgentState.of(agent, isUnread: isUnread(agent))
         switch state.group {
-        case .needsYou: return agent.mode == "blocked_error" ? 0 : 1
+        case .needsAttention: return agent.mode == "blocked_error" ? 0 : 1
         case .working: return 2
-        case .settled: return 3
+        case .finished: return 3
         }
     }
 
@@ -39,19 +39,13 @@ struct AgentsStatusBoard: View {
         AgentGrouping(agents: snapshot?.agents ?? [], isUnread: isUnread)
     }
 
-    private var headline: (text: String, tint: Color, symbol: String) {
-        guard snapshot != nil else {
-            return ("Waiting for data", .secondary, "antenna.radiowaves.left.and.right.slash")
+    private var headline: String {
+        guard snapshot != nil else { return "Waiting for data" }
+        if grouping.needsAttentionCount > 0 {
+            return "\(grouping.needsAttentionCount) need attention"
         }
-        if grouping.needsYouCount > 0 {
-            let count = grouping.needsYouCount
-            return ("\(count) session\(count == 1 ? "" : "s") need\(count == 1 ? "s" : "") you",
-                    .orange, "hand.raised.fill")
-        }
-        if grouping.activeCount > 0 {
-            return ("\(grouping.activeCount) working", .blue, "bolt.fill")
-        }
-        return ("All quiet", .green, "checkmark.circle.fill")
+        if grouping.workingCount > 0 { return "\(grouping.workingCount) working" }
+        return "No active sessions"
     }
 
     var body: some View {
@@ -67,16 +61,13 @@ struct AgentsStatusBoard: View {
     }
 
     private var banner: some View {
-        HStack(spacing: 14) {
-            Image(systemName: headline.symbol)
-                .font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(headline.tint)
-                .symbolEffect(.pulse, isActive: grouping.needsYouCount > 0 && !reduceMotion)
+        HStack(alignment: .lastTextBaseline, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(headline.text)
-                    .font(.title.weight(.bold))
+                Text(headline)
+                    .font(.title2.weight(.semibold))
+                    .monospacedDigit()
                     .lineLimit(1)
-                    .minimumScaleFactor(0.6)
+                    .minimumScaleFactor(0.7)
                 Text(hostLabel)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -84,38 +75,40 @@ struct AgentsStatusBoard: View {
             Spacer(minLength: 0)
             counters
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
         .background(
-            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color(.secondarySystemGroupedBackground))
-                // The board lights up as the phone is opened.
-                .shadow(color: headline.tint.opacity(0.4 * openness), radius: 16 * openness)
         )
+        // Restrained: the counters settle in as the phone is opened, and
+        // nothing else about the board moves.
+        .opacity(0.6 + 0.4 * openness)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(headline.text)
+        .accessibilityLabel(headline)
         .accessibilityValue(hostLabel)
     }
 
     private var counters: some View {
-        HStack(spacing: 16) {
+        HStack(alignment: .lastTextBaseline, spacing: 20) {
             counter(agents.filter { $0.mode == "blocked_error" }.count, .red, "Blocked")
-            counter(agents.filter { $0.mode == "waiting_for_input" }.count, .orange, "Asking")
-            counter(grouping.activeCount, .blue, "Working")
-            counter(agents.filter(isUnread).count, .green, "New")
+            counter(agents.filter { $0.mode == "waiting_for_input" }.count, .orange, "Needs input")
+            counter(grouping.workingCount, nil, "Working")
+            counter(agents.filter(isUnread).count, nil, "Unread")
         }
     }
 
     @ViewBuilder
-    private func counter(_ value: Int, _ tint: Color, _ label: String) -> some View {
+    private func counter(_ value: Int, _ accent: Color?, _ label: String) -> some View {
         if value > 0 {
-            VStack(spacing: 1) {
+            VStack(alignment: .trailing, spacing: 0) {
                 Text("\(value)")
-                    .font(.system(size: 30, weight: .bold, design: .rounded))
-                    .foregroundStyle(tint)
+                    .font(.system(.largeTitle, design: .default).weight(.medium))
                     .monospacedDigit()
+                    .foregroundStyle(accent ?? .primary)
                     .contentTransition(.numericText())
                 Text(label)
-                    .font(.caption2.weight(.semibold))
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .combine)
@@ -156,7 +149,8 @@ struct AgentsStatusBoard: View {
             if agents.count > limit {
                 HStack {
                     Text(overflowLabel(limit: limit))
-                        .font(.headline)
+                        .font(.subheadline)
+                        .monospacedDigit()
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                 }
@@ -167,30 +161,33 @@ struct AgentsStatusBoard: View {
 
     private func row(_ agent: AgentSnapshot.Agent) -> some View {
         let state = AgentState.of(agent, isUnread: isUnread(agent))
-        return HStack(spacing: 14) {
+        return HStack(spacing: 12) {
+            Circle()
+                .fill(isUnread(agent) ? Color.accentColor : .clear)
+                .frame(width: 8, height: 8)
+
             Image(systemName: state.symbol)
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundStyle(state.tint)
+                .font(.title3)
+                .foregroundStyle(state.accent ?? .secondary)
                 .symbolEffect(.pulse, isActive: state.isLive && !reduceMotion)
-                .frame(width: 34)
+                .frame(width: 26)
 
             Text(agent.name)
-                .font(.title2.weight(isUnread(agent) ? .semibold : .regular))
+                .font(.title3)
+                .fontWeight(isUnread(agent) ? .semibold : .regular)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(state.word)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(state.tint)
+                .font(.title3)
+                .foregroundStyle(state.accent ?? .secondary)
                 .fixedSize()
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.vertical, 13)
         .background(
-            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
-                .fill(isUnread(agent)
-                      ? Color.green.opacity(0.14)
-                      : Color(.secondarySystemGroupedBackground))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(agent.name)
@@ -204,11 +201,11 @@ struct AgentsStatusBoard: View {
     private func overflowLabel(limit: Int) -> String {
         let hidden = agents.dropFirst(limit)
         let waiting = hidden.filter {
-            AgentState.of($0, isUnread: isUnread($0)).group == .needsYou
+            AgentState.of($0, isUnread: isUnread($0)).group == .needsAttention
         }.count
         return waiting > 0
-            ? "+\(hidden.count) more · \(waiting) need you"
-            : "+\(hidden.count) more · none need you"
+            ? "\(hidden.count) more · \(waiting) need attention"
+            : "\(hidden.count) more · none need attention"
     }
 }
 
@@ -229,8 +226,8 @@ struct AgentsDeskControls: View {
                             Button(link.label) { openFirstAvailable(link.candidates) }
                         }
                     } label: {
-                        Label("New session", systemImage: "plus.circle.fill")
-                            .font(.headline)
+                        Label("New session", systemImage: "plus")
+                            .font(.body)
                             .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     }
                 }

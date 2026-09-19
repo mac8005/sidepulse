@@ -36,6 +36,14 @@ enum DemoData {
         return agents[position].id
     }
 
+    /// `-DemoEmoji off` shows the list without the session emoji.
+    static var hidesEmoji: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-DemoEmoji"), index + 1 < arguments.count
+        else { return false }
+        return arguments[index + 1].lowercased() == "off"
+    }
+
     static var snapshot: AgentSnapshot? {
         decode(AgentSnapshot.self, from: snapshotJSON)
     }

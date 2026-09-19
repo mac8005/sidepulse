@@ -46,13 +46,19 @@ private struct ModeGroups {
 }
 
 private extension Color {
-    static let statusWorking = Color.blue
+    static let statusWorking = Color.white.opacity(0.65)
     static let statusWaiting = Color.orange
     static let statusBlocked = Color.red
-    static let statusDone = Color.green
+    static let statusDone = Color.white.opacity(0.65)
 
+    /// Neutral unless a session wants a person: the same restraint the app
+    /// uses, on a card that is always dark.
     static func forMode(_ mode: String) -> Color {
-        AgentModeStyle.tint(mode)
+        switch mode {
+        case "blocked_error": return .red
+        case "waiting_for_input": return .orange
+        default: return .white.opacity(0.65)
+        }
     }
 }
 
