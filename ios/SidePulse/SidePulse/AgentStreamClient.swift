@@ -47,6 +47,12 @@ final class AgentStreamClient: ObservableObject {
 #if DEBUG && SIDEPULSE_MAIN_APP
         // `-DemoData` replaces the SSE stream with one canned snapshot.
         if DemoData.isEnabled {
+            // `-DemoScreen setup` is the first run: nothing has arrived yet.
+            guard DemoData.screen != "setup" else {
+                snapshot = nil
+                state = .idle
+                return
+            }
             snapshot = DemoData.snapshot
             state = .live
             return
