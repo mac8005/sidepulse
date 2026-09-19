@@ -5,66 +5,44 @@ import UserNotifications
 @MainActor
 struct ContentView: View {
     @StateObject private var model: AppModel
+    @ObservedObject private var stream = DotStatusMirror.shared.stream
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var isShowingFolderPicker = false
     @State private var activeSheet: ActiveSheet?
     /// The app opens straight into Mac Agents; the home screen sits behind it.
     @State private var path: [Route] = [.agents]
+    /// Only the three-column shell uses these.
+    @State private var duoDestination: DuoDestination? = .agents
+    @State private var selectedAgentID: String?
 
     init() {
         _model = StateObject(wrappedValue: AppModel.shared)
+        applyDemoScreen()
     }
 
     init(model: AppModel) {
         _model = StateObject(wrappedValue: model)
+        applyDemoScreen()
+    }
+
+    private mutating func applyDemoScreen() {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        switch DemoData.screen {
+        case "home": _path = State(initialValue: [])
+        case "settings": _path = State(initialValue: [.agents, .settings])
+        case "token": _activeSheet = State(initialValue: .token)
+        case "folder": _activeSheet = State(initialValue: .folderSetup)
+        default: break
+        }
+#endif
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    MacAgentsPanel(model: model)
-
-                    HeaderPanel(model: model) {
-                        activeSheet = .token
-                        requestPushToken()
-                    }
-
-                    SidePulseDotSetupPanel(model: model) {
-                        activeSheet = .folderSetup
-                    }
-
-                    QuickPatternsPanel { pattern in
-                        Task { await write(pattern) }
-                    }
-                }
-                .padding(16)
-            }
-            .background(Color(.systemGroupedBackground))
-            .navigationTitle("SidePulse")
-            .navigationDestination(for: Route.self) { route in
-                switch route {
-                case .agents:
-                    AgentsLiveView(model: model)
-                }
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink {
-                        SettingsView(
-                            model: model,
-                            requestPushToken: requestPushToken,
-                            showFolderPicker: showFolderPicker
-                        )
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                    .accessibilityLabel("Settings")
-                }
-            }
-        }
+        shell
         .onOpenURL { url in
             if url.host == "agents" {
                 path = [.agents]
+                duoDestination = .agents
             }
         }
         .sheet(item: $activeSheet) { sheet in
@@ -94,6 +72,122 @@ struct ContentView: View {
         .onAppear {
             model.refreshFolderStatus()
         }
+    }
+
+    // MARK: - Shell
+
+    @ViewBuilder
+    private var shell: some View {
+        if horizontalSizeClass == .regular, DuoVariant.current == .c {
+            threeColumnShell
+        } else {
+            NavigationStack(path: $path) {
+                homeScreen
+                    .navigationTitle("SidePulse")
+                    .duoCompactTitle()
+                    .navigationDestination(for: Route.self) { route in
+                        switch route {
+                        case .agents:
+                            AgentsLiveView(model: model)
+                        case .settings:
+                            SettingsView(
+                                model: model,
+                                requestPushToken: requestPushToken,
+                                showFolderPicker: showFolderPicker
+                            )
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            NavigationLink(value: Route.settings) {
+                                // Title and icon both: the system needs the
+                                // icon to move the item into the vertical bar
+                                // strip, and the title to label it in the
+                                // overflow menu.
+                                Label("Settings", systemImage: "gearshape")
+                            }
+                        }
+                    }
+            }
+        }
+    }
+
+    private var homeScreen: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                MacAgentsPanel(model: model)
+
+                HeaderPanel(model: model) {
+                    activeSheet = .token
+                    requestPushToken()
+                }
+
+                SidePulseDotSetupPanel(model: model) {
+                    activeSheet = .folderSetup
+                }
+
+                QuickPatternsPanel { pattern in
+                    Task { await write(pattern) }
+                }
+            }
+            .padding(16)
+        }
+        .background(Color(.systemGroupedBackground))
+    }
+
+    /// Variant C: destinations, sessions and the selected session at once.
+    private var threeColumnShell: some View {
+        NavigationSplitView {
+            List(DuoDestination.allCases, id: \.self, selection: $duoDestination) { destination in
+                Label(destination.title, systemImage: destination.symbol)
+            }
+            .navigationTitle("SidePulse")
+        } content: {
+            switch duoDestination ?? .agents {
+            case .agents:
+                AgentsLiveView(
+                    model: model,
+                    layout: .listOnly,
+                    externalSelection: $selectedAgentID
+                )
+            case .dashboard:
+                AgentsDashboard(model: model, usage: .shared)
+                    .navigationTitle("Usage & Dot")
+            case .home:
+                homeScreen
+                    .navigationTitle("SidePulse")
+            case .settings:
+                SettingsView(
+                    model: model,
+                    requestPushToken: requestPushToken,
+                    showFolderPicker: showFolderPicker
+                )
+            }
+        } detail: {
+            if let agent = selectedDuoAgent {
+                AgentSessionDetail(
+                    agent: agent,
+                    updatedAt: stream.snapshot?.updatedAt,
+                    isUnread: agent.unread == true && agent.finishedAt != nil
+                )
+                .navigationTitle("Session")
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "sidebar.squares.right")
+                        .font(.largeTitle)
+                        .foregroundStyle(.tertiary)
+                    Text("Select a session")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemGroupedBackground))
+            }
+        }
+    }
+
+    private var selectedDuoAgent: AgentSnapshot.Agent? {
+        guard let selectedAgentID else { return nil }
+        return stream.snapshot?.agents.first { $0.id == selectedAgentID }
     }
 
     private func requestPushToken() {
@@ -151,8 +245,9 @@ struct ContentView: View {
     }
 }
 
-private enum Route: Hashable {
+enum Route: Hashable {
     case agents
+    case settings
 }
 
 private enum ActiveSheet: Identifiable {
@@ -250,9 +345,17 @@ private struct SidePulseDotSetupPanel: View {
 
 private struct QuickPatternsPanel: View {
     let writePattern: (LEDPattern) -> Void
-    private let columns = [
-        GridItem(.adaptive(minimum: 150), spacing: 10)
-    ]
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    /// An even number of columns so the grid divides at the fold. `.adaptive`
+    /// already lands on two at every compact width, including the iPhone Duo's
+    /// outer display; only the wide inner display needs the fixed count.
+    private var columns: [GridItem] {
+        guard horizontalSizeClass == .regular else {
+            return [GridItem(.adaptive(minimum: 150), spacing: 10)]
+        }
+        return Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -335,11 +438,7 @@ private struct TokenSheet: View {
             }
             .navigationTitle("Push Token")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
+                DoneToolbarItem(dismiss: dismiss)
             }
         }
     }
@@ -377,11 +476,7 @@ private struct FolderSetupSheet: View {
             .padding(20)
             .navigationTitle("Set Up Folder")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
+                DoneToolbarItem(dismiss: dismiss)
             }
         }
     }
@@ -393,9 +488,40 @@ private struct SettingsView: View {
     let showFolderPicker: () -> Void
     @State private var diagnosticsExport: DiagnosticsExport?
     @State private var isShowingDiagnosticsError = false
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
-        Form {
+        settings
+            .navigationTitle("Settings")
+            .duoCompactTitle()
+            .alert("Couldn’t Prepare Log", isPresented: $isShowingDiagnosticsError) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Please try again. You can also select and copy individual log entries below.")
+            }
+    }
+
+    /// One long form on a phone; on a display wide enough for two panes the
+    /// device settings and the server / diagnostics half sit side by side, so
+    /// neither needs scrolling past the other.
+    @ViewBuilder
+    private var settings: some View {
+        if horizontalSizeClass == .regular {
+            DuoSplit {
+                Form { deviceSections }
+            } secondary: {
+                Form { serverSections }
+            }
+        } else {
+            Form {
+                deviceSections
+                serverSections
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var deviceSections: some View {
             Section("Push Token") {
                 Button {
                     requestPushToken()
@@ -445,6 +571,10 @@ private struct SettingsView: View {
                 Text("The schedule switches DND on/off; you can override it at any time.")
             }
 
+    }
+
+    @ViewBuilder
+    private var serverSections: some View {
             Section("Live Monitor (Mac Agents)") {
                 LiveMonitorSection(model: model)
             }
@@ -546,13 +676,6 @@ private struct SettingsView: View {
                     Label("Clear Received Pushes", systemImage: "tray.and.arrow.down")
                 }
             }
-        }
-        .navigationTitle("Settings")
-        .alert("Couldn’t Prepare Log", isPresented: $isShowingDiagnosticsError) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Please try again. You can also select and copy individual log entries below.")
-        }
     }
 
     private func shareDiagnostics() {

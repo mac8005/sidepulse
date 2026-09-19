@@ -74,12 +74,18 @@ final class DriveWriter: @unchecked Sendable {
     }
 
     var hasSavedFolder: Bool {
-        UserDefaults.standard.data(forKey: bookmarkKey) != nil
+#if DEBUG && SIDEPULSE_MAIN_APP
+        if DemoData.isEnabled { return true }
+#endif
+        return UserDefaults.standard.data(forKey: bookmarkKey) != nil
     }
 
     var savedBookmark: Data? { UserDefaults.standard.data(forKey: bookmarkKey) }
 
     var savedFolderDisplayName: String {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        if DemoData.isEnabled { return "/SIDEPULSE DOT" }
+#endif
         guard let url = try? resolveFolderURL() else {
             return "No USB folder selected"
         }
@@ -116,6 +122,13 @@ final class DriveWriter: @unchecked Sendable {
         context: DotWriteContext? = nil,
         bookmark: Data? = nil
     ) async throws -> URL {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        // Demo mode has no drive; pretend the write landed so the Dot section
+        // shows its ready state instead of a write error.
+        if DemoData.isEnabled {
+            return URL(fileURLWithPath: "/SIDEPULSE DOT").appendingPathComponent(fileName)
+        }
+#endif
         let normalizedProgram = normalizeLEDText(text)
         let trimmed = normalizedProgram.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -155,6 +168,9 @@ final class DriveWriter: @unchecked Sendable {
     /// Verify that the saved security-scoped drive is still mounted without
     /// rewriting LEDS.LED or adding a diagnostics-log entry.
     func probeAccess() async throws {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        if DemoData.isEnabled { return }
+#endif
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             ioQueue.async {
                 continuation.resume(with: Result {

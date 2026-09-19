@@ -9,6 +9,16 @@ struct SidePulseApp: App {
         WindowGroup {
             ContentView()
                 .task {
+#if DEBUG && SIDEPULSE_MAIN_APP
+                    if DemoData.isEnabled {
+                        AppModel.shared.liveMonitorServerURL = DemoData.serverURL
+                        AppModel.shared.refreshFolderStatus()
+                        if #available(iOS 17.2, *), DemoData.wantsLiveActivity {
+                            DemoData.startLiveActivity()
+                        }
+                        return
+                    }
+#endif
                     LiveMonitorManager.shared.startIfEnabled(model: AppModel.shared)
                 }
         }

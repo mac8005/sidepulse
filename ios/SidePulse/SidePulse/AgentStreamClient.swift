@@ -44,6 +44,14 @@ final class AgentStreamClient: ObservableObject {
     private var connectionDotToken: String?
 
     func start(baseURL: String, dotToken: String? = nil) {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        // `-DemoData` replaces the SSE stream with one canned snapshot.
+        if DemoData.isEnabled {
+            snapshot = DemoData.snapshot
+            state = .live
+            return
+        }
+#endif
         let qualifiedToken = dotToken.flatMap { $0.isEmpty ? nil : $0 }
         if task != nil,
            connectionBaseURL == baseURL,

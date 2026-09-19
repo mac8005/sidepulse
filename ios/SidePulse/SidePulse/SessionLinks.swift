@@ -22,6 +22,8 @@ struct NewSessionLink: Codable, Equatable, Identifiable {
 /// Fetches the links once per daemon URL while the Mac Agents screen is up.
 @MainActor
 final class SessionLinksClient: ObservableObject {
+    static let shared = SessionLinksClient()
+
     private struct Reply: Decodable {
         var links: [NewSessionLink]
     }
@@ -29,6 +31,12 @@ final class SessionLinksClient: ObservableObject {
     @Published var links: [NewSessionLink] = []
 
     func load(baseURL: String) async {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        if DemoData.isEnabled {
+            links = DemoData.sessionLinks
+            return
+        }
+#endif
         guard let url = URL(string: baseURL)?.appendingPathComponent("session-links") else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 5

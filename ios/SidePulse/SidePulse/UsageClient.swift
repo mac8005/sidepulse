@@ -64,6 +64,10 @@ struct UsageSnapshot: Codable, Equatable {
 /// up its newest cached reading.
 @MainActor
 final class UsageClient: ObservableObject {
+    /// One poller for the whole app: the agents screen and, where the display
+    /// has room for it, the dashboard pane both read this reading.
+    static let shared = UsageClient()
+
     struct ResetOutcome: Equatable {
         var ok: Bool
         var message: String
@@ -95,6 +99,13 @@ final class UsageClient: ObservableObject {
     }
 
     func fetch(baseURL: String) async {
+#if DEBUG && SIDEPULSE_MAIN_APP
+        if DemoData.isEnabled {
+            snapshot = DemoData.usage
+            failure = nil
+            return
+        }
+#endif
         guard let url = URL(string: baseURL)?.appendingPathComponent("usage") else {
             failure = "Invalid server URL"
             return
