@@ -146,8 +146,10 @@ struct BoardScreen: View {
         }
         .buttonStyle(.plain)
         .listRowBackground(isUnread(agent) ? Color.green.opacity(0.12) : nil)
+        // The vertical strip already takes width from the trailing edge, so
+        // the row gives some back there.
         .listRowInsets(isDense
-                       ? EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+                       ? EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 10)
                        : nil)
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             if isUnread(agent) {

@@ -94,54 +94,102 @@ struct DotScreen: View {
     let showFolderPicker: () -> Void
     @ObservedObject private var mirror = DotStatusMirror.shared
 
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
     var body: some View {
-        Form {
-            Section {
-                HStack(spacing: 14) {
-                    DotPreview(model: model)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(mirror.statusText)
-                            .font(.headline)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(model.selectedFolderPath)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.head)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(.vertical, 4)
+        dot
+            .navigationTitle("SidePulse Dot")
+            .duoCompactTitle()
+    }
 
-                Button {
-                    showFolderPicker()
-                } label: {
-                    Label(
-                        model.hasFolderAccess ? "Change LED folder" : "Choose the Dot's folder",
-                        systemImage: "folder.badge.plus"
-                    )
+    /// One form on a phone; where there are two panes the light itself and how
+    /// it behaves stay together on one side, and the drive it writes to plus
+    /// the patterns you can send by hand take the other.
+    @ViewBuilder
+    private var dot: some View {
+        if horizontalSizeClass == .regular {
+            DuoSplit {
+                Form {
+                    statusSection
+                    behaviourSection
                 }
-            } footer: {
-                Text("SidePulse writes LEDS.LED on the Dot's USB drive while the app is open, and from a silent push while it is not.")
+            } secondary: {
+                Form {
+                    folderSection
+                    patternsSection
+                }
             }
-
-            Section("Behaviour") {
-                DotBehaviorControls(model: model)
-            }
-
-            Section {
-                QuickPatternsGrid { pattern in
-                    Task { await write(pattern) }
-                }
-                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-            } header: {
-                Text("Send a pattern")
-            } footer: {
-                Text("Writes the pattern to the Dot straight away, without waiting for an agent.")
+        } else {
+            Form {
+                statusSection
+                folderSection
+                behaviourSection
+                patternsSection
             }
         }
-        .navigationTitle("SidePulse Dot")
-        .duoCompactTitle()
+    }
+
+    @ViewBuilder
+    private var statusSection: some View {
+        Section {
+            HStack(spacing: 14) {
+                DotPreview(model: model)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(mirror.statusText)
+                        .font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(model.hasFolderAccess ? "Writing LEDS.LED" : "No folder yet")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    @ViewBuilder
+    private var folderSection: some View {
+        Section {
+            LabeledContent("Folder") {
+                Text(model.selectedFolderPath)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            Button {
+                showFolderPicker()
+            } label: {
+                Label(
+                    model.hasFolderAccess ? "Change LED folder" : "Choose the Dot's folder",
+                    systemImage: "folder.badge.plus"
+                )
+            }
+        } footer: {
+            Text("SidePulse writes LEDS.LED on the Dot's USB drive while the app is open, and from a silent push while it is not.")
+        }
+    }
+
+    @ViewBuilder
+    private var behaviourSection: some View {
+        Section("Behaviour") {
+            DotBehaviorControls(model: model)
+        }
+    }
+
+    @ViewBuilder
+    private var patternsSection: some View {
+        Section {
+            QuickPatternsGrid { pattern in
+                Task { await write(pattern) }
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        } header: {
+            Text("Send a pattern")
+        } footer: {
+            Text("Writes the pattern to the Dot straight away, without waiting for an agent.")
+        }
     }
 
     private func write(_ pattern: LEDPattern) async {

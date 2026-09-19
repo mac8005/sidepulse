@@ -158,6 +158,16 @@ Every guideline below is quoted from Apple's *Designing for iPhone Duo* (HIG,
 | 19b | "Create a consistent experience" (first run) | A phone with no Mac configured shows a numbered setup checklist instead of an empty list. | `08-setup__outer__A.png` |
 | 20 | "People interact with the outer display when the device is closed" (glance surface) | A short container switches the board to its dense form: one-line titles, state on the quiet line, tighter rows — all nine sessions at once. | `01-board__outer__A.png` |
 
+### Fold depth
+
+`reservedRegions(kind: .division)` reports the crease as **inactive** until the
+phone is folded far enough for the system to divide the display. A shallow
+fold therefore keeps the ordinary layout, and that is deliberate: the tabletop
+board is for a phone that is actually standing on a desk. What the ordinary
+layout must never do is put something unreadable in the crease — it does not,
+because the panes are lists that scroll and the board's banner only exists in
+the tabletop layout, where the crease is active by definition.
+
 ### Gaps
 
 - **Dynamic Island on the outer display.** The Live Activity's Lock Screen card

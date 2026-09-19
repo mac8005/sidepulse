@@ -144,12 +144,12 @@ struct SessionRow: View {
     /// Short displays give each session one line of title and tighter rows.
     var isDense = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ScaledMetric(relativeTo: .body) private var glyphWidth: CGFloat = 22
+    @ScaledMetric(relativeTo: .body) private var glyphWidth: CGFloat = 19
 
     private var state: AgentState { AgentState.of(agent, isUnread: isUnread) }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 11) {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
             Image(systemName: state.symbol)
                 .font(.body)
                 .foregroundStyle(state.tint)
@@ -167,7 +167,9 @@ struct SessionRow: View {
                 Text(agent.name)
                     .font(.body)
                     .fontWeight(isUnread ? .semibold : .regular)
-                    .lineLimit(isDense ? 1 : 2)
+                    // A session that wants a person is worth reading in full,
+                    // even on the short display; the calm ones are not.
+                    .lineLimit(isDense && state.group != .needsYou ? 1 : 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 5) {
