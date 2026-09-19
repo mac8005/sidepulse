@@ -18,7 +18,11 @@ exists to answer one question from across a room: **does anything need me?**
 5. **Honest about time.** "Updated 09:41" under the status line; ages in
    monospaced digits; meters say when they reset.
 6. **The hardware is part of the design.** The fold, the hinge angle and the
-   vertical bar strip are inputs, not obstacles.
+   vertical bar strip are inputs, not obstacles. The strip question is closed:
+   Apple's default placement, kept light — no Back button, the attention bell
+   only while something needs attention, New session, one system overflow —
+   and the grouped background runs underneath it so it never reads as a dead
+   column.
 
 ## Information architecture
 
@@ -142,13 +146,13 @@ Every guideline below is quoted from Apple's *Designing for iPhone Duo* (HIG,
 | 1 | "Build your app to resize. … Use size classes, layout margins, and safe area insets … Avoid fixed widths and display-specific dependencies." | Only `horizontalSizeClass`, `verticalSizeClass` and measured container size are read. No `UIScreen`, idiom or orientation check anywhere; the only fixed frames are 12–34 pt glyphs. | every screenshot |
 | 2 | "Create a consistent experience across displays. Keep functionality and the state of elements the same between displays … show an additional level of hierarchy on the larger inner display if it makes sense." | Same board, same rows, same actions on both. The inner display adds one level — the usage meters and Dot beside the sessions instead of below them. | `01-board__outer__A.png`, `01-board__inner-land__A.png` |
 | 3 | "Maintain the same functionality across device poses." | Tabletop replaces the list with a distance-readable board but keeps every control on the lower half: new session, usage, Dot, and the toolbar. | `07-tabletop__tabletop__A.png` |
-| 4 | "Follow the system's vertical layout for toolbars, tab bars, and navigation controls." | Only system bars; `toolbarVerticalBehavior` is never disabled in the shipping configuration. The comparison pair exists only as a DEBUG flag for this decision. | `11-strip-compare__outer__vertical.png` |
+| 4 | "Follow the system's vertical layout for toolbars, tab bars, and navigation controls." | Settled: Apple's default vertical strip, kept light — no Back button (the board is the root), the attention bell only while something needs attention, New session, and one system overflow. `toolbarVerticalBehavior(.disabled)` survives only on the two single-button sheets, which is Apple's own recommendation. | `01-board__outer__emoji-on.png` |
 | 5 | "Adapt your layout when the device folds. Prefer a layout container that adapts automatically … In a grid-style layout, prefer an even number of columns so content divides cleanly." | `ArrangementView(.split)` for both panes; the pattern grid takes its column count from `duoColumnCount`, which rounds down to an even number whenever a division region exists (`[.includeInactive]`). | `01-board__half__A.png`, `02-dot__inner-land__A.png` |
 | 6 | "Avoid extreme layout changes as people fold the device. Move only what's necessary." | Folding moves the panes onto the two halves; nothing is rearranged. The only pose-specific layout is tabletop, and it keeps the same content in the same order. | `01-board__inner-land__A.png` vs `01-board__half__A.png` |
 | 7 | "Keep navigation outside of arrangement views." | The single `NavigationStack` wraps every `DuoSplit`; no arrangement view contains a navigation container. | `ContentView.swift` |
 | 8 | "Reserve the top of the vertical axis for primary navigation controls … followed by prominent actions." | The board is the root, so there is no Back button at all; the pinned trailing slot holds the attention item, then New session, then the system overflow. | `01-board__outer__A.png` |
 | 9 | "Prioritize frequently used toolbar items … keep controls that convey important status, like items with badges, visible longer." | The badged attention item is `.topBarPinnedTrailing` with `visibilityPriority(.high)`; New session is high; everything else lives in the overflow. | `01-board__outer__A.png` |
-| 10 | "In general, don't override the default bar placement." | Not overridden. `toolbarVerticalBehavior(.disabled)` is used only on the two single-button sheets, which the same guidance endorses. | `04-token__outer__A.png` |
+| 10 | "In general, don't override the default bar placement." | Not overridden anywhere; the debug switch that could has been removed. | `04-token__outer__A.png` |
 | 11 | "Consider using the full display width for interfaces where bars aren't necessary … letting a background image or header span the full width while scrollable content stays inset." | The grouped background runs the full width under the strip; the scrolling list stays inside the safe area. | `01-board__outer__A.png` |
 | 12 | "Group related toolbar items instead of spacing them manually." | `ToolbarItemGroup` / single items only; no spacers. | `AgentsLiveView.swift` |
 | 13 | "Provide both a title and a symbol for each toolbar item that isn't text-only." | Every item is a `Label(title, systemImage:)`. | — |

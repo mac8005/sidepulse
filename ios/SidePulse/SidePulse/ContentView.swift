@@ -51,7 +51,6 @@ struct ContentView: View {
                     }
                 }
         }
-        .duoStripBehavior()
         .onOpenURL { url in
             if url.host == "agents" {
                 path = []

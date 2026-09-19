@@ -214,21 +214,6 @@ extension View {
 #endif
     }
 
-    /// Apple's default is the vertical strip, and that is what ships.
-    /// `-DuoStrip horizontal` exists only so the two can be photographed side
-    /// by side for a decision.
-    @ViewBuilder
-    func duoStripBehavior() -> some View {
-#if DEBUG && SIDEPULSE_MAIN_APP && canImport(SwiftUI, _version: 8.0.85)
-        if #available(iOS 27.1, *), DuoStrip.prefersHorizontal {
-            toolbarVerticalBehavior(.disabled)
-        } else {
-            self
-        }
-#else
-        self
-#endif
-    }
 }
 
 #if canImport(SwiftUI, _version: 8.0.85)
@@ -273,14 +258,3 @@ struct DuoOverflow<Content: View>: ToolbarContent {
         }
     }
 }
-
-#if DEBUG
-enum DuoStrip {
-    static let prefersHorizontal: Bool = {
-        let arguments = ProcessInfo.processInfo.arguments
-        guard let index = arguments.firstIndex(of: "-DuoStrip"), index + 1 < arguments.count
-        else { return false }
-        return arguments[index + 1].lowercased() == "horizontal"
-    }()
-}
-#endif
