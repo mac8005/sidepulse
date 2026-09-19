@@ -201,7 +201,10 @@ struct AgentsLiveView: View {
     /// legible at the width of that strip.
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .topBarTrailing) {
+        // The count of sessions waiting for a person is the one thing this
+        // screen must never hide, so it is pinned and wears a badge instead
+        // of spelling the number out beside a symbol.
+        ToolbarItem(placement: .topBarPinnedTrailing) {
             Button {
                 selectFirstNeedingAttention()
             } label: {
@@ -209,7 +212,10 @@ struct AgentsLiveView: View {
             }
             .badge(attentionCount)
             .disabled(attentionCount == 0)
+        }
+        .visibilityPriority(.high)
 
+        ToolbarItemGroup(placement: .topBarTrailing) {
             if !sessionLinks.links.isEmpty {
                 // Hands off to the provider's own app; the daemon says where.
                 Menu {
@@ -220,19 +226,16 @@ struct AgentsLiveView: View {
                     Label("New session", systemImage: "plus")
                 }
             }
-        }
-        // Status first: these two are the last to fall into the overflow when
-        // a Live Activity takes its share of the strip.
-        .visibilityPriority(.high)
 
-        if layout == .adaptive {
-            ToolbarItem(placement: .topBarTrailing) {
+            if layout == .adaptive {
                 NavigationLink(value: Route.settings) {
                     Label("Settings", systemImage: "gearshape")
                 }
             }
-            .visibilityPriority(.low)
         }
+        // Setup before action: Settings is the first thing to give way when a
+        // Live Activity takes its share of the strip.
+        .visibilityPriority(.low)
 
         // The one rarely used action goes straight into the system overflow;
         // the ellipsis belongs to it and to nothing else.
