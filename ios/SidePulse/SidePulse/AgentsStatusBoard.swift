@@ -175,10 +175,10 @@ struct AgentsStatusBoard: View {
 
             if showsEmoji, let emoji = agent.leadingEmoji {
                 Text(emoji)
-                    .font(.system(size: 17))
-                    .frame(width: 32, height: 32)
+                    .font(.system(size: 14))
+                    .frame(width: 25, height: 25)
                     .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(Color(.tertiarySystemFill))
                     )
                     .accessibilityHidden(true)
